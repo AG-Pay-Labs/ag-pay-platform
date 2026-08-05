@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ag-platform-api"
+version = "0.1.0"
+description = "Backend API for the AG Pay agent-wallet platform"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "alembic>=1.16,<2",
+  "asyncpg>=0.30,<1",
+  "cryptography>=45,<47",
+  "email-validator>=2.2,<3",
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "pwdlib[argon2]>=0.2,<1",
+  "pydantic-settings>=2.10,<3",
+  "pyjwt>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "redis>=6,<7",
+  "sqlalchemy[asyncio]>=2.0.41,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "aiosqlite>=0.21,<1",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.0,<2",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ag_platform_api"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
