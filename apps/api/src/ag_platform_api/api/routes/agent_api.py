@@ -22,6 +22,7 @@ from ag_platform_api.models import (
     AgentStatus,
     CartItem,
     CartItemStatus,
+    CheckoutEvent,
     PaymentMethod,
     PaymentMethodStatus,
     Purchase,
@@ -35,11 +36,13 @@ from ag_platform_api.schemas import (
     AgentTokenResponse,
     CartItemCreate,
     CartItemRead,
+    CheckoutEventPage,
     PurchaseComplete,
     PurchaseRead,
 )
+from ag_platform_api.services.checkout_queue import CheckoutQueueError, queue_checkout_execution
 from ag_platform_api.services.payment_policies import requires_human_approval
-from ag_platform_api.services.serializers import cart_item_read, purchase_read
+from ag_platform_api.services.serializers import cart_item_read, checkout_event_read, purchase_read
 
 router = APIRouter(prefix="/agent", tags=["agent API"])
 
@@ -122,7 +125,7 @@ async def propose_cart_item(
         .with_for_update()
     )
     total_amount = payload.unit_price * payload.quantity
-    approval_required = requires_human_approval(
+    approval_required = payload.checkout is not None or requires_human_approval(
         policy,
         amount=total_amount,
         currency=payload.currency,
@@ -130,7 +133,7 @@ async def propose_cart_item(
     )
     selected_payment_method: PaymentMethod | None = None
     if not approval_required:
-        selected_payment_method = await db.scalar(
+        payment_method_query = (
             select(PaymentMethod)
             .join(AgentPaymentMethod)
             .where(
@@ -142,6 +145,7 @@ async def propose_cart_item(
             .limit(1)
             .with_for_update()
         )
+        selected_payment_method = await db.scalar(payment_method_query)
 
     credential = PurchaseCredential(
         owner_id=agent.owner_id,
@@ -159,6 +163,8 @@ async def propose_cart_item(
         title=payload.title,
         description=payload.description,
         product_url=str(payload.product_url),
+        checkout_adapter=payload.checkout.adapter if payload.checkout else None,
+        checkout_url=str(payload.checkout.checkout_url) if payload.checkout else None,
         merchant=payload.merchant,
         reason=payload.reason,
         quantity=payload.quantity,
@@ -181,6 +187,18 @@ async def propose_cart_item(
         approved_at=datetime.now(UTC) if selected_payment_method is not None else None,
     )
     db.add(item)
+    await db.flush()
+    if selected_payment_method is not None:
+        try:
+            await queue_checkout_execution(
+                db,
+                item=item,
+                payment_method=selected_payment_method,
+                settings=settings,
+            )
+        except CheckoutQueueError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail=exc.message) from exc
     await db.commit()
     item = await load_cart_item(db, item.id)
     if selected_payment_method is not None:
@@ -210,14 +228,67 @@ async def list_agent_cart_items(
 ) -> list[CartItemRead]:
     query = (
         select(CartItem)
-        .options(selectinload(CartItem.credential))
-        .where(CartItem.agent_id == agent.id)
+        .options(
+            selectinload(CartItem.credential),
+            selectinload(CartItem.checkout_execution),
+        )
+        .where(CartItem.agent_id == agent.id, CartItem.owner_id == agent.owner_id)
         .order_by(CartItem.created_at.desc())
     )
     if item_status is not None:
         query = query.where(CartItem.status == item_status)
     items = (await db.scalars(query)).all()
     return [cart_item_read(item) for item in items]
+
+
+@router.get("/cart-items/{cart_item_id}", response_model=CartItemRead)
+async def get_agent_cart_item(
+    cart_item_id: UUID,
+    agent: CurrentAgent,
+    db: DatabaseSession,
+) -> CartItemRead:
+    item = await db.scalar(
+        select(CartItem)
+        .options(
+            selectinload(CartItem.credential),
+            selectinload(CartItem.checkout_execution),
+        )
+        .where(
+            CartItem.id == cart_item_id,
+            CartItem.agent_id == agent.id,
+            CartItem.owner_id == agent.owner_id,
+        )
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+    return cart_item_read(item)
+
+
+@router.get("/checkout-events", response_model=CheckoutEventPage)
+async def list_checkout_events(
+    agent: CurrentAgent,
+    db: DatabaseSession,
+    after_cursor: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> CheckoutEventPage:
+    events = list(
+        (
+            await db.scalars(
+                select(CheckoutEvent)
+                .where(
+                    CheckoutEvent.agent_id == agent.id,
+                    CheckoutEvent.owner_id == agent.owner_id,
+                    CheckoutEvent.cursor > after_cursor,
+                )
+                .order_by(CheckoutEvent.cursor)
+                .limit(limit)
+            )
+        ).all()
+    )
+    return CheckoutEventPage(
+        events=[checkout_event_read(event) for event in events],
+        next_cursor=events[-1].cursor if events else after_cursor,
+    )
 
 
 @router.post("/cart-items/{cart_item_id}/purchase", response_model=PurchaseRead)
@@ -230,12 +301,24 @@ async def complete_purchase(
 ) -> PurchaseRead:
     item = await db.scalar(
         select(CartItem)
-        .options(selectinload(CartItem.credential))
-        .where(CartItem.id == cart_item_id, CartItem.agent_id == agent.id)
+        .options(
+            selectinload(CartItem.credential),
+            selectinload(CartItem.checkout_execution),
+        )
+        .where(
+            CartItem.id == cart_item_id,
+            CartItem.agent_id == agent.id,
+            CartItem.owner_id == agent.owner_id,
+        )
         .with_for_update()
     )
     if item is None:
         raise HTTPException(status_code=404, detail="Cart item not found")
+    if item.checkout_execution is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Managed checkout completion is recorded by the checkout worker",
+        )
     if item.status is not CartItemStatus.approved or item.selected_payment_method_id is None:
         raise HTTPException(status_code=409, detail="Cart item is not approved for purchase")
 

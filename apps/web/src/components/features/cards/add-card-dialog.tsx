@@ -108,17 +108,19 @@ export function AddCardDialog() {
       </DialogTrigger>
       <DialogContent className="max-h-[92svh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Add a sandbox payment method</DialogTitle>
+          <DialogTitle>Add a payment-method reference</DialogTitle>
           <DialogDescription>
-            Add a provider-tokenized reference and safe card metadata for this prototype.
+            Add an opaque provider reference and safe display metadata. Use stripe_issuing for
+            managed checkout or prototype-vault for the legacy test flow.
           </DialogDescription>
         </DialogHeader>
 
         <div className="flex gap-3 rounded-lg border border-indigo-200 bg-indigo-50 p-3 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/40 dark:text-indigo-100">
           <ShieldCheck className="mt-0.5 size-4 shrink-0" />
           <p>
-            Never enter a full card number or CVC. AG Pay currently stores sandbox/provider
-            references and does not charge a card.
+            Never enter a full card number or CVC. For Stripe Issuing checkout, enter only the
+            virtual-card reference that starts with <span className="font-mono">ic_</span>; the
+            trusted worker retrieves sensitive fields only at execution time.
           </p>
         </div>
 
@@ -132,13 +134,13 @@ export function AddCardDialog() {
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="Display name" name="display_name" placeholder="Operations Visa" />
-              <Field label="Provider" name="provider" placeholder="sandbox" />
+              <Field label="Provider" name="provider" placeholder="stripe_issuing" />
               <div className="space-y-1.5 sm:col-span-2">
                 <Label htmlFor="provider_reference">Provider payment-method reference</Label>
                 <Input
                   id="provider_reference"
                   name="provider_reference"
-                  placeholder="pm_sandbox_..."
+                  placeholder="ic_... or pm_..."
                   autoComplete="off"
                   required
                   minLength={3}

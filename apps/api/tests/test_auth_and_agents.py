@@ -4,6 +4,25 @@ from helpers import API, PASSWORD, bearer, connect_agent, create_agent, register
 from httpx import AsyncClient
 
 
+async def test_validation_error_does_not_echo_rejected_password_or_extra_body_values(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        f"{API}/auth/register",
+        json={
+            "username": "ab",
+            "password": "pwSENT!",
+            "https://secret.example.test/4242424242424242": "cvc-sentinel-987",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "pwSENT!" not in response.text
+    assert "4242424242424242" not in response.text
+    assert "cvc-sentinel-987" not in response.text
+    assert all(set(error) == {"type", "loc", "msg"} for error in response.json()["detail"])
+
+
 async def test_registration_login_and_current_user(client: AsyncClient) -> None:
     token = await register_user(client, "  OWNER  ")
 

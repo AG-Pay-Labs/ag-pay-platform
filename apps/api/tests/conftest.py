@@ -55,7 +55,9 @@ def settings(tmp_path: Path) -> Settings:
 
 
 @pytest_asyncio.fixture
-async def client(settings: Settings, broker: FakeBroker) -> AsyncIterator[AsyncClient]:
+async def db_session_factory(
+    settings: Settings,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     engine = create_async_engine(settings.database_url)
 
     @event.listens_for(engine.sync_engine, "connect")
@@ -69,8 +71,19 @@ async def client(settings: Settings, broker: FakeBroker) -> AsyncIterator[AsyncC
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
 
+    yield session_factory
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def client(
+    settings: Settings,
+    broker: FakeBroker,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncClient]:
+
     async def override_get_db() -> AsyncIterator[AsyncSession]:
-        async with session_factory() as session:
+        async with db_session_factory() as session:
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
@@ -82,4 +95,3 @@ async def client(settings: Settings, broker: FakeBroker) -> AsyncIterator[AsyncC
         yield test_client
 
     app.dependency_overrides.clear()
-    await engine.dispose()

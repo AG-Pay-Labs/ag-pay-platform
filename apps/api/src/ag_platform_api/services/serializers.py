@@ -5,14 +5,24 @@ from ag_platform_api.models import (
     Agent,
     AgentStatus,
     CartItem,
+    CheckoutEvent,
+    CheckoutExecution,
     Purchase,
     Subscription,
 )
 from ag_platform_api.schemas import (
     AgentRead,
     CartItemRead,
+    CheckoutEventRead,
+    CheckoutExecutionSummary,
+    HumanCartItemRead,
+    HumanCheckoutExecutionSummary,
     PurchaseRead,
     SubscriptionRead,
+)
+from ag_platform_api.services.checkout.errors import (
+    SAFE_ERROR_MESSAGES,
+    CheckoutErrorCode,
 )
 
 
@@ -54,6 +64,8 @@ def cart_item_read(item: CartItem) -> CartItemRead:
         title=item.title,
         description=item.description,
         product_url=item.product_url,
+        checkout_adapter=item.checkout_adapter,
+        checkout_url=item.checkout_url,
         merchant=item.merchant,
         reason=item.reason,
         quantity=item.quantity,
@@ -68,7 +80,74 @@ def cart_item_read(item: CartItem) -> CartItemRead:
         approved_at=item.approved_at,
         cancelled_at=item.cancelled_at,
         created_at=item.created_at,
+        execution=(
+            checkout_execution_summary(item.checkout_execution)
+            if item.checkout_execution is not None
+            else None
+        ),
     )
+
+
+def checkout_execution_summary(execution: CheckoutExecution) -> CheckoutExecutionSummary:
+    error_code, error_message = safe_checkout_error(execution.error_code)
+    return CheckoutExecutionSummary(
+        id=execution.id,
+        status=execution.status,
+        attempt_count=execution.attempt_count,
+        approved_amount=execution.approved_amount,
+        currency=execution.currency,
+        checkout_origin=execution.checkout_origin,
+        submitted_at=execution.submitted_at,
+        completed_at=execution.completed_at,
+        error_code=error_code,
+        error_message=error_message,
+        created_at=execution.created_at,
+        updated_at=execution.updated_at,
+    )
+
+
+def human_cart_item_read(item: CartItem) -> HumanCartItemRead:
+    serialized = cart_item_read(item).model_dump()
+    serialized["execution"] = (
+        human_checkout_execution_summary(item.checkout_execution)
+        if item.checkout_execution is not None
+        else None
+    )
+    return HumanCartItemRead.model_validate(serialized)
+
+
+def human_checkout_execution_summary(
+    execution: CheckoutExecution,
+) -> HumanCheckoutExecutionSummary:
+    serialized = checkout_execution_summary(execution).model_dump()
+    serialized["merchant_order_reference"] = execution.merchant_order_reference
+    serialized["browserbase_session_id"] = execution.browserbase_session_id
+    return HumanCheckoutExecutionSummary.model_validate(serialized)
+
+
+def checkout_event_read(event: CheckoutEvent) -> CheckoutEventRead:
+    error_code, _ = safe_checkout_error(event.error_code)
+    return CheckoutEventRead(
+        cursor=event.cursor,
+        event_id=event.event_id,
+        request_id=event.cart_item_id,
+        status=event.status,
+        purchase_id=event.purchase_id,
+        amount=event.amount,
+        currency=event.currency,
+        error_code=error_code,
+        occurred_at=event.created_at,
+    )
+
+
+def safe_checkout_error(error_code: str | None) -> tuple[str | None, str | None]:
+    if error_code is None:
+        return None, None
+    try:
+        safe_code = CheckoutErrorCode(error_code)
+    except ValueError:
+        safe_code = CheckoutErrorCode.checkout_failed
+    return safe_code.value, SAFE_ERROR_MESSAGES[safe_code]
 
 
 def subscription_read(
@@ -103,6 +182,7 @@ def purchase_read(purchase: Purchase) -> PurchaseRead:
         amount=purchase.amount,
         currency=purchase.currency,
         provider_reference=purchase.provider_reference,
+        merchant_order_reference=purchase.merchant_order_reference,
         receipt_url=purchase.receipt_url,
         account_email=cart.credential.email,
         purchased_at=purchase.purchased_at,

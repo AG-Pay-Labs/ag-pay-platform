@@ -40,7 +40,11 @@ import {
 } from "@/components/ui/sheet";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAgents, useCartItems } from "@/hooks/use-api-data";
-import type { CartItemRead, CartItemStatus } from "@/lib/api-types";
+import type {
+  CartItemRead,
+  CartItemStatus,
+  CheckoutExecutionStatus,
+} from "@/lib/api-types";
 import { formatDateTime, hostname, relativeTime } from "@/utils/format";
 
 type Queue = "review" | "approved" | "history";
@@ -104,7 +108,7 @@ function ApprovalsContent() {
       <PageHeader
         eyebrow="Human approval"
         title="Purchase approvals"
-        description="Review what agents want to buy. Approval selects an assigned card and authorizes the agent to complete checkout externally."
+        description="Review what agents want to buy. Approval selects an assigned payment method and, for supported adapters, queues a secure AG Pay checkout."
       />
 
       <Card>
@@ -204,7 +208,7 @@ function ApprovalsContent() {
               {
                 id: "status",
                 header: "Status",
-                cell: (item) => <StatusBadge status={item.status} />,
+                cell: (item) => <StatusBadge status={item.execution?.status ?? item.status} />,
               },
               {
                 id: "amount",
@@ -243,7 +247,7 @@ function ApprovalsContent() {
                       {agentFor(item)?.name ?? "Unknown agent"} · {relativeTime(item.created_at)}
                     </p>
                   </div>
-                  <StatusBadge status={item.status} />
+                  <StatusBadge status={item.execution?.status ?? item.status} />
                 </div>
                 <div className="mt-4 flex items-end justify-between gap-3">
                   <span className="text-xs text-muted-foreground">
@@ -272,6 +276,9 @@ function ApprovalsContent() {
               <SheetHeader className="border-b p-6 text-left">
                 <div className="flex flex-wrap items-center gap-2">
                   <StatusBadge status={selected.status} />
+                  {selected.execution ? (
+                    <StatusBadge status={selected.execution.status} />
+                  ) : null}
                   {selected.billing_period ? (
                     <StatusBadge
                       status="approved"
@@ -305,11 +312,20 @@ function ApprovalsContent() {
 
                 <DetailSection title="What the agent is buying">
                   <p className="text-sm leading-6">{selected.description}</p>
-                  <Button variant="outline" size="sm" asChild>
-                    <Link href={selected.product_url} target="_blank" rel="noreferrer">
-                      Open product page <ExternalLink />
-                    </Link>
-                  </Button>
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="outline" size="sm" asChild>
+                      <Link href={selected.product_url} target="_blank" rel="noreferrer">
+                        Open product page <ExternalLink />
+                      </Link>
+                    </Button>
+                    {selected.checkout_url && selected.checkout_url !== selected.product_url ? (
+                      <Button variant="outline" size="sm" asChild>
+                        <Link href={selected.checkout_url} target="_blank" rel="noreferrer">
+                          Open checkout page <ExternalLink />
+                        </Link>
+                      </Button>
+                    ) : null}
+                  </div>
                 </DetailSection>
 
                 <DetailSection title="Why this purchase">
@@ -323,6 +339,10 @@ function ApprovalsContent() {
                     <Detail label="Merchant" value={selected.merchant ?? hostname(selected.product_url)} />
                     <Detail label="Agent" value={selectedAgent?.name ?? "Unknown agent"} />
                     <Detail label="Merchant account" value={selected.account_email} />
+                    <Detail
+                      label="Checkout mode"
+                      value={selected.checkout_adapter ?? "Legacy external completion"}
+                    />
                     <Detail label="Submitted" value={formatDateTime(selected.created_at)} />
                   </dl>
                   <RevealCredentialDialog item={selected} />
@@ -350,16 +370,7 @@ function ApprovalsContent() {
                     </div>
                   </div>
                 ) : selected.status === "approved" ? (
-                  <div className="flex gap-3 rounded-lg border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100">
-                    <CalendarClock className="mt-0.5 size-5 shrink-0" />
-                    <div>
-                      <p className="font-medium">Waiting for the agent</p>
-                      <p className="mt-1 leading-6">
-                        Approved {selected.approved_at ? relativeTime(selected.approved_at) : "recently"}.
-                        The agent must complete checkout externally and report the result.
-                      </p>
-                    </div>
-                  </div>
+                  <ApprovedState item={selected} />
                 ) : null}
               </div>
             </>
@@ -388,14 +399,98 @@ function Detail({ label, value }: { label: string; value: string }) {
   );
 }
 
+function ApprovedState({ item }: { item: CartItemRead }) {
+  const approved = item.approved_at ? relativeTime(item.approved_at) : "recently";
+  const execution = item.execution;
+  const copy = executionStatusCopy(execution?.status);
+
+  return (
+    <div className="flex gap-3 rounded-lg border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100">
+      <CalendarClock className="mt-0.5 size-5 shrink-0" />
+      <div>
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="font-medium">{copy.title}</p>
+          {execution ? <StatusBadge status={execution.status} /> : null}
+        </div>
+        <p className="mt-1 leading-6">
+          Approved {approved}. {copy.description}
+        </p>
+        {execution?.error_message ? (
+          <p className="mt-2 leading-5">{execution.error_message}</p>
+        ) : null}
+        {execution?.error_code ? (
+          <p className="mt-2 font-mono text-xs">Reason code: {execution.error_code}</p>
+        ) : null}
+        {execution?.merchant_order_reference ? (
+          <p className="mt-2 text-xs">
+            Merchant order: <span className="font-mono">{execution.merchant_order_reference}</span>
+          </p>
+        ) : null}
+        {execution?.browserbase_session_id ? (
+          <p className="mt-2 text-xs">
+            <a
+              className="underline"
+              href={`https://www.browserbase.com/sessions/${encodeURIComponent(execution.browserbase_session_id)}`}
+              rel="noreferrer"
+              target="_blank"
+            >
+              Open Browserbase session
+            </a>
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function executionStatusCopy(status: CheckoutExecutionStatus | undefined) {
+  switch (status) {
+    case "queued":
+      return {
+        title: "Checkout queued",
+        description: "The trusted AG Pay worker will start the configured checkout.",
+      };
+    case "running":
+      return {
+        title: "Checkout in progress",
+        description: "AG Pay is completing the allowlisted checkout without exposing card data to the agent.",
+      };
+    case "action_required":
+      return {
+        title: "Human action required",
+        description: "Checkout stopped safely because the merchant requires an interactive step.",
+      };
+    case "failed":
+      return {
+        title: "Checkout failed safely",
+        description: "No successful purchase was recorded. Review the reason before trying again.",
+      };
+    case "outcome_unknown":
+      return {
+        title: "Outcome needs reconciliation",
+        description: "Submission may have occurred, so AG Pay will not retry automatically or risk a duplicate charge.",
+      };
+    case "succeeded":
+      return {
+        title: "Checkout confirmed",
+        description: "The purchase outcome has been verified and recorded.",
+      };
+    default:
+      return {
+        title: "Waiting for legacy completion",
+        description: "The agent must complete checkout externally and report the result.",
+      };
+  }
+}
+
 function emptyTitle(queue: Queue) {
   if (queue === "review") return "You are all caught up";
-  if (queue === "approved") return "No purchases waiting on agents";
+  if (queue === "approved") return "No approved checkouts in progress";
   return "No decision history yet";
 }
 
 function emptyDescription(queue: Queue) {
   if (queue === "review") return "New agent proposals will appear here for human approval.";
-  if (queue === "approved") return "Approved proposals remain here until an agent reports completion.";
+  if (queue === "approved") return "Approved proposals remain here until checkout reaches a terminal state.";
   return "Purchased and cancelled proposals will appear here.";
 }

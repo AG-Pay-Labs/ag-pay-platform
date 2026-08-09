@@ -72,7 +72,7 @@ export default function OverviewPage() {
       <PageHeader
         eyebrow="Control plane"
         title="Overview"
-        description="Monitor connected agents, decisions that need you, and externally recorded purchases."
+        description="Monitor connected agents, decisions that need you, and confirmed checkout outcomes."
         actions={
           <Button variant="outline" onClick={retry} disabled={allLoading}>
             <RefreshCw className={allLoading ? "animate-spin" : ""} />
@@ -234,7 +234,7 @@ export default function OverviewPage() {
           <div>
             <CardTitle>Recent purchases</CardTitle>
             <p className="mt-1 text-sm text-muted-foreground">
-              Successful purchases reported by your agents.
+              Successful checkout outcomes recorded by AG Pay.
             </p>
           </div>
           <Button variant="ghost" size="sm" asChild>
@@ -251,7 +251,7 @@ export default function OverviewPage() {
               compact
               icon={ReceiptText}
               title="No purchases recorded"
-              description="Approved items appear here after an agent reports external completion."
+              description="Approved items appear here after checkout is confirmed."
             />
           ) : (
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -287,7 +287,7 @@ export default function OverviewPage() {
 function SetupChecklist() {
   const steps = [
     { label: "Connect your first agent", href: "/agents", icon: Bot },
-    { label: "Add a sandbox payment method", href: "/cards", icon: CreditCard },
+    { label: "Add a provider reference", href: "/cards", icon: CreditCard },
     { label: "Assign the card to the agent", href: "/agents", icon: CheckCircle2 },
     { label: "Wait for the first proposal", href: "/approvals", icon: Clock3 },
   ];

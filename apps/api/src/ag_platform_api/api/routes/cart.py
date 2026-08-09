@@ -23,11 +23,12 @@ from ag_platform_api.models import (
 from ag_platform_api.schemas import (
     CartApproval,
     CartCancellation,
-    CartItemRead,
     CredentialReveal,
     CredentialRevealRequest,
+    HumanCartItemRead,
 )
-from ag_platform_api.services.serializers import cart_item_read
+from ag_platform_api.services.checkout_queue import CheckoutQueueError, queue_checkout_execution
+from ag_platform_api.services.serializers import human_cart_item_read
 
 router = APIRouter(prefix="/cart-items", tags=["cart"])
 
@@ -35,7 +36,10 @@ router = APIRouter(prefix="/cart-items", tags=["cart"])
 async def load_cart_item(db: DatabaseSession, cart_item_id: UUID) -> CartItem:
     item = await db.scalar(
         select(CartItem)
-        .options(selectinload(CartItem.credential))
+        .options(
+            selectinload(CartItem.credential),
+            selectinload(CartItem.checkout_execution),
+        )
         .where(CartItem.id == cart_item_id)
     )
     if item is None:
@@ -52,7 +56,10 @@ async def owned_cart_item(
 ) -> CartItem:
     query = (
         select(CartItem)
-        .options(selectinload(CartItem.credential))
+        .options(
+            selectinload(CartItem.credential),
+            selectinload(CartItem.checkout_execution),
+        )
         .where(CartItem.id == cart_item_id, CartItem.owner_id == owner_id)
     )
     if for_update:
@@ -63,50 +70,56 @@ async def owned_cart_item(
     return item
 
 
-@router.get("", response_model=list[CartItemRead])
+@router.get("", response_model=list[HumanCartItemRead])
 async def list_cart_items(
     user: CurrentUser,
     db: DatabaseSession,
     item_status: Annotated[CartItemStatus | None, Query(alias="status")] = None,
-) -> list[CartItemRead]:
+) -> list[HumanCartItemRead]:
     query = (
         select(CartItem)
-        .options(selectinload(CartItem.credential))
+        .options(
+            selectinload(CartItem.credential),
+            selectinload(CartItem.checkout_execution),
+        )
         .where(CartItem.owner_id == user.id)
         .order_by(CartItem.created_at.desc())
     )
     if item_status is not None:
         query = query.where(CartItem.status == item_status)
     items = (await db.scalars(query)).all()
-    return [cart_item_read(item) for item in items]
+    return [human_cart_item_read(item) for item in items]
 
 
-@router.get("/{cart_item_id}", response_model=CartItemRead)
+@router.get("/{cart_item_id}", response_model=HumanCartItemRead)
 async def get_cart_item(
     cart_item_id: UUID,
     user: CurrentUser,
     db: DatabaseSession,
-) -> CartItemRead:
-    return cart_item_read(await owned_cart_item(db, user.id, cart_item_id))
+) -> HumanCartItemRead:
+    return human_cart_item_read(await owned_cart_item(db, user.id, cart_item_id))
 
 
-@router.post("/{cart_item_id}/approve", response_model=CartItemRead)
+@router.post("/{cart_item_id}/approve", response_model=HumanCartItemRead)
 async def approve_cart_item(
     cart_item_id: UUID,
     payload: CartApproval,
     user: CurrentUser,
     db: DatabaseSession,
+    settings: AppSettings,
     broker: Broker,
-) -> CartItemRead:
+) -> HumanCartItemRead:
     item = await owned_cart_item(db, user.id, cart_item_id, for_update=True)
     if item.status is not CartItemStatus.proposed:
         raise HTTPException(status_code=409, detail="Only proposed cart items can be approved")
     payment_method = await db.scalar(
-        select(PaymentMethod).where(
+        select(PaymentMethod)
+        .where(
             PaymentMethod.id == payload.payment_method_id,
             PaymentMethod.owner_id == user.id,
             PaymentMethod.status == PaymentMethodStatus.active,
         )
+        .with_for_update()
     )
     if payment_method is None:
         raise HTTPException(status_code=404, detail="Active payment method not found")
@@ -121,6 +134,16 @@ async def approve_cart_item(
     item.selected_payment_method_id = payment_method.id
     item.decision_note = payload.note
     item.approved_at = datetime.now(UTC)
+    try:
+        await queue_checkout_execution(
+            db,
+            item=item,
+            payment_method=payment_method,
+            settings=settings,
+        )
+    except CheckoutQueueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=exc.message) from exc
     await db.commit()
     item = await load_cart_item(db, item.id)
     await broker.publish(
@@ -131,17 +154,17 @@ async def approve_cart_item(
             "payment_method_id": payment_method.id,
         },
     )
-    return cart_item_read(item)
+    return human_cart_item_read(item)
 
 
-@router.post("/{cart_item_id}/cancel", response_model=CartItemRead)
+@router.post("/{cart_item_id}/cancel", response_model=HumanCartItemRead)
 async def cancel_cart_item(
     cart_item_id: UUID,
     payload: CartCancellation,
     user: CurrentUser,
     db: DatabaseSession,
     broker: Broker,
-) -> CartItemRead:
+) -> HumanCartItemRead:
     item = await owned_cart_item(db, user.id, cart_item_id, for_update=True)
     if item.status is not CartItemStatus.proposed:
         raise HTTPException(status_code=409, detail="Only proposed cart items can be cancelled")
@@ -153,7 +176,7 @@ async def cancel_cart_item(
     await broker.publish(
         "cart_item.cancelled", {"cart_item_id": item.id, "agent_id": item.agent_id}
     )
-    return cart_item_read(item)
+    return human_cart_item_read(item)
 
 
 @router.post("/{cart_item_id}/credential/reveal", response_model=CredentialReveal)

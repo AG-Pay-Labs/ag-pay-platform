@@ -69,7 +69,7 @@ export default function SubscriptionsPage() {
       <PageHeader
         eyebrow="Recurring commitments"
         title="Subscriptions"
-        description="Track recurring purchases reported by agents. Status changes here do not pause or cancel billing at the merchant."
+        description="Track recurring purchases confirmed after checkout. Status changes here do not pause or cancel billing at the merchant."
       />
 
       <div className="mb-5 flex gap-3 rounded-xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100">
@@ -129,7 +129,7 @@ export default function SubscriptionsPage() {
                 description={
                   search || status !== "all"
                     ? "Change the search or status filter."
-                    : "A recurring purchase appears here after an agent reports external completion."
+                    : "A recurring purchase appears here after checkout is confirmed."
                 }
               />
             }

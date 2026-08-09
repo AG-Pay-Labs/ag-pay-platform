@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -52,6 +53,15 @@ class CartItemStatus(enum.StrEnum):
     approved = "approved"
     cancelled = "cancelled"
     purchased = "purchased"
+
+
+class CheckoutExecutionStatus(enum.StrEnum):
+    queued = "queued"
+    running = "running"
+    succeeded = "succeeded"
+    failed = "failed"
+    action_required = "action_required"
+    outcome_unknown = "outcome_unknown"
 
 
 class PurchaseStatus(enum.StrEnum):
@@ -235,6 +245,8 @@ class CartItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     product_url: Mapped[str] = mapped_column(Text, nullable=False)
+    checkout_adapter: Mapped[str | None] = mapped_column(String(64))
+    checkout_url: Mapped[str | None] = mapped_column(Text)
     merchant: Mapped[str | None] = mapped_column(String(255))
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -255,8 +267,67 @@ class CartItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     credential: Mapped[PurchaseCredential] = relationship()
     purchase: Mapped["Purchase | None"] = relationship(back_populates="cart_item", uselist=False)
+    checkout_execution: Mapped["CheckoutExecution | None"] = relationship(
+        back_populates="cart_item", uselist=False
+    )
 
-    __table_args__ = (Index("ix_cart_items_owner_status", "owner_id", "status"),)
+    __table_args__ = (
+        CheckConstraint(
+            "(checkout_adapter IS NULL AND checkout_url IS NULL) OR "
+            "(checkout_adapter IS NOT NULL AND checkout_url IS NOT NULL)",
+            name="checkout_fields",
+        ),
+        Index("ix_cart_items_owner_status", "owner_id", "status"),
+    )
+
+
+class CheckoutExecution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "checkout_executions"
+
+    owner_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agents.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    payment_method_id: Mapped[UUID] = mapped_column(
+        ForeignKey("payment_methods.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    cart_item_id: Mapped[UUID] = mapped_column(
+        ForeignKey("cart_items.id", ondelete="RESTRICT"), nullable=False, unique=True
+    )
+    adapter_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    adapter_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    approved_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    checkout_origin: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[CheckoutExecutionStatus] = mapped_column(
+        Enum(CheckoutExecutionStatus, native_enum=False),
+        nullable=False,
+        default=CheckoutExecutionStatus.queued,
+        server_default=CheckoutExecutionStatus.queued.value,
+        index=True,
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    browserbase_session_id: Mapped[str | None] = mapped_column(String(255))
+    merchant_order_reference: Mapped[str | None] = mapped_column(String(128))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+    cart_item: Mapped[CartItem] = relationship(back_populates="checkout_execution")
+    events: Mapped[list["CheckoutEvent"]] = relationship(back_populates="execution")
+
+    __table_args__ = (
+        CheckConstraint("approved_amount > 0", name="approved_amount_positive"),
+        CheckConstraint("length(currency) = 3", name="currency_length"),
+        CheckConstraint("attempt_count >= 0", name="attempt_count_non_negative"),
+        Index("ix_checkout_executions_owner_status", "owner_id", "status"),
+    )
 
 
 class Purchase(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -283,6 +354,7 @@ class Purchase(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     provider_reference: Mapped[str] = mapped_column(String(255), nullable=False)
+    merchant_order_reference: Mapped[str | None] = mapped_column(String(128))
     receipt_url: Mapped[str | None] = mapped_column(Text)
     purchased_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -296,6 +368,50 @@ class Purchase(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "payment_method_id", "provider_reference", name="payment_provider_reference"
         ),
         Index("ix_purchases_owner_purchased_at", "owner_id", "purchased_at"),
+    )
+
+
+class CheckoutEvent(Base):
+    __tablename__ = "checkout_events"
+
+    cursor: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[UUID] = mapped_column(default=uuid4, nullable=False, unique=True)
+    execution_id: Mapped[UUID] = mapped_column(
+        ForeignKey("checkout_executions.id", ondelete="RESTRICT"), nullable=False, unique=True
+    )
+    owner_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agents.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    cart_item_id: Mapped[UUID] = mapped_column(
+        ForeignKey("cart_items.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    purchase_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("purchases.id", ondelete="RESTRICT"), unique=True
+    )
+    status: Mapped[CheckoutExecutionStatus] = mapped_column(
+        Enum(CheckoutExecutionStatus, native_enum=False), nullable=False
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    execution: Mapped[CheckoutExecution] = relationship(back_populates="events")
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('succeeded', 'failed', 'action_required', 'outcome_unknown')",
+            name="terminal_status",
+        ),
+        CheckConstraint("amount > 0", name="amount_positive"),
+        CheckConstraint("length(currency) = 3", name="currency_length"),
+        Index("ix_checkout_events_agent_cursor", "agent_id", "cursor"),
+        {"sqlite_autoincrement": True},
     )
 
 

@@ -160,7 +160,8 @@ export function EditPaymentPolicySheet({ agent, policy }: EditPaymentPolicySheet
         <SheetHeader className="border-b px-5 py-5 pr-14">
           <SheetTitle>Edit approval rule</SheetTitle>
           <SheetDescription>
-            Decide when purchases proposed by {agent.name} must wait for you.
+            Decide when legacy external-completion purchases proposed by {agent.name} must wait for
+            you. Managed browser checkout always requires your explicit approval.
           </SheetDescription>
         </SheetHeader>
 
@@ -250,8 +251,9 @@ export function EditPaymentPolicySheet({ agent, policy }: EditPaymentPolicySheet
               <div className="flex gap-3 rounded-xl border border-indigo-200 bg-indigo-50 p-3.5 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100">
                 <CreditCard className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
                 <p className="leading-5">
-                  Auto-approved purchases still use an active payment method assigned to this
-                  agent. If none is available, the purchase cannot proceed automatically.
+                  These rules can auto-approve only legacy external-completion proposals, using
+                  an active method assigned to the agent. Managed browser checkout always waits
+                  for your explicit approval.
                 </p>
               </div>
               {isThresholdMode(mode) ? (

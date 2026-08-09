@@ -1,4 +1,4 @@
-# AG Platform development guide
+# AG Pay Platform development guide
 
 ## Current scope
 
@@ -27,17 +27,22 @@ PostgreSQL.
 ## Backend invariants
 
 - Never add raw card-number/CVC fields. Use a provider token/reference and safe
-  metadata only, and keep provider references out of response schemas.
+  metadata only, and keep provider references out of response schemas. The
+  managed checkout worker may retrieve an issuing-card secret into short-lived
+  process memory only; never send it to an LLM or persist, record, or log it.
 - Hash human passwords with Argon2; hash opaque pairing/agent tokens; encrypt
   merchant passwords and expose them only through the re-authenticated reveal
   route.
 - Human routes must filter by `owner_id`. Agent routes must take agent and owner
   identity only from the authenticated agent credential.
-- Validate the agent/payment-method assignment at approval and completion.
+- Validate the agent/payment-method assignment when managed checkout is queued,
+  immediately before submission, and again when success is recorded.
 - Lock rows around financial state transitions and keep uniqueness constraints
   that prevent duplicate purchases/subscriptions.
 - PostgreSQL is the source of truth. Redis publication is best effort until a
   transactional outbox is implemented; never claim it is a durable audit log.
+  Checkout execution rows and the cursor-based agent event feed are durable
+  PostgreSQL state.
 - Update base-repository docs when the implemented API or state model changes.
 
 ## Web invariants
@@ -52,11 +57,12 @@ PostgreSQL.
   approval, and completion rules. Client-side guards are UX, not security.
 - Keep auth, proxy, and merchant-credential responses non-cacheable. Requiring
   the current platform password for credential reveal must remain explicit.
-- Card forms may accept only opaque fake/sandbox provider references and safe
-  metadata. Never add PAN, CVC, PIN, or 3-D Secure fields.
-- UI copy must say that approval authorizes external completion. Never claim
-  that AG Pay charges a card, pays a merchant, or cancels a merchant
-  subscription when it only updates local state.
+- Card forms may accept only opaque provider references and safe metadata.
+  Never add PAN, CVC, PIN, or 3-D Secure fields.
+- UI copy must distinguish legacy/manual proposals from configured managed
+  checkout. Never claim an unconfirmed payment, refund, or merchant
+  subscription cancellation; a managed checkout is complete only after the
+  worker verifies the issuer authorization and records the purchase.
 - Preserve accessible keyboard/focus behavior, loading/empty/error states, and
   responsive management journeys. Run a browser smoke test after material UI
   changes.

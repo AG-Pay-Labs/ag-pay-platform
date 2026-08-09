@@ -1,6 +1,8 @@
+import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import (
@@ -20,21 +22,49 @@ from ag_platform_api.models import (
     BillingPeriod,
     BillingProfileType,
     CartItemStatus,
+    CheckoutExecutionStatus,
     PaymentApprovalMode,
     PaymentMethodStatus,
     PurchaseStatus,
     SubscriptionStatus,
 )
+from ag_platform_api.services.checkout.errors import CheckoutError
+from ag_platform_api.services.checkout.types import decimal_to_minor
 
 Username = Annotated[
     str,
     StringConstraints(strip_whitespace=True, to_lower=True, min_length=3, max_length=64),
 ]
 Password = Annotated[SecretStr, Field(min_length=10, max_length=256)]
+OPAQUE_PROVIDER_REFERENCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{2,254}$")
+PROVIDER_REFERENCE_PATTERNS = {
+    "stripe_issuing": re.compile(r"^ic_[A-Za-z0-9]+$"),
+    "prototype-vault": re.compile(r"^pm_[A-Za-z0-9_-]+$"),
+}
 
 
 def _uppercase(value: str) -> str:
     return value.strip().upper()
+
+
+def _luhn_valid(value: str) -> bool:
+    checksum = 0
+    parity = len(value) % 2
+    for index, character in enumerate(value):
+        digit = int(character)
+        if index % 2 == parity:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        checksum += digit
+    return checksum % 10 == 0
+
+
+def _contains_pan_or_cvc_like_digits(value: str) -> bool:
+    if re.search(r"(?:^|[_-])\d{3,4}$", value):
+        return True
+    digits = "".join(character for character in value if character.isdigit())
+    return 12 <= len(digits) <= 19 and _luhn_valid(digits)
 
 
 Currency = Annotated[
@@ -236,6 +266,16 @@ class PaymentMethodCreate(APIModel):
         now = datetime.now(UTC)
         if (self.expiry_year, self.expiry_month) < (now.year, now.month):
             raise ValueError("Card expiry must not be in the past")
+        reference_pattern = PROVIDER_REFERENCE_PATTERNS.get(self.provider)
+        if (
+            reference_pattern is None
+            or OPAQUE_PROVIDER_REFERENCE.fullmatch(self.provider_payment_method_id) is None
+            or reference_pattern.fullmatch(self.provider_payment_method_id) is None
+            or _contains_pan_or_cvc_like_digits(self.provider_payment_method_id)
+        ):
+            raise ValueError(
+                "Provider payment-method reference must be an opaque provider identifier"
+            )
         return self
 
 
@@ -259,6 +299,39 @@ class AccountCredentialInput(APIModel):
     login_url: AnyHttpUrl | None = None
 
 
+class CheckoutSpec(APIModel):
+    adapter: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=64,
+            pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$",
+        ),
+    ]
+    checkout_url: AnyHttpUrl
+
+    @model_validator(mode="after")
+    def validate_checkout_url(self) -> "CheckoutSpec":
+        try:
+            parsed = urlsplit(str(self.checkout_url))
+            _ = parsed.port
+        except ValueError:
+            raise ValueError(
+                "Managed checkout requires an absolute HTTPS URL without embedded credentials"
+            ) from None
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError(
+                "Managed checkout requires an absolute HTTPS URL without embedded credentials"
+            )
+        return self
+
+
 class CartItemCreate(APIModel):
     title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
     description: Annotated[
@@ -272,6 +345,33 @@ class CartItemCreate(APIModel):
     currency: Currency
     billing_period: BillingPeriod | None = None
     account: AccountCredentialInput
+    checkout: CheckoutSpec | None = None
+
+    @model_validator(mode="after")
+    def reject_unverified_managed_recurrence(self) -> "CartItemCreate":
+        if self.checkout is not None and self.billing_period is not None:
+            raise ValueError("Managed checkout does not support recurring purchases")
+        if self.checkout is not None:
+            try:
+                decimal_to_minor(self.unit_price * self.quantity, self.currency)
+            except CheckoutError as error:
+                raise ValueError(error.safe_message) from None
+        return self
+
+
+class CheckoutExecutionSummary(APIModel):
+    id: UUID
+    status: CheckoutExecutionStatus
+    attempt_count: int
+    approved_amount: Decimal
+    currency: str
+    checkout_origin: str
+    submitted_at: datetime | None
+    completed_at: datetime | None
+    error_code: str | None
+    error_message: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class CartItemRead(APIModel):
@@ -282,6 +382,8 @@ class CartItemRead(APIModel):
     title: str
     description: str
     product_url: str
+    checkout_adapter: str | None
+    checkout_url: str | None
     merchant: str | None
     reason: str
     quantity: int
@@ -296,6 +398,16 @@ class CartItemRead(APIModel):
     approved_at: datetime | None
     cancelled_at: datetime | None
     created_at: datetime
+    execution: CheckoutExecutionSummary | None = None
+
+
+class HumanCheckoutExecutionSummary(CheckoutExecutionSummary):
+    merchant_order_reference: str | None
+    browserbase_session_id: str | None
+
+
+class HumanCartItemRead(CartItemRead):
+    execution: HumanCheckoutExecutionSummary | None = None
 
 
 class CartApproval(APIModel):
@@ -327,6 +439,23 @@ class PurchaseComplete(APIModel):
     next_billing_at: datetime | None = None
 
 
+class CheckoutEventRead(APIModel):
+    cursor: int
+    event_id: UUID
+    request_id: UUID
+    status: CheckoutExecutionStatus
+    purchase_id: UUID | None
+    amount: Decimal
+    currency: str
+    error_code: str | None
+    occurred_at: datetime
+
+
+class CheckoutEventPage(APIModel):
+    events: list[CheckoutEventRead]
+    next_cursor: int
+
+
 class SubscriptionRead(APIModel):
     id: UUID
     purchase_id: UUID
@@ -352,6 +481,7 @@ class PurchaseRead(APIModel):
     amount: Decimal
     currency: str
     provider_reference: str
+    merchant_order_reference: str | None
     receipt_url: str | None
     account_email: EmailStr
     purchased_at: datetime

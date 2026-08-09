@@ -1,3 +1,4 @@
+import pytest
 from helpers import (
     API,
     bearer,
@@ -8,6 +9,44 @@ from helpers import (
     register_user,
 )
 from httpx import AsyncClient
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from ag_platform_api.models import PaymentMethod
+
+
+@pytest.mark.parametrize(
+    ("provider", "reference"),
+    [
+        ("prototype-vault", "123"),
+        ("prototype-vault", "4242424242424242"),
+        ("prototype-vault", "pm_card-4242-4242-4242-4242"),
+        ("prototype-vault", "pm_card-123"),
+        ("external-vault", "card_reference_safe_shape"),
+        ("stripe_issuing", "pm_not_an_issuing_card"),
+    ],
+)
+async def test_raw_or_provider_mismatched_references_are_rejected_without_persistence(
+    client: AsyncClient,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    provider: str,
+    reference: str,
+) -> None:
+    user_token = await register_user(client, f"unsafe-reference-{abs(hash(reference))}")
+    payload = personal_payment_method(reference)
+    payload["provider"] = provider
+
+    response = await client.post(
+        f"{API}/payment-methods",
+        headers=bearer(user_token),
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert reference not in response.text
+    async with db_session_factory() as db:
+        count = await db.scalar(select(func.count()).select_from(PaymentMethod))
+    assert count == 0
 
 
 async def test_personal_and_business_cards_can_be_shared_across_owned_agents(
@@ -78,3 +117,6 @@ async def test_personal_and_business_cards_can_be_shared_across_owned_agents(
         "card_number",
         "cvc",
     }
+    assert "test-pan-must-not-be-accepted" not in raw_card.text
+    assert "test-cvc-must-not-be-accepted" not in raw_card.text
+    assert all("input" not in error and "ctx" not in error for error in raw_card.json()["detail"])

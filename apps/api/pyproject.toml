@@ -14,6 +14,7 @@ dependencies = [
   "email-validator>=2.2,<3",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
+  "playwright>=1.54,<2",
   "pwdlib[argon2]>=0.2,<1",
   "pydantic-settings>=2.10,<3",
   "pyjwt>=2.10,<3",
@@ -22,6 +23,9 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.41,<3",
   "uvicorn[standard]>=0.35,<1",
 ]
+
+[project.scripts]
+ag-pay-checkout-worker = "ag_platform_api.checkout_worker:main"
 
 [project.optional-dependencies]
 dev = [
@@ -44,4 +48,3 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
-

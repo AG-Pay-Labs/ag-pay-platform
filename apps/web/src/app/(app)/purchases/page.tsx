@@ -93,7 +93,7 @@ export default function PurchasesPage() {
       <PageHeader
         eyebrow="Audit trail"
         title="Purchases"
-        description="A record of purchase outcomes reported after agents complete checkout on merchant sites."
+        description="A record of confirmed checkout outcomes, including purchases completed by the trusted AG Pay executor."
       />
 
       <Card>
@@ -143,7 +143,7 @@ export default function PurchasesPage() {
                 description={
                   search || status !== "all"
                     ? "Change the search or outcome filter."
-                    : "Approved items appear here after an agent reports external completion."
+                    : "Approved items appear here after checkout is confirmed."
                 }
               />
             }
@@ -255,7 +255,7 @@ export default function PurchasesPage() {
                       Recorded total
                     </p>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      Reported by {selectedAgent?.name ?? "unknown agent"}
+                      Requested by {selectedAgent?.name ?? "unknown agent"}
                     </p>
                   </div>
                   <Money amount={selected.amount} currency={selected.currency} className="text-2xl" />
@@ -303,6 +303,13 @@ export default function PurchasesPage() {
                   <dl className="grid gap-4 text-sm sm:grid-cols-2">
                     <Detail label="Agent" value={selectedAgent?.name ?? "Unknown agent"} />
                     <Detail label="Merchant account" value={selected.account_email} />
+                    {selected.merchant_order_reference ? (
+                      <Detail
+                        label="Merchant order"
+                        value={selected.merchant_order_reference}
+                        monospace
+                      />
+                    ) : null}
                     <Detail label="Provider reference" value={selected.provider_reference} monospace />
                     <Detail label="Purchase ID" value={selected.id} monospace />
                   </dl>
@@ -325,7 +332,9 @@ export default function PurchasesPage() {
                 ) : null}
 
                 <p className="text-xs leading-5 text-muted-foreground">
-                  AG Pay records the outcome supplied by the agent. It does not independently settle or refund the charge.
+                  Managed checkouts are recorded only after merchant and payment-provider verification.
+                  Legacy external records may still rely on an agent-supplied result. Refunds and merchant
+                  subscription cancellation remain separate provider operations.
                 </p>
               </div>
             </>

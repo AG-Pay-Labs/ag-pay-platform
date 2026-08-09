@@ -8,9 +8,14 @@ const STATUS_TONES: Record<string, StatusTone> = {
   completed: "positive",
   online: "positive",
   purchased: "positive",
+  succeeded: "positive",
   pending: "warning",
   proposed: "warning",
+  queued: "warning",
   approved: "info",
+  running: "info",
+  action_required: "warning",
+  outcome_unknown: "warning",
   offline: "neutral",
   paused: "neutral",
   cancelled: "negative",
@@ -79,4 +84,3 @@ export function StatusBadge({
     </Badge>
   )
 }
-

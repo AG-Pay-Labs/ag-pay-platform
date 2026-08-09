@@ -53,8 +53,9 @@ export default function CardsPage() {
       <div className="mb-6 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
         <ShieldAlert className="mt-0.5 size-4 shrink-0" />
         <p>
-          This prototype does not collect or expose raw card credentials and does not charge a
-          card. Use sandbox or already-tokenized provider references only.
+          Never enter raw card credentials. Managed checkout supports only server-configured
+          provider references; sensitive values are retrieved inside the trusted executor and are
+          never returned to the browser or agent.
         </p>
       </div>
 
@@ -66,7 +67,7 @@ export default function CardsPage() {
         <EmptyState
           icon={CreditCard}
           title="No payment methods"
-          description="Add a sandbox provider reference and safe card metadata, then assign it to one or more agents."
+          description="Add a configured provider reference and safe card metadata, then assign it to one or more agents."
           action={<AddCardDialog />}
         />
       ) : null}

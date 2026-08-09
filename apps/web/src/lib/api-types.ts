@@ -8,6 +8,13 @@ export type BillingProfileType = "personal" | "business";
 export type BillingPeriod = "monthly" | "yearly";
 export type PaymentMethodStatus = "active" | "disabled";
 export type CartItemStatus = "proposed" | "approved" | "cancelled" | "purchased";
+export type CheckoutExecutionStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "action_required"
+  | "outcome_unknown";
 export type PurchaseStatus = "completed" | "failed" | "refunded";
 export type SubscriptionStatus = "active" | "cancelled" | "paused";
 export type PaymentApprovalMode =
@@ -159,6 +166,28 @@ export interface AccountCredentialInput {
   login_url?: string | null;
 }
 
+export interface CheckoutRequest {
+  adapter: string;
+  checkout_url: string;
+}
+
+export interface CheckoutExecutionRead {
+  id: UUID;
+  status: CheckoutExecutionStatus;
+  attempt_count: number;
+  approved_amount: DecimalString;
+  currency: string;
+  checkout_origin: string;
+  error_code: string | null;
+  error_message: string | null;
+  merchant_order_reference: string | null;
+  browserbase_session_id: string | null;
+  submitted_at: ISODateTime | null;
+  completed_at: ISODateTime | null;
+  created_at: ISODateTime;
+  updated_at: ISODateTime;
+}
+
 export interface CartItemCreate {
   title: string;
   description: string;
@@ -169,6 +198,7 @@ export interface CartItemCreate {
   unit_price: DecimalString;
   currency: string;
   billing_period?: BillingPeriod | null;
+  checkout?: CheckoutRequest | null;
   account: AccountCredentialInput;
 }
 
@@ -187,6 +217,9 @@ export interface CartItemRead {
   total_amount: DecimalString;
   currency: string;
   billing_period: BillingPeriod | null;
+  checkout_adapter: string | null;
+  checkout_url: string | null;
+  execution: CheckoutExecutionRead | null;
   status: CartItemStatus;
   decision_note: string | null;
   account_email: string;
@@ -249,6 +282,7 @@ export interface PurchaseRead {
   amount: DecimalString;
   currency: string;
   provider_reference: string;
+  merchant_order_reference: string | null;
   receipt_url: string | null;
   account_email: string;
   purchased_at: ISODateTime;

@@ -65,18 +65,19 @@ export default function RulesPage() {
           <div>
             <p className="font-medium">Rules decide the approval step</p>
             <p className="mt-1 leading-5">
-              An automatic decision does not charge a card. AG Pay remains a control plane and
-              records only sandbox or externally reported purchase results.
+              For a proposal with a configured checkout adapter, automatic approval also queues
+              the trusted executor. Unsupported or legacy proposals retain external completion.
             </p>
           </div>
         </div>
         <div className="flex gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
           <TriangleAlert className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
           <div>
-            <p className="font-medium">Automatic approval still has guardrails</p>
+            <p className="font-medium">Automatic approval is legacy-only</p>
             <p className="mt-1 leading-5">
-              It uses an active card assigned to the agent. For amount rules, a currency mismatch
-              is always sent for human approval.
+              It uses an active card assigned to the agent for external-completion proposals.
+              Managed browser checkout always requires your explicit approval; currency
+              mismatches also require review.
             </p>
           </div>
         </div>
@@ -179,6 +180,10 @@ function AgentPolicyCard({
             Different currencies always require approval.
           </div>
         ) : null}
+        <div className="flex items-start gap-2 rounded-lg border border-indigo-200/80 bg-indigo-50/70 p-3 text-xs leading-5 text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/20 dark:text-indigo-100">
+          <ShieldCheck className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          Managed browser checkout always waits for your explicit approval.
+        </div>
       </CardContent>
 
       <CardFooter className="justify-between gap-3">

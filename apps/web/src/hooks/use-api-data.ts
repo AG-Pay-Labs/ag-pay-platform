@@ -58,6 +58,7 @@ export function usePurchases() {
   return useQuery({
     queryKey: queryKeys.purchases,
     queryFn: () => apiRequest<PurchaseRead[]>("/purchases"),
+    refetchInterval: 20_000,
   });
 }
 
@@ -65,6 +66,7 @@ export function useSubscriptions() {
   return useQuery({
     queryKey: queryKeys.subscriptions,
     queryFn: () => apiRequest<SubscriptionRead[]>("/subscriptions"),
+    refetchInterval: 20_000,
   });
 }
 

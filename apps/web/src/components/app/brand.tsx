@@ -11,7 +11,7 @@ export function BrandMark({ className, priority = false }: BrandMarkProps) {
   return (
     <span
       className={cn(
-        "relative block size-10 shrink-0 overflow-hidden rounded-[13px] bg-[#09084f] shadow-sm shadow-indigo-950/20 ring-1 ring-white/10",
+        "relative block size-10 shrink-0 overflow-hidden rounded-[9px] bg-transparent shadow-sm shadow-violet-950/20 ring-1 ring-violet-950/10 dark:ring-white/10",
         className,
       )}
       aria-hidden="true"

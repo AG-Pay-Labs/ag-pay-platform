@@ -71,7 +71,11 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
         }),
       });
       await queryClient.invalidateQueries({ queryKey: queryKeys.cart });
-      toast.success("Purchase approved for external completion");
+      toast.success(
+        item.checkout_adapter
+          ? "Purchase approved; secure checkout queued"
+          : "Purchase approved for legacy external completion",
+      );
       setOpen(false);
     } catch (caught) {
       setError(getErrorMessage(caught, "Could not approve this proposal."));
@@ -100,8 +104,17 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
         <DialogHeader>
           <DialogTitle>Approve this purchase?</DialogTitle>
           <DialogDescription>
-            This authorizes {agent?.name ?? "the agent"} to complete the item externally. AG Pay
-            does not charge the card.
+            {item.checkout_adapter ? (
+              <>
+                This authorizes AG Pay to run the configured checkout after approval. Payment
+                credentials stay inside the trusted executor and are never sent to the agent.
+              </>
+            ) : (
+              <>
+                This authorizes {agent?.name ?? "the agent"} to complete the item through the
+                legacy external flow and report its result.
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
 
@@ -167,8 +180,8 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
           </div>
           {item.billing_period ? (
             <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-              This proposal creates a {item.billing_period} recurring commitment after the agent
-              reports a successful external purchase.
+              This proposal creates a {item.billing_period} recurring commitment only after a
+              successful checkout is confirmed.
             </p>
           ) : null}
           {error ? (

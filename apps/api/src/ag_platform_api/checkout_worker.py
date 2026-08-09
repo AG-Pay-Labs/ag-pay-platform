@@ -1,0 +1,140 @@
+import asyncio
+import json
+import logging
+import signal
+from datetime import UTC, datetime
+
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+from ag_platform_api.core.config import CheckoutWorkerSettings, get_worker_settings
+from ag_platform_api.db.session import SessionFactory, engine
+from ag_platform_api.services.checkout.browserbase import BrowserbaseCheckout, BrowserbaseGateway
+from ag_platform_api.services.checkout.repository import SqlAlchemyCheckoutRepository
+from ag_platform_api.services.checkout.stripe_issuing import StripeIssuingGateway
+from ag_platform_api.services.checkout.stripe_payments_demo import StripePaymentsDemoGateway
+from ag_platform_api.services.checkout.worker import CheckoutWorker
+
+
+class CheckoutRedisPublisher:
+    """Best-effort publication without logging broker exceptions or payload internals."""
+
+    def __init__(self, redis: Redis, stream: str = "agpay:domain-events") -> None:
+        self._redis = redis
+        self._stream = stream
+
+    async def publish(self, event_type: str, payload: dict[str, object]) -> bool:
+        envelope = {
+            "type": event_type,
+            "occurred_at": datetime.now(UTC).isoformat(),
+            "payload": json.dumps(payload, default=str, separators=(",", ":")),
+        }
+        try:
+            await self._redis.xadd(self._stream, envelope, maxlen=10_000, approximate=True)
+        except RedisError:
+            return False
+        return True
+
+
+def build_worker(
+    settings: CheckoutWorkerSettings, redis: Redis
+) -> tuple[
+    CheckoutWorker,
+    BrowserbaseGateway,
+    StripeIssuingGateway | None,
+    StripePaymentsDemoGateway | None,
+]:
+    if not settings.checkout_enabled:
+        raise RuntimeError("Managed checkout is disabled.")
+    if settings.browserbase_api_key is None or not settings.browserbase_project_id:
+        raise RuntimeError("Browserbase worker configuration is incomplete.")
+    if settings.stripe_secret_key is None and not settings.checkout_demo_enabled:
+        raise RuntimeError("No checkout payment provider is configured.")
+
+    browserbase = BrowserbaseGateway(
+        api_key=settings.browserbase_api_key.get_secret_value(),
+        project_id=settings.browserbase_project_id,
+        region=settings.browserbase_region,
+        api_url=settings.browserbase_api_url,
+        session_timeout_seconds=settings.checkout_result_timeout_seconds + 60,
+    )
+    issuing = (
+        StripeIssuingGateway(
+            secret_key=settings.stripe_secret_key.get_secret_value(),
+            api_url=settings.stripe_api_url,
+        )
+        if settings.stripe_secret_key is not None
+        else None
+    )
+    demo = (
+        StripePaymentsDemoGateway(
+            secret_key=settings.stripe_demo_secret_key.get_secret_value(),
+            api_url=settings.stripe_api_url,
+        )
+        if settings.checkout_demo_enabled and settings.stripe_demo_secret_key is not None
+        else None
+    )
+    worker = CheckoutWorker(
+        repository=SqlAlchemyCheckoutRepository(SessionFactory),
+        browser=BrowserbaseCheckout(
+            browserbase,
+            result_timeout_seconds=settings.checkout_result_timeout_seconds,
+        ),
+        issuing=issuing,
+        demo=demo,
+        broker=CheckoutRedisPublisher(redis),
+        lease_seconds=settings.checkout_lease_seconds,
+        max_attempts=settings.checkout_max_attempts,
+        poll_seconds=settings.checkout_worker_poll_seconds,
+        authorization_timeout_seconds=settings.checkout_authorization_timeout_seconds,
+        authorization_poll_seconds=settings.checkout_authorization_poll_seconds,
+        demo_observation_seconds=settings.checkout_demo_observation_seconds,
+    )
+    return worker, browserbase, issuing, demo
+
+
+async def run() -> None:
+    log_format = "%(levelname)s %(name)s %(message)s"
+    logging.basicConfig(level=logging.CRITICAL, format=log_format)
+    worker_logger = logging.getLogger("ag_platform_api.services.checkout.worker")
+    worker_logger.handlers.clear()
+    worker_handler = logging.StreamHandler()
+    worker_handler.setFormatter(logging.Formatter(log_format))
+    worker_logger.addHandler(worker_handler)
+    worker_logger.setLevel(logging.INFO)
+    worker_logger.propagate = False
+    settings = get_worker_settings()
+    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    browserbase: BrowserbaseGateway | None = None
+    issuing: StripeIssuingGateway | None = None
+    demo: StripePaymentsDemoGateway | None = None
+    try:
+        worker, browserbase, issuing, demo = build_worker(settings, redis)
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(signum, stop.set)
+            except NotImplementedError:  # pragma: no cover - Windows event loops
+                pass
+        await worker.run_forever(stop)
+    finally:
+        if browserbase is not None:
+            await browserbase.close()
+        if issuing is not None:
+            await issuing.close()
+        if demo is not None:
+            await demo.close()
+        await redis.aclose()
+        await engine.dispose()
+
+
+def main() -> None:
+    try:
+        asyncio.run(run())
+    except RuntimeError as error:
+        raise SystemExit(str(error)) from None
+
+
+if __name__ == "__main__":
+    main()
