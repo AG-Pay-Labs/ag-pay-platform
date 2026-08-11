@@ -7,6 +7,7 @@ from ag_platform_api.models import (
     CartItem,
     CheckoutEvent,
     CheckoutExecution,
+    CheckoutStatusTransition,
     Purchase,
     Subscription,
 )
@@ -15,6 +16,7 @@ from ag_platform_api.schemas import (
     CartItemRead,
     CheckoutEventRead,
     CheckoutExecutionSummary,
+    CheckoutStatusTransitionRead,
     HumanCartItemRead,
     HumanCheckoutExecutionSummary,
     PurchaseRead,
@@ -122,7 +124,23 @@ def human_checkout_execution_summary(
     serialized = checkout_execution_summary(execution).model_dump()
     serialized["merchant_order_reference"] = execution.merchant_order_reference
     serialized["browserbase_session_id"] = execution.browserbase_session_id
+    serialized["status_history"] = [
+        checkout_status_transition_read(transition) for transition in execution.status_transitions
+    ]
     return HumanCheckoutExecutionSummary.model_validate(serialized)
+
+
+def checkout_status_transition_read(
+    transition: CheckoutStatusTransition,
+) -> CheckoutStatusTransitionRead:
+    error_code, error_message = safe_checkout_error(transition.error_code)
+    return CheckoutStatusTransitionRead(
+        status=transition.status,
+        attempt_count=transition.attempt_count,
+        error_code=error_code,
+        error_message=error_message,
+        occurred_at=transition.occurred_at,
+    )
 
 
 def checkout_event_read(event: CheckoutEvent) -> CheckoutEventRead:

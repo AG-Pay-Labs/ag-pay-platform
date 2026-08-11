@@ -171,6 +171,14 @@ export interface CheckoutRequest {
   checkout_url: string;
 }
 
+export interface CheckoutStatusTransitionRead {
+  status: CheckoutExecutionStatus;
+  attempt_count: number;
+  error_code: string | null;
+  error_message: string | null;
+  occurred_at: ISODateTime;
+}
+
 export interface CheckoutExecutionRead {
   id: UUID;
   status: CheckoutExecutionStatus;
@@ -186,6 +194,7 @@ export interface CheckoutExecutionRead {
   completed_at: ISODateTime | null;
   created_at: ISODateTime;
   updated_at: ISODateTime;
+  status_history: CheckoutStatusTransitionRead[];
 }
 
 export interface CartItemCreate {

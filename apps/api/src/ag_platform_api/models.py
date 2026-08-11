@@ -321,12 +321,43 @@ class CheckoutExecution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     cart_item: Mapped[CartItem] = relationship(back_populates="checkout_execution")
     events: Mapped[list["CheckoutEvent"]] = relationship(back_populates="execution")
+    status_transitions: Mapped[list["CheckoutStatusTransition"]] = relationship(
+        order_by=lambda: CheckoutStatusTransition.sequence,
+        viewonly=True,
+    )
 
     __table_args__ = (
         CheckConstraint("approved_amount > 0", name="approved_amount_positive"),
         CheckConstraint("length(currency) = 3", name="currency_length"),
         CheckConstraint("attempt_count >= 0", name="attempt_count_non_negative"),
         Index("ix_checkout_executions_owner_status", "owner_id", "status"),
+    )
+
+
+class CheckoutStatusTransition(Base):
+    __tablename__ = "checkout_status_transitions"
+
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    execution_id: Mapped[UUID] = mapped_column(
+        ForeignKey("checkout_executions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[CheckoutExecutionStatus] = mapped_column(
+        Enum(CheckoutExecutionStatus, native_enum=False), nullable=False
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("attempt_count >= 0", name="attempt_count_non_negative"),
+        Index(
+            "ix_checkout_status_transitions_execution_sequence",
+            "execution_id",
+            "sequence",
+        ),
+        {"sqlite_autoincrement": True},
     )
 
 

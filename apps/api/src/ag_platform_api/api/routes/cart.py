@@ -17,6 +17,7 @@ from ag_platform_api.models import (
     AgentPaymentMethod,
     CartItem,
     CartItemStatus,
+    CheckoutExecution,
     PaymentMethod,
     PaymentMethodStatus,
 )
@@ -38,7 +39,9 @@ async def load_cart_item(db: DatabaseSession, cart_item_id: UUID) -> CartItem:
         select(CartItem)
         .options(
             selectinload(CartItem.credential),
-            selectinload(CartItem.checkout_execution),
+            selectinload(CartItem.checkout_execution).selectinload(
+                CheckoutExecution.status_transitions
+            ),
         )
         .where(CartItem.id == cart_item_id)
     )
@@ -58,7 +61,9 @@ async def owned_cart_item(
         select(CartItem)
         .options(
             selectinload(CartItem.credential),
-            selectinload(CartItem.checkout_execution),
+            selectinload(CartItem.checkout_execution).selectinload(
+                CheckoutExecution.status_transitions
+            ),
         )
         .where(CartItem.id == cart_item_id, CartItem.owner_id == owner_id)
     )
@@ -80,7 +85,9 @@ async def list_cart_items(
         select(CartItem)
         .options(
             selectinload(CartItem.credential),
-            selectinload(CartItem.checkout_execution),
+            selectinload(CartItem.checkout_execution).selectinload(
+                CheckoutExecution.status_transitions
+            ),
         )
         .where(CartItem.owner_id == user.id)
         .order_by(CartItem.created_at.desc())

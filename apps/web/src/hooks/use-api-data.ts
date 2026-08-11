@@ -50,7 +50,12 @@ export function useCartItems() {
   return useQuery({
     queryKey: queryKeys.cart,
     queryFn: () => apiRequest<CartItemRead[]>("/cart-items"),
-    refetchInterval: 20_000,
+    refetchInterval: (query) =>
+      query.state.data?.some(
+        (item) => item.execution?.status === "queued" || item.execution?.status === "running",
+      )
+        ? 2_000
+        : 20_000,
   });
 }
 

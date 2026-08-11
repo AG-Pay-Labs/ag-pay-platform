@@ -101,6 +101,8 @@ class CheckoutAdapter:
     success_selector: str
     decline_selector: str | None = None
     resource_origins: tuple[str, ...] = ()
+    result_origins: tuple[str, ...] = ()
+    checkout_mode: str = "direct"
     expiry_selector: str | None = None
     expiry_month_selector: str | None = None
     expiry_year_selector: str | None = None
@@ -129,6 +131,7 @@ class CheckoutAdapter:
                     "allowed_origins": tuple(snapshot.get("allowed_origins", ())),
                     "payment_origins": tuple(snapshot.get("payment_origins", ())),
                     "resource_origins": tuple(snapshot.get("resource_origins", ())),
+                    "result_origins": tuple(snapshot.get("result_origins", ())),
                 }
             )
         except (TypeError, ValueError):
@@ -154,6 +157,10 @@ class CheckoutAdapter:
         split = self.expiry_month_selector is not None and self.expiry_year_selector is not None
         partial_split = (self.expiry_month_selector is None) != (self.expiry_year_selector is None)
         if combined == split or partial_split:
+            raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+        if self.checkout_mode not in {"direct", "stripe_hosted_test"}:
+            raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+        if not set(self.result_origins).issubset(self.allowed_origins):
             raise CheckoutError(CheckoutErrorCode.adapter_invalid)
         selectors = (
             value

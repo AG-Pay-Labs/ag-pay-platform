@@ -349,7 +349,12 @@ export function RevealCredentialDialog({ item }: { item: CartItemRead }) {
             </p>
           </div>
         ) : (
-          <form id={`reveal-${item.id}`} onSubmit={reveal} className="space-y-3">
+          <form
+            id={`reveal-${item.id}`}
+            method="post"
+            onSubmit={reveal}
+            className="space-y-3"
+          >
             <div className="space-y-1.5">
               <Label htmlFor={`current-password-${item.id}`}>Current AG Pay password</Label>
               <Input

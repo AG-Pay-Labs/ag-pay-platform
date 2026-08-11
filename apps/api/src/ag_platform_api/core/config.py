@@ -1,6 +1,6 @@
 import re
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -19,6 +19,8 @@ CheckoutSelector = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=512),
 ]
 CHECKOUT_ADAPTER_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+STRIPE_HOSTED_TEST_ADAPTER_KEY = "stripe-hosted"
+STRIPE_HOSTED_TEST_BOOTSTRAP_URL = "https://checkout.stripe.com/"
 
 
 def normalize_checkout_origin(value: str) -> str:
@@ -45,6 +47,8 @@ class CheckoutAdapterSettings(BaseModel):
     allowed_origins: list[str] = Field(min_length=1, max_length=100)
     payment_origins: list[str] = Field(min_length=1, max_length=100)
     resource_origins: list[str] = Field(default_factory=list, max_length=100)
+    result_origins: list[str] = Field(default_factory=list, max_length=10)
+    checkout_mode: Literal["direct", "stripe_hosted_test"] = "direct"
     product_title_selector: CheckoutSelector
     quantity_selector: CheckoutSelector
     total_selector: CheckoutSelector
@@ -69,7 +73,12 @@ class CheckoutAdapterSettings(BaseModel):
     order_reference_selector: CheckoutSelector | None = None
     receipt_url_selector: CheckoutSelector | None = None
 
-    @field_validator("allowed_origins", "payment_origins", "resource_origins")
+    @field_validator(
+        "allowed_origins",
+        "payment_origins",
+        "resource_origins",
+        "result_origins",
+    )
     @classmethod
     def validate_origins(cls, values: list[str]) -> list[str]:
         return list(dict.fromkeys(normalize_checkout_origin(value) for value in values))
@@ -92,7 +101,55 @@ class CheckoutAdapterSettings(BaseModel):
             value = getattr(self, field_name)
             if value is not None and any(ord(character) < 32 for character in value):
                 raise ValueError(f"{field_name} cannot contain control characters")
+        if not set(self.result_origins).issubset(self.allowed_origins):
+            raise ValueError("result_origins must also be listed in allowed_origins")
         return self
+
+
+def stripe_hosted_test_adapter() -> CheckoutAdapterSettings:
+    """Pinned, development-only adapter for Stripe's live hosted test checkout."""
+    return CheckoutAdapterSettings(
+        checkout_mode="stripe_hosted_test",
+        allowed_origins=["https://checkout.stripe.com", "https://example.com"],
+        result_origins=["https://example.com"],
+        payment_origins=[
+            "https://checkout.stripe.com",
+            "https://js.stripe.com",
+            "https://b.stripecdn.com",
+            "https://newassets.hcaptcha.com",
+            "https://m.stripe.network",
+        ],
+        resource_origins=[
+            "https://api.stripe.com",
+            "https://checkout-cookies.stripe.com",
+            "https://merchant-ui-api.stripe.com",
+            "https://m.stripe.com",
+            "https://r.stripe.com",
+            "https://hcaptcha.com",
+            "https://api.hcaptcha.com",
+            "https://maps.googleapis.com",
+            "https://applepay.cdn-apple.com",
+            "https://smp-paymentservices.apple.com",
+        ],
+        product_title_selector='[data-testid="product-summary-name"]',
+        quantity_selector='[data-testid="product-summary-description"]',
+        total_selector='[data-testid="product-summary-total-amount"]',
+        billing_email_selector='input[autocomplete="email"]',
+        card_number_selector='input[autocomplete="cc-number"]',
+        expiry_selector='input[autocomplete="cc-exp"]',
+        cvc_selector='input[autocomplete="cc-csc"]',
+        name_selector='input[autocomplete="cc-name"]',
+        billing_phone_selector='input[autocomplete="tel"]',
+        billing_country_selector='select[autocomplete="billing country"]',
+        billing_line1_selector="#billingAddressLine1",
+        billing_line2_selector="#billingAddressLine2",
+        billing_city_selector="#billingLocality",
+        billing_region_selector="#billingAdministrativeArea",
+        billing_postal_code_selector="#billingPostalCode",
+        submit_selector='[data-testid="hosted-payment-submit-button"]',
+        # Hosted mode observes the provider API; this selector is never authoritative.
+        success_selector="body",
+    )
 
 
 class CheckoutRuntimeSettings(BaseSettings):
@@ -107,6 +164,7 @@ class CheckoutRuntimeSettings(BaseSettings):
     environment: str = "development"
     checkout_enabled: bool = False
     checkout_demo_enabled: bool = False
+    checkout_hosted_demo_enabled: bool = False
     checkout_demo_adapter_key: str = "stripe-demo"
     checkout_adapters: dict[str, CheckoutAdapterSettings] = Field(default_factory=dict)
     checkout_worker_poll_seconds: float = Field(default=1.0, gt=0)
@@ -136,6 +194,24 @@ class CheckoutRuntimeSettings(BaseSettings):
         if CHECKOUT_ADAPTER_KEY_PATTERN.fullmatch(value) is None:
             raise ValueError("CHECKOUT_DEMO_ADAPTER_KEY is invalid")
         return value
+
+    @model_validator(mode="after")
+    def install_hosted_demo_adapter(self) -> "CheckoutRuntimeSettings":
+        if not self.checkout_hosted_demo_enabled:
+            return self
+        if self.environment.lower() not in {"development", "test"}:
+            raise ValueError("CHECKOUT_HOSTED_DEMO_ENABLED is development/test-only")
+        if not self.checkout_demo_enabled:
+            raise ValueError("CHECKOUT_HOSTED_DEMO_ENABLED requires CHECKOUT_DEMO_ENABLED")
+        built_in = stripe_hosted_test_adapter()
+        configured = self.checkout_adapters.get(STRIPE_HOSTED_TEST_ADAPTER_KEY)
+        if configured is not None and configured != built_in:
+            raise ValueError("The built-in stripe-hosted adapter cannot be overridden")
+        self.checkout_adapters = {
+            **self.checkout_adapters,
+            STRIPE_HOSTED_TEST_ADAPTER_KEY: built_in,
+        }
+        return self
 
 
 class Settings(CheckoutRuntimeSettings):

@@ -1,18 +1,23 @@
 from datetime import UTC, datetime
 from decimal import Decimal
+from urllib.parse import parse_qsl
 from uuid import uuid4
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from ag_platform_api.core.config import (
+    STRIPE_HOSTED_TEST_ADAPTER_KEY,
     CheckoutRuntimeSettings,
     CheckoutWorkerSettings,
     Settings,
+    stripe_hosted_test_adapter,
 )
 from ag_platform_api.db import session as database_session
 from ag_platform_api.services.checkout.browserbase import (
     BrowserbaseGateway,
+    amount_text_matches,
     money_text_matches,
 )
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
@@ -50,7 +55,52 @@ def test_api_settings_never_load_worker_provider_secrets(monkeypatch) -> None:
     assert worker_settings.stripe_secret_key is not None
 
 
-async def test_browserbase_session_payload_disables_observation_and_limits_domains() -> None:
+def test_stripe_hosted_adapter_is_pinned_and_development_test_only() -> None:
+    runtime = CheckoutRuntimeSettings(
+        _env_file=None,
+        environment="test",
+        checkout_demo_enabled=True,
+        checkout_hosted_demo_enabled=True,
+    )
+
+    assert runtime.checkout_adapters == {
+        STRIPE_HOSTED_TEST_ADAPTER_KEY: stripe_hosted_test_adapter()
+    }
+    assert runtime.checkout_adapters[STRIPE_HOSTED_TEST_ADAPTER_KEY].checkout_mode == (
+        "stripe_hosted_test"
+    )
+    assert runtime.checkout_adapters[STRIPE_HOSTED_TEST_ADAPTER_KEY].result_origins == [
+        "https://example.com"
+    ]
+
+    with pytest.raises(ValidationError, match="requires CHECKOUT_DEMO_ENABLED"):
+        CheckoutRuntimeSettings(
+            _env_file=None,
+            environment="test",
+            checkout_hosted_demo_enabled=True,
+        )
+    with pytest.raises(ValidationError, match="development/test-only"):
+        CheckoutRuntimeSettings(
+            _env_file=None,
+            environment="production",
+            checkout_demo_enabled=True,
+            checkout_hosted_demo_enabled=True,
+        )
+    with pytest.raises(ValidationError, match="cannot be overridden"):
+        CheckoutRuntimeSettings(
+            _env_file=None,
+            environment="test",
+            checkout_demo_enabled=True,
+            checkout_hosted_demo_enabled=True,
+            checkout_adapters={
+                STRIPE_HOSTED_TEST_ADAPTER_KEY: stripe_hosted_test_adapter().model_copy(
+                    update={"submit_selector": "#untrusted-submit"}
+                )
+            },
+        )
+
+
+async def test_browserbase_session_payload_honors_observation_and_limits_domains() -> None:
     captured: dict[str, object] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -72,7 +122,9 @@ async def test_browserbase_session_payload_disables_observation_and_limits_domai
             client=client,
         )
         session = await gateway.create_session(
-            ("https://merchant.example.test", "https://pay.example.test")
+            ("https://merchant.example.test", "https://pay.example.test"),
+            record_session=True,
+            log_session=True,
         )
 
     assert captured == {
@@ -81,8 +133,8 @@ async def test_browserbase_session_payload_disables_observation_and_limits_domai
         "keepAlive": False,
         "timeout": 120,
         "browserSettings": {
-            "recordSession": False,
-            "logSession": False,
+            "recordSession": True,
+            "logSession": True,
             "solveCaptchas": False,
             "allowedDomains": ["merchant.example.test", "pay.example.test"],
         },
@@ -143,6 +195,26 @@ def test_origin_normalization_and_total_matching_are_exact() -> None:
     assert not money_text_matches("Total CNY ¥25", Decimal("25"), "JPY")
     assert not money_text_matches("Total USD -25.00", Decimal("25.00"), "USD")
     assert not money_text_matches("Total CAD / USD 25.00", Decimal("25.00"), "USD")
+
+
+@pytest.mark.parametrize(
+    ("text", "amount", "currency", "expected"),
+    [
+        ("25,00 €", Decimal("25.00"), "EUR", True),
+        ("1.234,56 €", Decimal("1234.56"), "EUR", True),
+        ("¥2,500", Decimal("2500"), "JPY", True),
+        ("-25,00 €", Decimal("25.00"), "EUR", False),
+        ("Subtotal 20,00 € Total 25,00 €", Decimal("25.00"), "EUR", False),
+        ("25,00 €", Decimal("25.00"), "ZZZ", False),
+    ],
+)
+def test_hosted_amount_matching_accepts_one_localized_provider_bound_total(
+    text: str,
+    amount: Decimal,
+    currency: str,
+    expected: bool,
+) -> None:
+    assert amount_text_matches(text, amount, currency) is expected
 
 
 def test_minor_amount_conversion_supports_zero_two_and_three_decimal_currencies() -> None:
@@ -429,3 +501,389 @@ async def test_stripe_payments_demo_rejects_wrong_execution_binding() -> None:
         )
 
     assert result.outcome == AuthorizationOutcome.unknown
+
+
+async def test_stripe_hosted_session_creation_is_exact_idempotent_and_bound() -> None:
+    execution_id = uuid4()
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["authorization"] = request.headers["Authorization"]
+        captured["idempotency_key"] = request.headers["Idempotency-Key"]
+        captured["content_type"] = request.headers["Content-Type"]
+        captured["form"] = parse_qsl(request.content.decode(), keep_blank_values=True)
+        return httpx.Response(
+            200,
+            json={
+                "id": "cs_test_session123",
+                "url": "https://checkout.stripe.com/c/pay/cs_test_session123#fixture",
+                "livemode": False,
+                "amount_total": 5000,
+                "currency": "eur",
+                "client_reference_id": str(execution_id),
+                "metadata": {"agpay_execution_id": str(execution_id)},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = StripePaymentsDemoGateway(secret_key="sk_test_demo", client=client)
+        hosted = await gateway.create_checkout_session(
+            execution_id=execution_id,
+            title="  AG   Pay\nConcept  ",
+            quantity=2,
+            unit_amount_minor=2500,
+            currency="EUR",
+            collect_phone=True,
+        )
+
+    assert hosted.session_id == "cs_test_session123"
+    assert hosted.checkout_url == ("https://checkout.stripe.com/c/pay/cs_test_session123#fixture")
+    assert captured == {
+        "method": "POST",
+        "path": "/v1/checkout/sessions",
+        "authorization": "Bearer sk_test_demo",
+        "idempotency_key": f"agpay-hosted-{execution_id}",
+        "content_type": "application/x-www-form-urlencoded",
+        "form": [
+            ("mode", "payment"),
+            ("payment_method_types[]", "card"),
+            ("client_reference_id", str(execution_id)),
+            ("metadata[agpay_execution_id]", str(execution_id)),
+            ("payment_intent_data[metadata][agpay_execution_id]", str(execution_id)),
+            ("line_items[0][price_data][currency]", "eur"),
+            ("line_items[0][price_data][unit_amount]", "2500"),
+            ("line_items[0][price_data][product_data][name]", "AG Pay Concept"),
+            ("line_items[0][quantity]", "2"),
+            ("billing_address_collection", "required"),
+            ("submit_type", "pay"),
+            (
+                "success_url",
+                "https://example.com/?agpay_checkout=complete&session_id={CHECKOUT_SESSION_ID}",
+            ),
+            ("cancel_url", "https://example.com/?agpay_checkout=cancelled"),
+            ("phone_number_collection[enabled]", "true"),
+        ],
+    }
+
+
+async def test_stripe_hosted_session_rejects_a_title_it_cannot_show_exactly() -> None:
+    called = False
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = StripePaymentsDemoGateway(secret_key="sk_test_demo", client=client)
+        with pytest.raises(CheckoutError) as caught:
+            await gateway.create_checkout_session(
+                execution_id=uuid4(),
+                title="x" * 128,
+                quantity=1,
+                unit_amount_minor=2500,
+                currency="EUR",
+                collect_phone=False,
+            )
+
+    assert caught.value.code == CheckoutErrorCode.execution_invalid
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    "response_override",
+    [
+        {"id": "cs_live_not_allowed"},
+        {"livemode": True},
+        {"amount_total": 2499},
+        {"currency": "usd"},
+        {"client_reference_id": str(uuid4())},
+        {"metadata": {"agpay_execution_id": str(uuid4())}},
+    ],
+)
+async def test_stripe_hosted_session_creation_rejects_wrong_response_binding(
+    response_override: dict[str, object],
+) -> None:
+    execution_id = uuid4()
+    payload: dict[str, object] = {
+        "id": "cs_test_session123",
+        "url": "https://checkout.stripe.com/c/pay/cs_test_session123#fixture",
+        "livemode": False,
+        "amount_total": 2500,
+        "currency": "eur",
+        "client_reference_id": str(execution_id),
+        "metadata": {"agpay_execution_id": str(execution_id)},
+    }
+    payload.update(response_override)
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = StripePaymentsDemoGateway(secret_key="sk_test_demo", client=client)
+        with pytest.raises(CheckoutError) as caught:
+            await gateway.create_checkout_session(
+                execution_id=execution_id,
+                title="AG Pay Concept",
+                quantity=1,
+                unit_amount_minor=2500,
+                currency="EUR",
+                collect_phone=False,
+            )
+
+    assert caught.value.code == CheckoutErrorCode.browser_navigation_failed
+    assert not caught.value.retryable
+
+
+@pytest.mark.parametrize(
+    "checkout_url",
+    [
+        "http://checkout.stripe.com/c/pay/cs_test_session123",
+        "https://checkout.stripe.com.evil.example/c/pay/cs_test_session123",
+        "https://buyer:secret@checkout.stripe.com/c/pay/cs_test_session123",
+        "https://checkout.stripe.com:444/c/pay/cs_test_session123",
+    ],
+)
+async def test_stripe_hosted_session_creation_rejects_untrusted_checkout_url(
+    checkout_url: str,
+) -> None:
+    execution_id = uuid4()
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "cs_test_session123",
+                "url": checkout_url,
+                "livemode": False,
+                "amount_total": 2500,
+                "currency": "eur",
+                "client_reference_id": str(execution_id),
+                "metadata": {"agpay_execution_id": str(execution_id)},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = StripePaymentsDemoGateway(secret_key="sk_test_demo", client=client)
+        with pytest.raises(CheckoutError) as caught:
+            await gateway.create_checkout_session(
+                execution_id=execution_id,
+                title="AG Pay Concept",
+                quantity=1,
+                unit_amount_minor=2500,
+                currency="EUR",
+                collect_phone=False,
+            )
+
+    assert caught.value.code == CheckoutErrorCode.browser_navigation_failed
+    assert not caught.value.retryable
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "last_error", "expected"),
+    [
+        ("succeeded", None, AuthorizationOutcome.approved),
+        ("requires_payment_method", {"code": "card_declined"}, AuthorizationOutcome.declined),
+        ("requires_action", None, AuthorizationOutcome.action_required),
+        ("processing", None, AuthorizationOutcome.unknown),
+    ],
+)
+async def test_stripe_hosted_verification_requires_exact_session_and_intent_binding(
+    status: str,
+    last_error: object,
+    expected: AuthorizationOutcome,
+) -> None:
+    execution_id = uuid4()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v1/checkout/sessions/cs_test_session123"
+        assert request.headers["Authorization"] == "Bearer sk_test_demo"
+        assert request.url.params.get_list("expand[]") == [
+            "payment_intent",
+            "payment_intent.latest_charge",
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "id": "cs_test_session123",
+                "livemode": False,
+                "amount_total": 5000,
+                "currency": "eur",
+                "client_reference_id": str(execution_id),
+                "metadata": {"agpay_execution_id": str(execution_id)},
+                "payment_intent": {
+                    "id": "pi_hosted123",
+                    "livemode": False,
+                    "amount": 5000,
+                    "currency": "eur",
+                    "metadata": {"agpay_execution_id": str(execution_id)},
+                    "status": status,
+                    "last_payment_error": last_error,
+                    "latest_charge": {
+                        "receipt_url": "https://pay.stripe.com/receipts/payment/hosted123"
+                    },
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = StripePaymentsDemoGateway(secret_key="sk_test_demo", client=client)
+        verified = await gateway.verify_checkout_session(
+            session_id="cs_test_session123",
+            execution_id=execution_id,
+            amount_minor=5000,
+            currency="EUR",
+        )
+
+    assert verified.outcome == expected
+    assert verified.provider_reference == (
+        "pi_hosted123" if expected == AuthorizationOutcome.approved else None
+    )
+    assert verified.receipt_url == (
+        "https://pay.stripe.com/receipts/payment/hosted123"
+        if expected == AuthorizationOutcome.approved
+        else None
+    )
+
+
+async def test_stripe_hosted_verification_returns_unknown_for_wrong_session_binding() -> None:
+    execution_id = uuid4()
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "cs_test_session123",
+                "livemode": False,
+                "amount_total": 5000,
+                "currency": "eur",
+                "client_reference_id": str(execution_id),
+                "metadata": {"agpay_execution_id": str(uuid4())},
+                "payment_intent": {
+                    "id": "pi_hosted123",
+                    "livemode": False,
+                    "amount": 5000,
+                    "currency": "eur",
+                    "metadata": {"agpay_execution_id": str(execution_id)},
+                    "status": "succeeded",
+                    "latest_charge": {
+                        "receipt_url": "https://pay.stripe.com/receipts/payment/hosted123"
+                    },
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = StripePaymentsDemoGateway(secret_key="sk_test_demo", client=client)
+        verified = await gateway.verify_checkout_session(
+            session_id="cs_test_session123",
+            execution_id=execution_id,
+            amount_minor=5000,
+            currency="EUR",
+        )
+
+    assert verified.outcome == AuthorizationOutcome.unknown
+    assert verified.provider_reference is None
+    assert verified.receipt_url is None
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({}, True),
+        ({"id": "cs_test_other"}, False),
+        ({"livemode": True}, False),
+        ({"status": "open"}, False),
+        ({"payment_status": "paid"}, False),
+        ({"client_reference_id": str(uuid4())}, False),
+        ({"metadata": {"agpay_execution_id": str(uuid4())}}, False),
+    ],
+)
+async def test_stripe_hosted_expiration_requires_exact_unpaid_binding(
+    override: dict[str, object],
+    expected: bool,
+) -> None:
+    execution_id = uuid4()
+    payload: dict[str, object] = {
+        "id": "cs_test_session123",
+        "livemode": False,
+        "status": "expired",
+        "payment_status": "unpaid",
+        "client_reference_id": str(execution_id),
+        "metadata": {"agpay_execution_id": str(execution_id)},
+    }
+    payload.update(override)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == ("/v1/checkout/sessions/cs_test_session123/expire")
+        assert request.headers["Authorization"] == "Bearer sk_test_demo"
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = StripePaymentsDemoGateway(secret_key="sk_test_demo", client=client)
+        expired = await gateway.expire_checkout_session(
+            "cs_test_session123",
+            execution_id,
+        )
+
+    assert expired is expected
+
+
+@pytest.mark.parametrize(
+    ("receipt_url", "expected"),
+    [
+        (
+            "https://pay.stripe.com/receipts/payment/hosted123?source=test",
+            "https://pay.stripe.com/receipts/payment/hosted123?source=test",
+        ),
+        ("http://pay.stripe.com/receipts/payment/hosted123", None),
+        ("https://pay.stripe.com.evil.example/receipts/payment/hosted123", None),
+        ("https://buyer:secret@pay.stripe.com/receipts/payment/hosted123", None),
+        ("https://pay.stripe.com:444/receipts/payment/hosted123", None),
+        (None, None),
+    ],
+)
+async def test_stripe_hosted_receipt_url_is_sanitized(
+    receipt_url: object,
+    expected: str | None,
+) -> None:
+    execution_id = uuid4()
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "cs_test_session123",
+                "livemode": False,
+                "amount_total": 2500,
+                "currency": "eur",
+                "client_reference_id": str(execution_id),
+                "metadata": {"agpay_execution_id": str(execution_id)},
+                "payment_intent": {
+                    "id": "pi_hosted123",
+                    "livemode": False,
+                    "amount": 2500,
+                    "currency": "eur",
+                    "metadata": {"agpay_execution_id": str(execution_id)},
+                    "status": "succeeded",
+                    "latest_charge": {"receipt_url": receipt_url},
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway = StripePaymentsDemoGateway(secret_key="sk_test_demo", client=client)
+        verified = await gateway.verify_checkout_session(
+            session_id="cs_test_session123",
+            execution_id=execution_id,
+            amount_minor=2500,
+            currency="EUR",
+        )
+
+    assert verified.outcome == AuthorizationOutcome.approved
+    assert verified.receipt_url == expected

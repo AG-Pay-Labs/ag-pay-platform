@@ -12,6 +12,7 @@ from ag_platform_api.services.checkout.browserbase import (
 )
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
 from ag_platform_api.services.checkout.types import (
+    AuthorizationOutcome,
     BrowserbaseSession,
     CheckoutAdapter,
     CheckoutContext,
@@ -62,6 +63,15 @@ class FakeElement:
     async def fill(self, _: str) -> None:
         self.events.append(f"fill:{self.name}")
 
+    async def select_option(
+        self,
+        _: str | None = None,
+        *,
+        label: str | None = None,
+    ) -> object:
+        self.events.append(f"select:{self.name}")
+        return None
+
     async def click(self) -> None:
         self.events.append(f"click:{self.name}")
         if self.clicked:
@@ -83,6 +93,17 @@ class FakeCollection:
 
     def nth(self, index: int) -> FakeElement:
         return self.elements[index]
+
+
+class CapturingSelectElement(FakeElement):
+    def __init__(self, name: str, events: list[str]) -> None:
+        super().__init__(name, events)
+        self.selected_values: list[str] = []
+
+    async def select_option(self, value: str) -> object:
+        self.selected_values.append(value)
+        self.events.append(f"select:{self.name}")
+        return None
 
 
 class ChangingTextElement(FakeElement):
@@ -215,10 +236,20 @@ class FakeGateway:
     def __init__(self, browser: FakeBrowser) -> None:
         self.browser = browser
         self.origins: tuple[str, ...] = ()
+        self.record_session = False
+        self.log_session = False
         self.released_session_id: str | None = None
 
-    async def create_session(self, origins: tuple[str, ...]) -> BrowserbaseSession:
+    async def create_session(
+        self,
+        origins: tuple[str, ...],
+        *,
+        record_session: bool = False,
+        log_session: bool = False,
+    ) -> BrowserbaseSession:
         self.origins = origins
+        self.record_session = record_session
+        self.log_session = log_session
         return BrowserbaseSession("session_12345", "wss://never-used.example.test")
 
     async def connect(self, _: BrowserbaseSession) -> FakeBrowser:
@@ -304,7 +335,8 @@ async def test_browser_checkout_loads_card_late_and_marks_submitted_before_click
     payment = FakeFrame("https://payments.example.test/elements/card", payment_elements)
     page = FakePage(main.url, [main, payment], {})
     browser = FakeBrowser(page)
-    checkout = BrowserbaseCheckout(FakeGateway(browser), result_timeout_seconds=1)  # type: ignore[arg-type]
+    gateway = FakeGateway(browser)
+    checkout = BrowserbaseCheckout(gateway, result_timeout_seconds=1)  # type: ignore[arg-type]
 
     async def load_card() -> IssuingCardSecret:
         events.append("load-card")
@@ -334,6 +366,8 @@ async def test_browser_checkout_loads_card_late_and_marks_submitted_before_click
     assert events.index("load-card") < events.index("submitted")
     assert events.index("submitted") < events.index("fill:number")
     assert events.index("submitted") < events.index("click:submit")
+    assert gateway.record_session is False
+    assert gateway.log_session is False
     assert browser.closed
 
 
@@ -383,6 +417,115 @@ async def test_browser_checkout_supports_split_expiry_fields() -> None:
 
     assert "fill:month" in events
     assert "fill:year" in events
+
+
+async def test_hosted_checkout_parses_localized_facts_selects_country_and_observes_provider() -> (
+    None
+):
+    events: list[str] = []
+    country = CapturingSelectElement("country", events)
+    main_elements = {
+        "#product-title": [FakeElement("product-title", events, text="Managed checkout")],
+        "#quantity": [FakeElement("quantity", events, text="Qty 2, €12,50 each")],
+        "#total": [FakeElement("total", events, text="25,00 €")],
+        "#name": [FakeElement("name", events)],
+        "#email": [FakeElement("email", events)],
+        "#country": [country],
+        "#number": [FakeElement("number", events)],
+        "#expiry": [FakeElement("expiry", events)],
+        "#cvc": [FakeElement("cvc", events)],
+        "#submit": [FakeElement("submit", events)],
+    }
+    checkout_url = "https://checkout.stripe.com/c/pay/cs_test_session123#fixture"
+    main = FakeFrame(checkout_url, main_elements)
+    browser = FakeBrowser(FakePage(main.url, [main], {}))
+    gateway = FakeGateway(browser)
+    checkout = BrowserbaseCheckout(gateway, result_timeout_seconds=1)  # type: ignore[arg-type]
+    hosted_adapter = adapter(
+        allowed_origins=("https://checkout.stripe.com", "https://example.com"),
+        payment_origins=("https://checkout.stripe.com",),
+        result_origins=("https://example.com",),
+        checkout_mode="stripe_hosted_test",
+        billing_country_selector="#country",
+        order_reference_selector=None,
+        receipt_url_selector=None,
+    )
+    checkout_context = replace(
+        context(hosted_adapter),
+        checkout_url=checkout_url,
+        checkout_origin="https://checkout.stripe.com",
+        billing_details={
+            "full_name": "Alex Example",
+            "email": "alex@example.test",
+            "address": {"country": "ES"},
+        },
+    )
+
+    async def load_card() -> IssuingCardSecret:
+        events.append("load-card")
+        return IssuingCardSecret("4242424242424242", "123", 12, 2030)
+
+    async def session_started(_: str) -> None:
+        events.append("session-started")
+
+    async def prepare_submission() -> None:
+        events.append("prepare-submission")
+
+    async def mark_submitted(_: str) -> None:
+        events.append("submitted")
+
+    async def observe_outcome() -> AuthorizationOutcome:
+        events.append("observe-provider")
+        return AuthorizationOutcome.declined
+
+    result = await checkout.run(
+        checkout_context,
+        load_card=load_card,
+        on_session_started=session_started,
+        prepare_submission=prepare_submission,
+        mark_submitted=mark_submitted,
+        observe_outcome=observe_outcome,
+    )
+
+    assert result.outcome == AuthorizationOutcome.declined
+    assert country.selected_values == ["ES"]
+    assert "select:country" in events
+    assert events.index("submitted") < events.index("fill:number")
+    assert events.index("fill:number") < events.index("click:submit")
+    assert events.index("click:submit") < events.index("observe-provider")
+    assert events.count("observe-provider") == 1
+    assert gateway.origins == (
+        "https://checkout.stripe.com",
+        "https://example.com",
+        "https://checkout.stripe.com",
+    )
+    assert gateway.record_session is True
+    assert gateway.log_session is True
+    assert browser.closed
+
+
+async def test_hosted_checkout_accepts_stripes_implicit_single_quantity() -> None:
+    events: list[str] = []
+    checkout_url = "https://checkout.stripe.com/c/pay/cs_test_session123#fixture"
+    main = FakeFrame(
+        checkout_url,
+        {"#product-title": [FakeElement("product-title", events, text="Managed checkout")]},
+    )
+    page = FakePage(main.url, [main], {})
+    hosted_adapter = adapter(
+        allowed_origins=("https://checkout.stripe.com",),
+        payment_origins=("https://checkout.stripe.com",),
+        checkout_mode="stripe_hosted_test",
+    )
+    checkout_context = replace(
+        context(hosted_adapter),
+        checkout_url=checkout_url,
+        checkout_origin="https://checkout.stripe.com",
+        approved_quantity=1,
+    )
+
+    checkout = BrowserbaseCheckout(FakeGateway(FakeBrowser(page)))  # type: ignore[arg-type]
+    await checkout._verify_item(page, checkout_context, ("https://checkout.stripe.com",))
 
 
 async def test_browser_checkout_rejects_unapproved_frame_before_loading_card() -> None:

@@ -5,12 +5,17 @@ from urllib.parse import urlsplit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ag_platform_api.core.config import Settings, normalize_checkout_origin
+from ag_platform_api.core.config import (
+    STRIPE_HOSTED_TEST_ADAPTER_KEY,
+    Settings,
+    normalize_checkout_origin,
+)
 from ag_platform_api.models import (
     AgentPaymentMethod,
     CartItem,
     CheckoutExecution,
     CheckoutExecutionStatus,
+    CheckoutStatusTransition,
     PaymentMethod,
     PaymentMethodStatus,
 )
@@ -74,7 +79,11 @@ async def queue_checkout_execution(
     demo_method = (
         settings.environment.lower() in {"development", "test"}
         and settings.checkout_demo_enabled
-        and item.checkout_adapter == settings.checkout_demo_adapter_key
+        and item.checkout_adapter
+        in {
+            settings.checkout_demo_adapter_key,
+            *((STRIPE_HOSTED_TEST_ADAPTER_KEY,) if settings.checkout_hosted_demo_enabled else ()),
+        }
         and payment_method.provider == "prototype-vault"
         and payment_method.provider_payment_method_id
         in {
@@ -113,6 +122,11 @@ async def queue_checkout_execution(
     if adapter is None:
         raise CheckoutQueueError(
             "checkout_adapter_unknown", "The requested checkout adapter is not configured"
+        )
+    if adapter.checkout_mode == "stripe_hosted_test" and not demo_method:
+        raise CheckoutQueueError(
+            "checkout_provider_unsupported",
+            "Stripe-hosted test checkout requires a configured demo payment method",
         )
     origin = checkout_url_origin(item.checkout_url)
     if origin not in adapter.allowed_origins:
@@ -161,5 +175,12 @@ async def queue_checkout_execution(
     )
     db.add(execution)
     await db.flush()
+    db.add(
+        CheckoutStatusTransition(
+            execution_id=execution.id,
+            status=CheckoutExecutionStatus.queued,
+            attempt_count=execution.attempt_count,
+        )
+    )
     item.checkout_execution = execution
     return execution

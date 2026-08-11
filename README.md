@@ -15,11 +15,16 @@ proposal requires human review. Owners can configure a narrower per-agent
 review rule. Proposals with an optional configured checkout adapter can be
 queued for the managed checkout worker after approval; proposals without that
 specification keep the legacy manual/external-completion behavior. Managed
-checkout is disabled by default. Production execution supports configured
-merchant origins and Stripe Issuing card references; development/test also has
-an explicit Stripe Payments demo rail for Browserbase success, decline, and 3DS
-scenarios without a real card. Managed recurring checkout is intentionally
-rejected until merchant interval verification is implemented.
+checkout is disabled by default. The production-shaped rail supports configured
+merchant origins and Stripe Issuing card references but still requires the
+documented launch gates; development/test also has
+an explicit `stripe-hosted` Stripe Payments rail. After approval, it creates a
+test-mode Checkout Session from the exact approved facts, fills Stripe's hosted
+page through Browserbase, and verifies success, decline, or 3DS through
+Stripe's API without a real card. That proof does not order from the proposal's
+source product URL and is not an arbitrary production-merchant integration.
+Managed recurring checkout is intentionally rejected until merchant interval
+verification is implemented.
 
 For the complete multi-repository setup, including the AG Pay OpenClaw plugin
 and playground, follow the [base quick start](https://github.com/AG-Pay-Labs/ag-pay#quick-start).
@@ -63,10 +68,35 @@ make checkout-worker
 Never put those secrets in the web or OpenClaw environments. The base
 repository's `docs/managed-checkout.md` contains the adapter schema, security
 boundary, and end-to-end sandbox test procedure.
-For the visual decline demo, run `make demo-merchant-run` and
-`make seed-checkout-demo SEED_USERNAME=...`; follow the literal guide in that
-document. The demo rail requires `CHECKOUT_DEMO_ENABLED=true` and an `sk_test_`
-key and cannot activate outside development/test queueing.
+
+For the recommended hosted decline/success proof, set these values in the
+untracked `.env` while keeping all existing application/database values:
+
+```dotenv
+ENVIRONMENT=development
+CHECKOUT_ENABLED=true
+CHECKOUT_DEMO_ENABLED=true
+CHECKOUT_HOSTED_DEMO_ENABLED=true
+BROWSERBASE_API_KEY=your_browserbase_key
+BROWSERBASE_PROJECT_ID=your_browserbase_project_id
+STRIPE_DEMO_SECRET_KEY=sk_test_your_stripe_test_secret
+```
+
+Run migrations, the API, web app, and `make checkout-worker` in separate
+terminals. Create the human account and agent, then seed the safe methods:
+
+```bash
+make seed-checkout-demo SEED_USERNAME=your-login-email@example.com
+```
+
+The built-in adapter key is `stripe-hosted` and its bootstrap URL is
+`https://checkout.stripe.com/`; do not add or override it in
+`CHECKOUT_ADAPTERS`. It requires both demo flags, an `sk_test_...` key, and a
+development/test environment. It needs no Stripe publishable key, local demo
+merchant, tunnel, or port `8100`. The older direct-adapter fixture remains
+available through `make demo-merchant-run` when adapter development specifically
+needs it.
+
 The shared `.env` is only a local-development convenience. FastAPI uses a
 settings model that has no Browserbase or Stripe secret fields; production must
 inject those provider variables only into the checkout-worker process.
@@ -89,8 +119,10 @@ The management UI includes registration/login, an overview, compact
 OpenClaw/Hermes runtime cards with detail sheets, realistic but safely masked
 virtual cards, agent/card assignment, personal/business sandbox
 payment-method entry, per-agent approval rules at `/rules`, queues for
-proposed, approved, and historical items, merchant-credential reveal after
-password confirmation, purchases, and locally tracked subscriptions.
+proposed, approved, needs-attention, and historical items, ordered checkout
+status timelines, active Browserbase session inspection, terminal outcome
+toasts, merchant-credential reveal after password confirmation, purchases, and
+locally tracked subscriptions.
 
 To populate an existing account with repeatable local demo data:
 
@@ -142,7 +174,10 @@ Browserbase automation with recording and logging disabled; and records success
 only after matching issuer authorization. Raw PAN/CVC values are never stored,
 returned, logged, or sent to an LLM. Agents learn terminal managed-checkout
 outcomes through their tenant-scoped cursor event feed and cannot self-report
-completion for those requests. A managed-checkout card must not be used by an
+completion for those requests. The built-in development-only `stripe-hosted`
+rail hardcodes Browserbase recording and session logging on because it uses
+only public Stripe test-card fixtures; Issuing and configured-merchant sessions
+keep both features off. A managed-checkout card must not be used by an
 unrelated external flow while an execution is in progress; dedicated virtual
 cards per execution are the safest deployment model. A card is quarantined
 after an action-required or outcome-unknown execution and cannot be queued or

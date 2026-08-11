@@ -17,17 +17,27 @@ from helpers import (
 )
 from httpx import AsyncClient
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ag_platform_api.core.config import CheckoutAdapterSettings, Settings
+from ag_platform_api.core.config import (
+    STRIPE_HOSTED_TEST_ADAPTER_KEY,
+    STRIPE_HOSTED_TEST_BOOTSTRAP_URL,
+    CheckoutAdapterSettings,
+    Settings,
+    stripe_hosted_test_adapter,
+)
 from ag_platform_api.models import (
     CartItem,
     CheckoutEvent,
     CheckoutExecution,
     CheckoutExecutionStatus,
+    CheckoutStatusTransition,
     PurchaseCredential,
+    User,
 )
+from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
+from ag_platform_api.services.checkout.repository import SqlAlchemyCheckoutRepository
 
 
 def adapter_payload(**overrides: Any) -> dict[str, Any]:
@@ -150,6 +160,12 @@ def test_checkout_adapter_configuration_is_strict() -> None:
         )
     with pytest.raises(ValidationError):
         CheckoutAdapterSettings.model_validate(adapter_payload(unexpected_secret="not-allowed"))
+    with pytest.raises(ValidationError):
+        CheckoutAdapterSettings.model_validate(
+            adapter_payload(result_origins=["https://result.example.test"])
+        )
+    with pytest.raises(ValidationError):
+        CheckoutAdapterSettings.model_validate(adapter_payload(checkout_mode="agentic"))
 
     split_expiry = CheckoutAdapterSettings.model_validate(
         adapter_payload(
@@ -159,6 +175,63 @@ def test_checkout_adapter_configuration_is_strict() -> None:
         )
     )
     assert split_expiry.expiry_selector is None
+
+
+async def test_hosted_checkout_queues_one_pinned_frozen_adapter_snapshot(
+    client: AsyncClient,
+    settings: Settings,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings.checkout_enabled = True
+    settings.checkout_demo_enabled = True
+    settings.checkout_hosted_demo_enabled = True
+    settings.checkout_adapters = {STRIPE_HOSTED_TEST_ADAPTER_KEY: stripe_hosted_test_adapter()}
+    wallet = await managed_wallet(client, "managed-hosted-frozen")
+    demo_method = await create_payment_method(
+        client,
+        wallet["user_token"],
+        payload=personal_payment_method("pm_stripe_demo_decline"),
+    )
+    await assign_payment_method(
+        client,
+        wallet["user_token"],
+        wallet["agent_id"],
+        demo_method["id"],
+    )
+    proposed = await propose_managed(
+        client,
+        wallet,
+        suffix="hosted-frozen",
+        adapter=STRIPE_HOSTED_TEST_ADAPTER_KEY,
+        checkout_url=STRIPE_HOSTED_TEST_BOOTSTRAP_URL,
+    )
+    approval = await client.post(
+        f"{API}/cart-items/{proposed['id']}/approve",
+        headers=bearer(wallet["user_token"]),
+        json={"payment_method_id": demo_method["id"]},
+    )
+
+    assert approval.status_code == 200, approval.text
+    execution_id = UUID(approval.json()["execution"]["id"])
+    async with db_session_factory() as db:
+        execution = await db.get(CheckoutExecution, execution_id)
+    assert execution is not None
+    assert execution.adapter_key == STRIPE_HOSTED_TEST_ADAPTER_KEY
+    assert execution.checkout_origin == "https://checkout.stripe.com"
+    assert execution.adapter_config == stripe_hosted_test_adapter().model_dump(mode="json")
+
+    settings.checkout_adapters = {
+        "different": CheckoutAdapterSettings.model_validate(adapter_payload())
+    }
+    repository = SqlAlchemyCheckoutRepository(db_session_factory)
+    claim = await repository.claim_next(lease_seconds=120, max_attempts=1)
+    assert claim and claim.execution_id == execution_id
+    frozen = await repository.prepare(execution_id)
+
+    assert frozen.adapter_key == STRIPE_HOSTED_TEST_ADAPTER_KEY
+    assert frozen.adapter.checkout_mode == "stripe_hosted_test"
+    assert frozen.adapter.result_origins == ("https://example.com",)
+    assert frozen.adapter.submit_selector == '[data-testid="hosted-payment-submit-button"]'
 
 
 async def test_human_approval_queues_one_frozen_safe_execution(
@@ -192,6 +265,15 @@ async def test_human_approval_queues_one_frozen_safe_execution(
         "error_message": None,
         "merchant_order_reference": None,
         "browserbase_session_id": None,
+        "status_history": [
+            {
+                "status": "queued",
+                "attempt_count": 0,
+                "error_code": None,
+                "error_message": None,
+                "occurred_at": body["execution"]["status_history"][0]["occurred_at"],
+            }
+        ],
         "created_at": body["execution"]["created_at"],
         "updated_at": body["execution"]["updated_at"],
     }
@@ -230,6 +312,154 @@ async def test_human_approval_queues_one_frozen_safe_execution(
     safe_summary = safely_reloaded.json()["execution"]
     assert safe_summary["error_message"] == "The approved payment method was declined."
     assert "unsafe provider" not in json.dumps(safe_summary)
+
+
+async def test_human_checkout_history_is_ordered_tenant_scoped_and_sanitized(
+    client: AsyncClient,
+    settings: Settings,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    enable_checkout(settings)
+    wallet = await managed_wallet(client, "managed-history-owner")
+    other_wallet = await managed_wallet(client, "managed-history-other")
+    proposed = await propose_managed(client, wallet, suffix="history")
+    approved = await approve_managed(client, wallet, proposed["id"])
+    assert approved.status_code == 200, approved.text
+
+    execution_id = UUID(approved.json()["execution"]["id"])
+    repository = SqlAlchemyCheckoutRepository(db_session_factory)
+    first_claim = await repository.claim_next(lease_seconds=120, max_attempts=2)
+    assert first_claim and first_claim.execution_id == execution_id
+    assert (
+        await repository.retry_or_fail(
+            execution_id,
+            CheckoutError(CheckoutErrorCode.browser_session_failed, retryable=True),
+            max_attempts=2,
+        )
+        is None
+    )
+    second_claim = await repository.claim_next(lease_seconds=120, max_attempts=2)
+    assert second_claim and second_claim.execution_id == execution_id
+    terminal = await repository.retry_or_fail(
+        execution_id,
+        CheckoutError(CheckoutErrorCode.browser_session_failed, retryable=True),
+        max_attempts=2,
+    )
+    assert terminal and terminal.status == CheckoutExecutionStatus.failed
+
+    async with db_session_factory() as db:
+        final_transition = await db.scalar(
+            select(CheckoutStatusTransition)
+            .where(
+                CheckoutStatusTransition.execution_id == execution_id,
+                CheckoutStatusTransition.status == CheckoutExecutionStatus.failed,
+            )
+            .order_by(CheckoutStatusTransition.sequence.desc())
+        )
+        assert final_transition is not None
+        final_transition.error_code = "unsafe-provider-response-secret"
+        await db.commit()
+
+    human = await client.get(
+        f"{API}/cart-items/{proposed['id']}", headers=bearer(wallet["user_token"])
+    )
+    assert human.status_code == 200, human.text
+    history = human.json()["execution"]["status_history"]
+    assert [transition["status"] for transition in history] == [
+        "queued",
+        "running",
+        "queued",
+        "running",
+        "failed",
+    ]
+    assert [transition["attempt_count"] for transition in history] == [0, 1, 1, 2, 2]
+    assert history[2]["error_code"] == "browser_session_failed"
+    assert history[2]["error_message"] == "The secure browser session could not be started."
+    assert history[-1]["error_code"] == "checkout_failed"
+    assert history[-1]["error_message"] == "The checkout could not be completed."
+    assert "secret" not in json.dumps(history)
+
+    other_owner = await client.get(
+        f"{API}/cart-items/{proposed['id']}",
+        headers=bearer(other_wallet["user_token"]),
+    )
+    assert other_owner.status_code == 404
+
+    agent = await client.get(
+        f"{API}/agent/cart-items/{proposed['id']}",
+        headers=bearer(wallet["agent_token"]),
+    )
+    assert agent.status_code == 200, agent.text
+    assert "status_history" not in agent.json()["execution"]
+
+
+async def test_human_checkout_history_exposes_queued_running_and_succeeded(
+    client: AsyncClient,
+    settings: Settings,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    enable_checkout(settings)
+    wallet = await managed_wallet(client, "managed-history-success")
+    proposed = await propose_managed(client, wallet, suffix="history-success")
+    approved = await approve_managed(client, wallet, proposed["id"])
+    assert approved.status_code == 200, approved.text
+
+    execution_id = UUID(approved.json()["execution"]["id"])
+    repository = SqlAlchemyCheckoutRepository(db_session_factory)
+    claim = await repository.claim_next(lease_seconds=120, max_attempts=2)
+    assert claim and claim.execution_id == execution_id
+    await repository.mark_submitted(execution_id, "session_history_success")
+    completed = await repository.succeed(
+        execution_id,
+        provider_reference="iauth_historysuccess",
+        merchant_order_reference="ORDER-HISTORY-SUCCESS",
+        receipt_url="https://merchant.example.test/receipts/history-success",
+    )
+    assert completed and completed.status == CheckoutExecutionStatus.succeeded
+
+    human = await client.get(
+        f"{API}/cart-items/{proposed['id']}", headers=bearer(wallet["user_token"])
+    )
+    assert human.status_code == 200, human.text
+    history = human.json()["execution"]["status_history"]
+    assert [transition["status"] for transition in history] == [
+        "queued",
+        "running",
+        "succeeded",
+    ]
+    assert [transition["attempt_count"] for transition in history] == [0, 1, 1]
+    assert all(transition["error_code"] is None for transition in history)
+
+
+async def test_checkout_status_history_cascades_when_tenant_is_deleted(
+    client: AsyncClient,
+    settings: Settings,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    enable_checkout(settings)
+    wallet = await managed_wallet(client, "managed-history-cascade")
+    proposed = await propose_managed(client, wallet, suffix="history-cascade")
+    approved = await approve_managed(client, wallet, proposed["id"])
+    assert approved.status_code == 200, approved.text
+
+    execution_id = UUID(approved.json()["execution"]["id"])
+    async with db_session_factory() as db:
+        execution = await db.get(CheckoutExecution, execution_id)
+        assert execution is not None
+        transition_count = await db.scalar(
+            select(func.count())
+            .select_from(CheckoutStatusTransition)
+            .where(CheckoutStatusTransition.execution_id == execution_id)
+        )
+        assert transition_count == 1
+        await db.execute(delete(User).where(User.id == execution.owner_id))
+        await db.commit()
+        remaining = await db.scalar(
+            select(func.count())
+            .select_from(CheckoutStatusTransition)
+            .where(CheckoutStatusTransition.execution_id == execution_id)
+        )
+        assert remaining == 0
 
 
 async def test_managed_checkout_always_waits_for_human_even_with_never_policy(

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Loader2, WalletCards } from "lucide-react";
 
 import { AppShell } from "@/components/app";
+import { CheckoutOutcomeNotifier } from "@/components/features/approvals/checkout-outcome-notifier";
 import { useCartItems } from "@/hooks/use-api-data";
 import { useAuth } from "@/providers/auth-provider";
 
@@ -40,6 +41,10 @@ function AuthenticatedShell({ children }: { children: React.ReactNode }) {
   const pendingApprovals =
     cart.data?.filter((item) => item.status === "proposed").length ?? 0;
 
-  return <AppShell pendingApprovals={pendingApprovals}>{children}</AppShell>;
+  return (
+    <AppShell pendingApprovals={pendingApprovals}>
+      <CheckoutOutcomeNotifier items={cart.data} />
+      {children}
+    </AppShell>
+  );
 }
-

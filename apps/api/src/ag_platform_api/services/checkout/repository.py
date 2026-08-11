@@ -23,6 +23,7 @@ from ag_platform_api.models import (
     CheckoutEvent,
     CheckoutExecution,
     CheckoutExecutionStatus,
+    CheckoutStatusTransition,
     PaymentMethod,
     PaymentMethodStatus,
     Purchase,
@@ -155,6 +156,13 @@ class SqlAlchemyCheckoutRepository:
             execution.lease_expires_at = now + timedelta(seconds=lease_seconds)
             execution.error_code = None
             execution.error_message = None
+            session.add(
+                self._transition(
+                    execution,
+                    status=CheckoutExecutionStatus.running,
+                    occurred_at=now,
+                )
+            )
             return ClaimResult(execution.id, execution.cart_item_id)
 
     async def prepare(self, execution_id: UUID) -> CheckoutContext:
@@ -246,6 +254,14 @@ class SqlAlchemyCheckoutRepository:
                 execution.lease_expires_at = None
                 execution.error_code = error.code.value
                 execution.error_message = error.safe_message
+                session.add(
+                    self._transition(
+                        execution,
+                        status=CheckoutExecutionStatus.queued,
+                        error_code=error.code,
+                        occurred_at=now,
+                    )
+                )
                 return None
             return self._set_terminal(
                 session,
@@ -324,6 +340,13 @@ class SqlAlchemyCheckoutRepository:
             execution.error_code = None
             execution.error_message = None
             execution.merchant_order_reference = merchant_order_reference
+            session.add(
+                self._transition(
+                    execution,
+                    status=CheckoutExecutionStatus.succeeded,
+                    occurred_at=now,
+                )
+            )
             try:
                 await session.flush()
             except IntegrityError:
@@ -458,7 +481,17 @@ class SqlAlchemyCheckoutRepository:
         execution.lease_expires_at = None
         execution.error_code = error_code.value
         execution.error_message = SAFE_ERROR_MESSAGES[error_code]
-        session.add(self._event(execution, status=status, error_code=error_code.value))
+        session.add_all(
+            (
+                self._event(execution, status=status, error_code=error_code.value),
+                self._transition(
+                    execution,
+                    status=status,
+                    error_code=error_code,
+                    occurred_at=now,
+                ),
+            )
+        )
         return TerminalNotification(
             execution_id=execution.id,
             cart_item_id=execution.cart_item_id,
@@ -484,4 +517,20 @@ class SqlAlchemyCheckoutRepository:
             amount=execution.approved_amount,
             currency=execution.currency,
             error_code=error_code,
+        )
+
+    @staticmethod
+    def _transition(
+        execution: CheckoutExecution,
+        *,
+        status: CheckoutExecutionStatus,
+        error_code: CheckoutErrorCode | None = None,
+        occurred_at: datetime,
+    ) -> CheckoutStatusTransition:
+        return CheckoutStatusTransition(
+            execution_id=execution.id,
+            status=status,
+            attempt_count=execution.attempt_count,
+            error_code=error_code.value if error_code is not None else None,
+            occurred_at=occurred_at,
         )

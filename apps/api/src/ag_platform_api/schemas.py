@@ -401,9 +401,18 @@ class CartItemRead(APIModel):
     execution: CheckoutExecutionSummary | None = None
 
 
+class CheckoutStatusTransitionRead(APIModel):
+    status: CheckoutExecutionStatus
+    attempt_count: int
+    error_code: str | None
+    error_message: str | None
+    occurred_at: datetime
+
+
 class HumanCheckoutExecutionSummary(CheckoutExecutionSummary):
     merchant_order_reference: str | None
     browserbase_session_id: str | None
+    status_history: list[CheckoutStatusTransitionRead]
 
 
 class HumanCartItemRead(CartItemRead):

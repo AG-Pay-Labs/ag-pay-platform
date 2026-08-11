@@ -22,6 +22,7 @@ from ag_platform_api.models import (
     CheckoutEvent,
     CheckoutExecution,
     CheckoutExecutionStatus,
+    CheckoutStatusTransition,
     PaymentMethod,
     PaymentMethodStatus,
     Purchase,
@@ -151,6 +152,13 @@ async def seed_execution(
         )
         session.add(execution)
         await session.flush()
+        session.add(
+            CheckoutStatusTransition(
+                execution_id=execution.id,
+                status=CheckoutExecutionStatus.queued,
+                attempt_count=0,
+            )
+        )
         return execution.id
 
 
@@ -203,6 +211,13 @@ async def seed_sibling_execution(
         )
         session.add(execution)
         await session.flush()
+        session.add(
+            CheckoutStatusTransition(
+                execution_id=execution.id,
+                status=CheckoutExecutionStatus.queued,
+                attempt_count=0,
+            )
+        )
         return execution.id
 
 
@@ -236,9 +251,31 @@ async def test_pre_submit_failure_retries_only_to_configured_max(
             .select_from(CheckoutEvent)
             .where(CheckoutEvent.execution_id == execution_id)
         )
+        transitions = list(
+            await session.scalars(
+                select(CheckoutStatusTransition)
+                .where(CheckoutStatusTransition.execution_id == execution_id)
+                .order_by(CheckoutStatusTransition.sequence)
+            )
+        )
     assert execution and execution.attempt_count == 2
     assert execution.status == CheckoutExecutionStatus.failed
     assert event_count == 1
+    assert [transition.status for transition in transitions] == [
+        CheckoutExecutionStatus.queued,
+        CheckoutExecutionStatus.running,
+        CheckoutExecutionStatus.queued,
+        CheckoutExecutionStatus.running,
+        CheckoutExecutionStatus.failed,
+    ]
+    assert [transition.attempt_count for transition in transitions] == [0, 1, 1, 2, 2]
+    assert [transition.error_code for transition in transitions] == [
+        None,
+        None,
+        CheckoutErrorCode.browser_session_failed.value,
+        None,
+        CheckoutErrorCode.browser_session_failed.value,
+    ]
 
 
 async def test_stale_post_submit_execution_becomes_unknown_and_is_never_retried(
@@ -318,11 +355,24 @@ async def test_success_is_atomic_and_idempotent_with_one_purchase_and_event(
         purchase = await session.scalar(
             select(Purchase).where(Purchase.cart_item_id == completed.cart_item_id)
         )
+        transitions = list(
+            await session.scalars(
+                select(CheckoutStatusTransition)
+                .where(CheckoutStatusTransition.execution_id == execution_id)
+                .order_by(CheckoutStatusTransition.sequence)
+            )
+        )
     assert execution and execution.status == CheckoutExecutionStatus.succeeded
     assert execution.merchant_order_reference == "ORDER-123"
     assert cart and cart.status == CartItemStatus.purchased
     assert purchase and purchase.merchant_order_reference == "ORDER-123"
     assert purchase_count == event_count == 1
+    assert [transition.status for transition in transitions] == [
+        CheckoutExecutionStatus.queued,
+        CheckoutExecutionStatus.running,
+        CheckoutExecutionStatus.succeeded,
+    ]
+    assert [transition.attempt_count for transition in transitions] == [0, 1, 1]
 
 
 async def test_repository_rejects_legacy_queued_recurring_execution(

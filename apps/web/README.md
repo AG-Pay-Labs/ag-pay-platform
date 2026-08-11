@@ -35,9 +35,13 @@ API proxy forwards only an explicit method/path allowlist. Agent-facing routes
 are intentionally unavailable through that proxy.
 
 Never add inputs for raw PAN, CVC, PIN, or 3-D Secure secrets. The current card
-form accepts only fake/provider-sandbox references and safe display metadata.
-Approval authorizes an agent to complete checkout externally; this application
-does not charge a card or cancel a merchant subscription.
+form accepts only opaque provider references and safe display metadata.
+For managed checkout, approval queues the trusted AG Pay executor only when a
+server-configured merchant adapter and compatible provider reference are
+available. The UI follows that execution from queued or running through its
+verified terminal outcome. Legacy approval instead authorizes the agent to
+complete checkout externally and report the result. Merchant subscription
+cancellation remains a separate provider operation in both flows.
 
 ## Checks
 

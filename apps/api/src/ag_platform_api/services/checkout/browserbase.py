@@ -42,6 +42,13 @@ class LocatorLike(Protocol):
 
     async def fill(self, value: str) -> None: ...
 
+    async def select_option(
+        self,
+        value: str | None = None,
+        *,
+        label: str | None = None,
+    ) -> object: ...
+
     async def click(self) -> None: ...
 
     async def get_attribute(self, name: str) -> str | None: ...
@@ -99,6 +106,7 @@ CardLoader = Callable[[], Awaitable[IssuingCardSecret]]
 SessionStarted = Callable[[str], Awaitable[None]]
 PrepareSubmission = Callable[[], Awaitable[None]]
 MarkSubmitted = Callable[[str], Awaitable[None]]
+ObserveOutcome = Callable[[], Awaitable[AuthorizationOutcome]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,11 +147,17 @@ class BrowserbaseGateway:
         if self._owns_client:
             await self._client.aclose()
 
-    async def create_session(self, origins: tuple[str, ...]) -> BrowserbaseSession:
+    async def create_session(
+        self,
+        origins: tuple[str, ...],
+        *,
+        record_session: bool = False,
+        log_session: bool = False,
+    ) -> BrowserbaseSession:
         allowed_domains = browserbase_allowed_domains(origins)
         browser_settings: dict[str, object] = {
-            "recordSession": False,
-            "logSession": False,
+            "recordSession": record_session,
+            "logSession": log_session,
             "solveCaptchas": False,
             "allowedDomains": allowed_domains,
         }
@@ -214,17 +228,22 @@ class BrowserbaseCheckout:
         on_session_started: SessionStarted,
         prepare_submission: PrepareSubmission,
         mark_submitted: MarkSubmitted,
+        observe_outcome: ObserveOutcome | None = None,
     ) -> BrowserCheckoutResult:
         adapter = context.adapter
         allowed_origins = tuple(normalize_origin(value) for value in adapter.allowed_origins)
         payment_origins = tuple(normalize_origin(value) for value in adapter.payment_origins)
         resource_origins = tuple(normalize_origin(value) for value in adapter.resource_origins)
+        result_origins = tuple(normalize_origin(value) for value in adapter.result_origins)
         merchant_origins = (normalize_origin(context.checkout_origin),)
         if merchant_origins[0] not in allowed_origins:
             raise CheckoutError(CheckoutErrorCode.origin_blocked)
         checkout_url = validate_checkout_url(context.checkout_url, merchant_origins)
+        observe_test_session = adapter.checkout_mode == "stripe_hosted_test"
         session = await self._gateway.create_session(
-            allowed_origins + payment_origins + resource_origins
+            allowed_origins + payment_origins + resource_origins,
+            record_session=observe_test_session,
+            log_session=observe_test_session,
         )
         browser: ConnectedBrowser | None = None
         try:
@@ -250,6 +269,7 @@ class BrowserbaseCheckout:
                 adapter.submit_selector,
                 merchant_origins,
                 CheckoutErrorCode.payment_form_not_found,
+                timeout_ms=10_000,
             )
             submit_handle = await self._resolve_handle(
                 submit,
@@ -274,7 +294,17 @@ class BrowserbaseCheckout:
                     raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown) from None
             finally:
                 del card
-            return await self._wait_for_result(page, adapter, merchant_origins, payment_origins)
+            if adapter.checkout_mode == "stripe_hosted_test":
+                if observe_outcome is None:
+                    raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+                outcome = await observe_outcome()
+                return BrowserCheckoutResult(None, None, outcome)
+            return await self._wait_for_result(
+                page,
+                adapter,
+                tuple(dict.fromkeys(merchant_origins + result_origins)),
+                payment_origins,
+            )
         finally:
             if browser is not None:
                 try:
@@ -334,12 +364,18 @@ class BrowserbaseCheckout:
             context.adapter.total_selector,
             allowed_origins,
             CheckoutErrorCode.total_not_found,
+            timeout_ms=10_000,
         )
         try:
             text = (await located.locator.inner_text())[:500]
         except Exception:
             raise CheckoutError(CheckoutErrorCode.total_not_found) from None
-        if not money_text_matches(text, context.amount, context.currency):
+        matches = (
+            amount_text_matches(text, context.amount, context.currency)
+            if context.adapter.checkout_mode == "stripe_hosted_test"
+            else money_text_matches(text, context.amount, context.currency)
+        )
+        if not matches:
             raise CheckoutError(CheckoutErrorCode.total_mismatch)
 
     async def _verify_item(
@@ -353,29 +389,51 @@ class BrowserbaseCheckout:
             context.adapter.product_title_selector,
             allowed_origins,
             CheckoutErrorCode.item_mismatch,
+            timeout_ms=10_000,
         )
-        quantity = await self._unique_visible(
-            page,
-            context.adapter.quantity_selector,
-            allowed_origins,
-            CheckoutErrorCode.quantity_mismatch,
-        )
+        quantity: LocatedElement | None
+        try:
+            quantity = await self._unique_visible(
+                page,
+                context.adapter.quantity_selector,
+                allowed_origins,
+                CheckoutErrorCode.quantity_mismatch,
+                timeout_ms=(1_000 if context.approved_quantity == 1 else 10_000),
+            )
+        except CheckoutError:
+            if (
+                context.adapter.checkout_mode == "stripe_hosted_test"
+                and context.approved_quantity == 1
+            ):
+                quantity = None
+            else:
+                raise
         try:
             merchant_title = normalize_item_text((await title.locator.inner_text())[:500])
         except Exception:
             raise CheckoutError(CheckoutErrorCode.item_mismatch) from None
         if merchant_title != normalize_item_text(context.approved_title):
             raise CheckoutError(CheckoutErrorCode.item_mismatch)
-        try:
-            merchant_quantity = await quantity.locator.input_value()
-        except Exception:
+        if quantity is None:
+            merchant_quantity = "1"
+        else:
             try:
-                merchant_quantity = (await quantity.locator.inner_text())[:100]
+                merchant_quantity = await quantity.locator.input_value()
             except Exception:
-                raise CheckoutError(CheckoutErrorCode.quantity_mismatch) from None
-        match = re.fullmatch(
-            r"(?:qty|quantity)?\s*[:x×]?\s*(\d+)",
-            normalize_item_text(merchant_quantity),
+                try:
+                    merchant_quantity = (await quantity.locator.inner_text())[:100]
+                except Exception:
+                    raise CheckoutError(CheckoutErrorCode.quantity_mismatch) from None
+        if quantity is None:
+            return
+        normalized_quantity = normalize_item_text(merchant_quantity)
+        match = (
+            re.search(r"(?:^|\b)qty\s*[:x×]?\s*(\d+)(?:\b|,)", normalized_quantity)
+            if context.adapter.checkout_mode == "stripe_hosted_test"
+            else re.fullmatch(
+                r"(?:qty|quantity)?\s*[:x×]?\s*(\d+)",
+                normalized_quantity,
+            )
         )
         if match is None or int(match.group(1)) != context.approved_quantity:
             raise CheckoutError(CheckoutErrorCode.quantity_mismatch)
@@ -395,25 +453,44 @@ class BrowserbaseCheckout:
             (adapter.name_selector, name),
             (adapter.billing_email_selector, billing_details.get("email")),
             (adapter.billing_phone_selector, billing_details.get("phone")),
+            (adapter.billing_country_selector, address.get("country")),
             (adapter.billing_line1_selector, address.get("line1")),
             (adapter.billing_line2_selector, address.get("line2")),
             (adapter.billing_city_selector, address.get("city")),
             (adapter.billing_region_selector, address.get("region")),
             (adapter.billing_postal_code_selector, address.get("postal_code")),
-            (adapter.billing_country_selector, address.get("country")),
         )
         for selector, value in values:
             if selector is None or value is None:
                 continue
-            located = await self._unique_visible(
-                page,
-                selector,
-                allowed_origins,
-                CheckoutErrorCode.payment_form_not_found,
-            )
+            try:
+                located = await self._unique_visible(
+                    page,
+                    selector,
+                    allowed_origins,
+                    CheckoutErrorCode.payment_form_not_found,
+                    timeout_ms=5_000,
+                )
+            except CheckoutError:
+                if adapter.checkout_mode == "stripe_hosted_test":
+                    continue
+                raise
             try:
                 self._validate_located_frame(located, allowed_origins)
-                await located.locator.fill(str(value)[:320])
+                if selector in {
+                    adapter.billing_country_selector,
+                    adapter.billing_region_selector,
+                }:
+                    try:
+                        await located.locator.select_option(str(value)[:320])
+                    except Exception:
+                        try:
+                            await located.locator.select_option(label=str(value)[:320])
+                        except Exception:
+                            await located.locator.fill(str(value)[:320])
+                    await page.wait_for_timeout(100)
+                else:
+                    await located.locator.fill(str(value)[:320])
             except Exception:
                 raise CheckoutError(CheckoutErrorCode.payment_form_not_found) from None
 
@@ -445,6 +522,7 @@ class BrowserbaseCheckout:
                 selector,
                 payment_origins,
                 CheckoutErrorCode.payment_form_not_found,
+                timeout_ms=10_000,
             )
             handle = await self._resolve_handle(
                 located,
@@ -572,26 +650,34 @@ class BrowserbaseCheckout:
         selector: str,
         allowed_origins: tuple[str, ...],
         missing_code: CheckoutErrorCode,
+        *,
+        timeout_ms: int = 0,
     ) -> LocatedElement:
-        matches: list[LocatedElement] = []
+        elapsed = 0
+        interval = 100
         allowed = set(allowed_origins)
-        for frame in page.frames:
-            if not frame.url or frame.url == "about:blank":
-                continue
-            if normalize_origin(frame.url) not in allowed:
-                continue
-            try:
-                collection = frame.locator(selector)
-                count = await collection.count()
-                for index in range(count):
-                    candidate = collection.nth(index)
-                    if await candidate.is_visible():
-                        matches.append(LocatedElement(locator=candidate, frame=frame))
-            except Exception:
-                raise CheckoutError(missing_code) from None
-        if len(matches) != 1:
-            raise CheckoutError(missing_code)
-        return matches[0]
+        while True:
+            matches: list[LocatedElement] = []
+            for frame in page.frames:
+                if not frame.url or frame.url == "about:blank":
+                    continue
+                if normalize_origin(frame.url) not in allowed:
+                    continue
+                try:
+                    collection = frame.locator(selector)
+                    count = await collection.count()
+                    for index in range(count):
+                        candidate = collection.nth(index)
+                        if await candidate.is_visible():
+                            matches.append(LocatedElement(locator=candidate, frame=frame))
+                except Exception:
+                    raise CheckoutError(missing_code) from None
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1 or elapsed >= timeout_ms:
+                raise CheckoutError(missing_code)
+            await page.wait_for_timeout(interval)
+            elapsed += interval
 
     async def _resolve_handle(
         self,
@@ -657,6 +743,22 @@ def money_text_matches(text: str, amount: Decimal, currency: str) -> bool:
     if re.search(r"[+\-−]\s*\d", text):
         return False
     decimal_places = CURRENCY_EXPONENTS.get(currency)
+    if decimal_places is None:
+        return False
+    parsed: set[Decimal] = set()
+    for match in NUMBER_PATTERN.finditer(text):
+        try:
+            parsed.add(parse_display_amount(match.group(1), decimal_places=decimal_places))
+        except InvalidOperation:
+            continue
+    return parsed == {amount}
+
+
+def amount_text_matches(text: str, amount: Decimal, currency: str) -> bool:
+    """Match a single localized amount when provider API already binds its currency."""
+    if re.search(r"[+\-−]\s*\d", text):
+        return False
+    decimal_places = CURRENCY_EXPONENTS.get(currency.upper())
     if decimal_places is None:
         return False
     parsed: set[Decimal] = set()

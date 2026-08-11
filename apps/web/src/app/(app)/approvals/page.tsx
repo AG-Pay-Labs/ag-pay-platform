@@ -7,10 +7,12 @@ import {
   Bot,
   CalendarClock,
   CheckCircle2,
+  CircleX,
   ExternalLink,
   Search,
   ShieldCheck,
   ShoppingBasket,
+  TriangleAlert,
 } from "lucide-react";
 
 import {
@@ -42,18 +44,25 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAgents, useCartItems } from "@/hooks/use-api-data";
 import type {
   CartItemRead,
-  CartItemStatus,
   CheckoutExecutionStatus,
 } from "@/lib/api-types";
+import { cn } from "@/lib/utils";
 import { formatDateTime, hostname, relativeTime } from "@/utils/format";
 
-type Queue = "review" | "approved" | "history";
+type Queue = "review" | "progress" | "attention" | "history";
 
-const QUEUE_STATUSES: Record<Queue, CartItemStatus[]> = {
-  review: ["proposed"],
-  approved: ["approved"],
-  history: ["purchased", "cancelled"],
+const QUEUE_LABELS: Record<Queue, string> = {
+  review: "Needs review",
+  progress: "In progress",
+  attention: "Needs attention",
+  history: "History",
 };
+
+const ATTENTION_STATUSES = new Set<CheckoutExecutionStatus>([
+  "failed",
+  "action_required",
+  "outcome_unknown",
+]);
 
 export default function ApprovalsPage() {
   return (
@@ -76,16 +85,17 @@ function ApprovalsContent() {
   const counts = useMemo(() => {
     const items = cart.data ?? [];
     return {
-      review: items.filter((item) => item.status === "proposed").length,
-      approved: items.filter((item) => item.status === "approved").length,
-      history: items.filter((item) => ["purchased", "cancelled"].includes(item.status)).length,
+      review: items.filter((item) => queueFor(item) === "review").length,
+      progress: items.filter((item) => queueFor(item) === "progress").length,
+      attention: items.filter((item) => queueFor(item) === "attention").length,
+      history: items.filter((item) => queueFor(item) === "history").length,
     };
   }, [cart.data]);
 
   const items = useMemo(() => {
     const normalized = search.trim().toLowerCase();
     return (cart.data ?? []).filter((item) => {
-      if (!QUEUE_STATUSES[queue].includes(item.status)) return false;
+      if (queueFor(item) !== queue) return false;
       if (!normalized) return true;
       const agent = agents.data?.find((candidate) => candidate.id === item.agent_id);
       return [item.title, item.merchant, item.description, item.reason, agent?.name]
@@ -124,7 +134,10 @@ function ApprovalsContent() {
                     </span>
                   ) : null}
                 </TabsTrigger>
-                <TabsTrigger value="approved">Approved · {counts.approved}</TabsTrigger>
+                <TabsTrigger value="progress">In progress · {counts.progress}</TabsTrigger>
+                <TabsTrigger value="attention">
+                  Needs attention · {counts.attention}
+                </TabsTrigger>
                 <TabsTrigger value="history">History · {counts.history}</TabsTrigger>
               </TabsList>
             </Tabs>
@@ -155,7 +168,7 @@ function ApprovalsContent() {
           <ResponsiveEntityList
             items={items}
             getKey={(item) => item.id}
-            caption={`${queue} purchase proposals`}
+            caption={`${QUEUE_LABELS[queue]} purchase proposals`}
             emptyState={
               <EmptyState
                 icon={queue === "review" ? CheckCircle2 : ShoppingBasket}
@@ -356,7 +369,9 @@ function ApprovalsContent() {
 
                 <Separator />
 
-                {selected.status === "proposed" ? (
+                {selected.execution ? (
+                  <ExecutionState item={selected} />
+                ) : selected.status === "proposed" ? (
                   <div>
                     <div className="mb-4 flex gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
                       <ShieldCheck className="mt-0.5 size-4 shrink-0" />
@@ -370,7 +385,7 @@ function ApprovalsContent() {
                     </div>
                   </div>
                 ) : selected.status === "approved" ? (
-                  <ApprovedState item={selected} />
+                  <LegacyApprovedState item={selected} />
                 ) : null}
               </div>
             </>
@@ -399,38 +414,85 @@ function Detail({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ApprovedState({ item }: { item: CartItemRead }) {
+function ExecutionState({ item }: { item: CartItemRead }) {
   const approved = item.approved_at ? relativeTime(item.approved_at) : "recently";
   const execution = item.execution;
-  const copy = executionStatusCopy(execution?.status);
+  if (!execution) return null;
+  const copy = executionStatusCopy(execution.status);
+  const presentation = executionPresentation(execution.status);
+  const StateIcon = presentation.icon;
 
   return (
-    <div className="flex gap-3 rounded-lg border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100">
-      <CalendarClock className="mt-0.5 size-5 shrink-0" />
-      <div>
+    <div
+      className={cn(
+        "flex gap-3 rounded-lg border p-4 text-sm",
+        presentation.className,
+      )}
+    >
+      <StateIcon className="mt-0.5 size-5 shrink-0" />
+      <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
           <p className="font-medium">{copy.title}</p>
-          {execution ? <StatusBadge status={execution.status} /> : null}
+          <StatusBadge status={execution.status} />
         </div>
         <p className="mt-1 leading-6">
           Approved {approved}. {copy.description}
         </p>
-        {execution?.error_message ? (
-          <p className="mt-2 leading-5">{execution.error_message}</p>
+        <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+          <Detail label="Attempt count" value={String(execution.attempt_count)} />
+          {execution.submitted_at ? (
+            <Detail label="Payment submitted" value={formatDateTime(execution.submitted_at)} />
+          ) : null}
+          {execution.completed_at ? (
+            <Detail label="Checkout completed" value={formatDateTime(execution.completed_at)} />
+          ) : null}
+        </dl>
+        {execution.error_message || execution.error_code ? (
+          <div className="mt-4 rounded-md border border-current/20 bg-background/45 p-3">
+            {execution.error_message ? (
+              <p className="leading-5">{execution.error_message}</p>
+            ) : null}
+            {execution.error_code ? (
+              <p className="mt-1 font-mono text-xs">Reason code: {execution.error_code}</p>
+            ) : null}
+          </div>
         ) : null}
-        {execution?.error_code ? (
-          <p className="mt-2 font-mono text-xs">Reason code: {execution.error_code}</p>
+        {execution.status_history.length ? (
+          <div className="mt-4 border-t border-current/20 pt-3">
+            <p className="text-xs font-semibold tracking-wide uppercase">Status history</p>
+            <ol className="mt-3 space-y-3">
+              {execution.status_history.map((transition, index) => (
+                <li
+                  key={`${transition.occurred_at}-${index}`}
+                  className="border-l-2 border-current/30 pl-3"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <StatusBadge status={transition.status} />
+                    {transition.attempt_count ? (
+                      <span className="text-xs">Attempt {transition.attempt_count}</span>
+                    ) : null}
+                    <time className="text-xs opacity-75">
+                      {formatDateTime(transition.occurred_at)}
+                    </time>
+                  </div>
+                  {transition.error_message ? (
+                    <p className="mt-1 text-xs leading-5">{transition.error_message}</p>
+                  ) : null}
+                </li>
+              ))}
+            </ol>
+          </div>
         ) : null}
-        {execution?.merchant_order_reference ? (
+        {execution.merchant_order_reference ? (
           <p className="mt-2 text-xs">
             Merchant order: <span className="font-mono">{execution.merchant_order_reference}</span>
           </p>
         ) : null}
-        {execution?.browserbase_session_id ? (
+        {execution.browserbase_session_id ? (
           <p className="mt-2 text-xs">
             <a
               className="underline"
-              href={`https://www.browserbase.com/sessions/${encodeURIComponent(execution.browserbase_session_id)}`}
+              href={`https://browserbase.com/sessions/${encodeURIComponent(execution.browserbase_session_id)}`}
               rel="noreferrer"
               target="_blank"
             >
@@ -443,7 +505,54 @@ function ApprovedState({ item }: { item: CartItemRead }) {
   );
 }
 
-function executionStatusCopy(status: CheckoutExecutionStatus | undefined) {
+function executionPresentation(status: CheckoutExecutionStatus) {
+  switch (status) {
+    case "succeeded":
+      return {
+        icon: CheckCircle2,
+        className:
+          "border-emerald-200 bg-emerald-50 text-emerald-950 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100",
+      };
+    case "failed":
+      return {
+        icon: CircleX,
+        className:
+          "border-rose-200 bg-rose-50 text-rose-950 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-100",
+      };
+    case "action_required":
+    case "outcome_unknown":
+      return {
+        icon: TriangleAlert,
+        className:
+          "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100",
+      };
+    case "queued":
+    case "running":
+      return {
+        icon: CalendarClock,
+        className:
+          "border-indigo-200 bg-indigo-50 text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100",
+      };
+  }
+}
+
+function LegacyApprovedState({ item }: { item: CartItemRead }) {
+  const approved = item.approved_at ? relativeTime(item.approved_at) : "recently";
+
+  return (
+    <div className="flex gap-3 rounded-lg border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100">
+      <CalendarClock className="mt-0.5 size-5 shrink-0" />
+      <div>
+        <p className="font-medium">Waiting for legacy completion</p>
+        <p className="mt-1 leading-6">
+          Approved {approved}. The agent must complete checkout externally and report the result.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function executionStatusCopy(status: CheckoutExecutionStatus) {
   switch (status) {
     case "queued":
       return {
@@ -475,22 +584,31 @@ function executionStatusCopy(status: CheckoutExecutionStatus | undefined) {
         title: "Checkout confirmed",
         description: "The purchase outcome has been verified and recorded.",
       };
-    default:
-      return {
-        title: "Waiting for legacy completion",
-        description: "The agent must complete checkout externally and report the result.",
-      };
   }
+}
+
+function queueFor(item: CartItemRead): Queue {
+  if (item.execution && ATTENTION_STATUSES.has(item.execution.status)) return "attention";
+  if (item.execution?.status === "succeeded") return "history";
+  if (item.status === "purchased" || item.status === "cancelled") return "history";
+  if (item.status === "proposed") return "review";
+  return "progress";
 }
 
 function emptyTitle(queue: Queue) {
   if (queue === "review") return "You are all caught up";
-  if (queue === "approved") return "No approved checkouts in progress";
+  if (queue === "progress") return "No checkouts in progress";
+  if (queue === "attention") return "No checkouts need attention";
   return "No decision history yet";
 }
 
 function emptyDescription(queue: Queue) {
   if (queue === "review") return "New agent proposals will appear here for human approval.";
-  if (queue === "approved") return "Approved proposals remain here until checkout reaches a terminal state.";
-  return "Purchased and cancelled proposals will appear here.";
+  if (queue === "progress") {
+    return "Queued and running managed checkouts appear here, along with legacy approvals awaiting the agent.";
+  }
+  if (queue === "attention") {
+    return "Failed, action-required, and uncertain checkout outcomes will appear here.";
+  }
+  return "Confirmed purchases and cancelled proposals will appear here.";
 }
