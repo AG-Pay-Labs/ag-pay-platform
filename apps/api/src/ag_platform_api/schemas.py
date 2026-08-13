@@ -39,6 +39,7 @@ Password = Annotated[SecretStr, Field(min_length=10, max_length=256)]
 OPAQUE_PROVIDER_REFERENCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{2,254}$")
 PROVIDER_REFERENCE_PATTERNS = {
     "stripe_issuing": re.compile(r"^ic_[A-Za-z0-9]+$"),
+    "stripe_link": re.compile(r"^csmrpd_[A-Za-z0-9]+$"),
     "prototype-vault": re.compile(r"^pm_[A-Za-z0-9_-]+$"),
 }
 

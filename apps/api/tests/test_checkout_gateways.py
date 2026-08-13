@@ -36,6 +36,7 @@ def test_api_settings_never_load_worker_provider_secrets(monkeypatch) -> None:
     monkeypatch.setenv("BROWSERBASE_PROJECT_ID", "project-worker-only")
     monkeypatch.setenv("STRIPE_SECRET_KEY", "stripe-worker-only")
     monkeypatch.setenv("STRIPE_DEMO_SECRET_KEY", "sk_test_demo-worker-only")
+    monkeypatch.setenv("STRIPE_LINK_AUTH_DIRECTORY", "/worker-only/link-auth")
 
     api_settings = Settings(_env_file=None)
     worker_settings = CheckoutWorkerSettings(_env_file=None)
@@ -43,6 +44,7 @@ def test_api_settings_never_load_worker_provider_secrets(monkeypatch) -> None:
     assert "browserbase_api_key" not in type(api_settings).model_fields
     assert "stripe_secret_key" not in type(api_settings).model_fields
     assert "stripe_demo_secret_key" not in type(api_settings).model_fields
+    assert "stripe_link_auth_directory" not in type(api_settings).model_fields
     assert "jwt_secret" not in type(worker_settings).model_fields
     assert "credential_encryption_key" not in type(worker_settings).model_fields
     assert isinstance(database_session.runtime_settings, CheckoutRuntimeSettings)
@@ -53,6 +55,42 @@ def test_api_settings_never_load_worker_provider_secrets(monkeypatch) -> None:
     assert "demo-worker-only" not in repr(worker_settings)
     assert worker_settings.browserbase_api_key is not None
     assert worker_settings.stripe_secret_key is not None
+
+
+def test_stripe_link_configuration_is_pinned_and_development_test_only(tmp_path) -> None:
+    auth_directory = tmp_path / "link-auth"
+    auth_directory.mkdir(mode=0o700)
+    configured = CheckoutWorkerSettings(
+        _env_file=None,
+        environment="test",
+        stripe_link_enabled=True,
+        stripe_link_test_mode=True,
+        stripe_link_auth_directory=auth_directory,
+    )
+    assert configured.stripe_link_cli_version == "0.12.0"
+
+    with pytest.raises(ValidationError, match="requires STRIPE_LINK_TEST_MODE"):
+        CheckoutRuntimeSettings(
+            _env_file=None,
+            environment="test",
+            stripe_link_enabled=True,
+        )
+    with pytest.raises(ValidationError, match="development/test-only"):
+        CheckoutRuntimeSettings(
+            _env_file=None,
+            environment="production",
+            stripe_link_enabled=True,
+            stripe_link_test_mode=True,
+        )
+    with pytest.raises(ValidationError):
+        CheckoutWorkerSettings(
+            _env_file=None,
+            environment="test",
+            stripe_link_enabled=True,
+            stripe_link_test_mode=True,
+            stripe_link_auth_directory=auth_directory,
+            stripe_link_cli_version="0.13.0",
+        )
 
 
 def test_stripe_hosted_adapter_is_pinned_and_development_test_only() -> None:

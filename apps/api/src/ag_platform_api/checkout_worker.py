@@ -12,6 +12,7 @@ from ag_platform_api.db.session import SessionFactory, engine
 from ag_platform_api.services.checkout.browserbase import BrowserbaseCheckout, BrowserbaseGateway
 from ag_platform_api.services.checkout.repository import SqlAlchemyCheckoutRepository
 from ag_platform_api.services.checkout.stripe_issuing import StripeIssuingGateway
+from ag_platform_api.services.checkout.stripe_link import StripeLinkGateway
 from ag_platform_api.services.checkout.stripe_payments_demo import StripePaymentsDemoGateway
 from ag_platform_api.services.checkout.worker import CheckoutWorker
 
@@ -48,9 +49,27 @@ def build_worker(
         raise RuntimeError("Managed checkout is disabled.")
     if settings.browserbase_api_key is None or not settings.browserbase_project_id:
         raise RuntimeError("Browserbase worker configuration is incomplete.")
-    if settings.stripe_secret_key is None and not settings.checkout_demo_enabled:
+    if (
+        settings.stripe_secret_key is None
+        and not settings.checkout_demo_enabled
+        and not settings.stripe_link_enabled
+    ):
         raise RuntimeError("No checkout payment provider is configured.")
 
+    # Link validates its executable and auth directory synchronously; fail before
+    # allocating any network clients so startup errors cannot leak resources.
+    link = (
+        StripeLinkGateway(
+            cli_path=settings.stripe_link_cli_path,
+            expected_cli_version=settings.stripe_link_cli_version,
+            auth_directory=settings.stripe_link_auth_directory,
+            test_mode=settings.stripe_link_test_mode,
+            approval_timeout_seconds=settings.stripe_link_approval_timeout_seconds,
+            cli_timeout_seconds=settings.stripe_link_cli_timeout_seconds,
+        )
+        if settings.stripe_link_enabled and settings.stripe_link_auth_directory is not None
+        else None
+    )
     browserbase = BrowserbaseGateway(
         api_key=settings.browserbase_api_key.get_secret_value(),
         project_id=settings.browserbase_project_id,
@@ -81,6 +100,7 @@ def build_worker(
             result_timeout_seconds=settings.checkout_result_timeout_seconds,
         ),
         issuing=issuing,
+        link=link,
         demo=demo,
         broker=CheckoutRedisPublisher(redis),
         lease_seconds=settings.checkout_lease_seconds,

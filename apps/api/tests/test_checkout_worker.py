@@ -14,6 +14,10 @@ from ag_platform_api.services.checkout.repository import (
     ClaimResult,
     TerminalNotification,
 )
+from ag_platform_api.services.checkout.stripe_link import (
+    LinkSpendBinding,
+    LinkSpendRequest,
+)
 from ag_platform_api.services.checkout.stripe_payments_demo import (
     StripeHostedSession,
     StripeHostedVerification,
@@ -512,6 +516,167 @@ async def test_demo_decline_is_verified_and_published_as_failed() -> None:
                 "cart_item_id": context.cart_item_id,
                 "status": "failed",
                 "error_code": "payment_declined",
+            },
+        )
+    ]
+
+
+async def test_link_unknown_outcome_is_never_recorded_as_success_and_preserves_ordering() -> None:
+    context = replace(
+        worker_context(),
+        provider="stripe_link",
+        provider_card_id="csmrpd_wallet123",
+        billing_details={
+            "type": "personal",
+            "full_name": "Alex Example",
+            "address": {
+                "line1": "1 Test Street",
+                "city": "Madrid",
+                "region": "Madrid",
+                "postal_code": "28001",
+                "country": "ES",
+            },
+        },
+    )
+    events: list[str] = []
+
+    class LinkRepository(FakeRepository):
+        def __init__(self, checkout_context: CheckoutContext) -> None:
+            super().__init__(checkout_context)
+            self.provider_request_id: str | None = None
+            self.terminal_status: CheckoutExecutionStatus | None = None
+            self.terminal_error: CheckoutErrorCode | None = None
+
+        async def record_provider_request(self, execution_id, request_id: str) -> str:
+            assert execution_id == self.context.execution_id
+            assert self.locked
+            assert not self.submitted
+            events.append("request_persisted")
+            self.provider_request_id = request_id
+            return request_id
+
+        async def finish_terminal(
+            self,
+            execution_id,
+            *,
+            status: CheckoutExecutionStatus,
+            error_code: CheckoutErrorCode,
+            merchant_order_reference: str | None = None,
+        ) -> TerminalNotification:
+            assert execution_id == self.context.execution_id
+            assert self.locked
+            assert self.submitted
+            assert merchant_order_reference == "order_link123"
+            events.append("terminal")
+            self.terminal_status = status
+            self.terminal_error = error_code
+            return TerminalNotification(
+                self.context.execution_id,
+                self.context.cart_item_id,
+                status,
+                error_code.value,
+            )
+
+        async def succeed(self, *args: object, **kwargs: object) -> TerminalNotification:
+            raise AssertionError("an unknown Link outcome must never create a purchase")
+
+    repository = LinkRepository(context)
+    link_request = LinkSpendRequest(
+        "lsrq_request123",
+        "pending_approval",
+        LinkSpendBinding(
+            execution_id=context.execution_id,
+            payment_method_id=context.provider_card_id,
+            merchant_url=context.checkout_origin,
+            amount_minor=context.amount_minor,
+            currency=context.currency,
+            merchant_name="merchant.example.test",
+            context="A" * 100,
+            item_name=context.approved_title,
+            item_quantity=context.approved_quantity,
+            unit_amount_minor=1250,
+        ),
+    )
+
+    class FakeLink:
+        async def ensure_spend_request(self, **arguments: object) -> LinkSpendRequest:
+            assert arguments["existing_request_id"] is None
+            events.append("request_created")
+            return link_request
+
+        async def wait_for_approval(self, **arguments: object) -> None:
+            assert arguments["request"] == link_request
+            assert link_request.request_id == repository.provider_request_id
+            events.append("approval_waited")
+
+        async def retrieve_card(self, **arguments: object) -> IssuingCardSecret:
+            assert arguments["request"] == link_request
+            assert link_request.request_id == repository.provider_request_id
+            events.append("credential_retrieved")
+            return IssuingCardSecret("4000009990001984", "123", 12, 2030)
+
+        async def report_outcome(self, **arguments: object) -> None:
+            assert arguments["outcome"] == "abandoned"
+            assert arguments["tag"] == "timeout"
+            events.append("outcome_reported")
+
+    class LinkBrowser(FakeBrowser):
+        async def run(
+            self, checkout_context: CheckoutContext, **callbacks: object
+        ) -> BrowserCheckoutResult:
+            self.runs += 1
+            assert checkout_context == context
+            events.append("browser_started")
+            await callbacks["on_session_started"]("session_link123")  # type: ignore[operator]
+            await callbacks["prepare_submission"]()  # type: ignore[operator]
+            await callbacks["load_card"]()  # type: ignore[operator]
+            events.append("card_loaded")
+            await callbacks["mark_submitted"]("session_link123")  # type: ignore[operator]
+            events.append("submitted")
+            return BrowserCheckoutResult(
+                "order_link123",
+                None,
+                AuthorizationOutcome.unknown,
+            )
+
+    browser = LinkBrowser(repository)
+    broker = FakeBroker()
+    worker = CheckoutWorker(
+        repository=repository,  # type: ignore[arg-type]
+        browser=browser,  # type: ignore[arg-type]
+        issuing=None,
+        link=FakeLink(),  # type: ignore[arg-type]
+        broker=broker,
+        lease_seconds=120,
+        max_attempts=3,
+        poll_seconds=0.01,
+    )
+
+    assert await worker.process_once()
+
+    assert events == [
+        "request_created",
+        "request_persisted",
+        "approval_waited",
+        "browser_started",
+        "credential_retrieved",
+        "card_loaded",
+        "submitted",
+        "outcome_reported",
+        "terminal",
+    ]
+    assert repository.retry_errors == []
+    assert repository.terminal_status == CheckoutExecutionStatus.outcome_unknown
+    assert repository.terminal_error == CheckoutErrorCode.payment_outcome_unknown
+    assert repository.provider_reference is None
+    assert broker.events == [
+        (
+            "checkout.outcome_unknown",
+            {
+                "execution_id": context.execution_id,
+                "cart_item_id": context.cart_item_id,
+                "status": "outcome_unknown",
+                "error_code": "payment_outcome_unknown",
             },
         )
     ]

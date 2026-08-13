@@ -322,6 +322,31 @@ async def test_prepare_rejects_removed_assignment(
     assert caught.value.code == CheckoutErrorCode.payment_method_unassigned
 
 
+async def test_provider_request_is_persisted_idempotently_and_loaded_by_prepare(
+    checkout_db: tuple[SessionMaker, SqlAlchemyCheckoutRepository],
+) -> None:
+    session_factory, repository = checkout_db
+    execution_id = await seed_execution(session_factory)
+    await repository.claim_next(lease_seconds=120, max_attempts=3)
+
+    assert await repository.record_provider_request(execution_id, "lsrq_request123") == (
+        "lsrq_request123"
+    )
+    assert await repository.record_provider_request(execution_id, "lsrq_request123") == (
+        "lsrq_request123"
+    )
+    assert (await repository.prepare(execution_id)).provider_request_id == "lsrq_request123"
+
+    with pytest.raises(CheckoutError) as mismatch:
+        await repository.record_provider_request(execution_id, "lsrq_different123")
+    assert mismatch.value.code == CheckoutErrorCode.payment_outcome_unknown
+
+    async with session_factory() as session:
+        execution = await session.get(CheckoutExecution, execution_id)
+    assert execution is not None
+    assert execution.provider_request_id == "lsrq_request123"
+
+
 async def test_success_is_atomic_and_idempotent_with_one_purchase_and_event(
     checkout_db: tuple[SessionMaker, SqlAlchemyCheckoutRepository],
 ) -> None:

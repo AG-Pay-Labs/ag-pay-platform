@@ -313,6 +313,7 @@ class CheckoutExecution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     browserbase_session_id: Mapped[str | None] = mapped_column(String(255))
+    provider_request_id: Mapped[str | None] = mapped_column(String(255))
     merchant_order_reference: Mapped[str | None] = mapped_column(String(128))
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

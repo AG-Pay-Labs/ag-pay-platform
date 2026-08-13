@@ -26,10 +26,6 @@ PostgreSQL.
 
 ## Backend invariants
 
-- Never add raw card-number/CVC fields. Use a provider token/reference and safe
-  metadata only, and keep provider references out of response schemas. The
-  managed checkout worker may retrieve an issuing-card secret into short-lived
-  process memory only; never send it to an LLM or persist, record, or log it.
 - Hash human passwords with Argon2; hash opaque pairing/agent tokens; encrypt
   merchant passwords and expose them only through the re-authenticated reveal
   route.
@@ -57,8 +53,6 @@ PostgreSQL.
   approval, and completion rules. Client-side guards are UX, not security.
 - Keep auth, proxy, and merchant-credential responses non-cacheable. Requiring
   the current platform password for credential reveal must remain explicit.
-- Card forms may accept only opaque provider references and safe metadata.
-  Never add PAN, CVC, PIN, or 3-D Secure fields.
 - UI copy must distinguish legacy/manual proposals from configured managed
   checkout. Never claim an unconfirmed payment, refund, or merchant
   subscription cancellation; a managed checkout is complete only after the

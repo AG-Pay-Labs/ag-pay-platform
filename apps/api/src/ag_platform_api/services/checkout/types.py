@@ -200,6 +200,7 @@ class CheckoutContext:
     provider_card_id: str
     card_metadata: ExpectedCardMetadata
     billing_details: Mapping[str, Any]
+    provider_request_id: str | None = None
 
     @property
     def amount_minor(self) -> int:

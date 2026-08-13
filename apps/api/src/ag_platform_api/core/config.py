@@ -1,5 +1,6 @@
 import re
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
@@ -174,6 +175,8 @@ class CheckoutRuntimeSettings(BaseSettings):
     checkout_authorization_timeout_seconds: int = Field(default=30, ge=1, le=300)
     checkout_authorization_poll_seconds: float = Field(default=1.0, gt=0, le=30)
     checkout_demo_observation_seconds: float = Field(default=30.0, ge=0, le=30)
+    stripe_link_enabled: bool = False
+    stripe_link_test_mode: bool = False
 
     @field_validator("checkout_adapters")
     @classmethod
@@ -211,6 +214,16 @@ class CheckoutRuntimeSettings(BaseSettings):
             **self.checkout_adapters,
             STRIPE_HOSTED_TEST_ADAPTER_KEY: built_in,
         }
+        return self
+
+    @model_validator(mode="after")
+    def validate_link_mode(self) -> "CheckoutRuntimeSettings":
+        if self.stripe_link_enabled and not self.stripe_link_test_mode:
+            raise ValueError("STRIPE_LINK_ENABLED requires STRIPE_LINK_TEST_MODE")
+        if self.stripe_link_enabled and self.environment.lower() not in {"development", "test"}:
+            raise ValueError("Stripe Link checkout is development/test-only")
+        if self.stripe_link_test_mode and not self.stripe_link_enabled:
+            raise ValueError("STRIPE_LINK_TEST_MODE requires STRIPE_LINK_ENABLED")
         return self
 
 
@@ -255,6 +268,11 @@ class CheckoutWorkerSettings(CheckoutRuntimeSettings):
     stripe_secret_key: SecretStr | None = None
     stripe_demo_secret_key: SecretStr | None = None
     stripe_api_url: str = "https://api.stripe.com"
+    stripe_link_cli_path: str = "link-cli"
+    stripe_link_cli_version: Literal["0.12.0"] = "0.12.0"
+    stripe_link_auth_directory: Path | None = None
+    stripe_link_approval_timeout_seconds: int = Field(default=600, ge=30, le=900)
+    stripe_link_cli_timeout_seconds: int = Field(default=30, ge=5, le=120)
 
     @field_validator("browserbase_api_url", "stripe_api_url")
     @classmethod
@@ -286,6 +304,13 @@ class CheckoutWorkerSettings(CheckoutRuntimeSettings):
                 self.stripe_demo_secret_key.get_secret_value().startswith("sk_test_")
             ):
                 raise ValueError("STRIPE_DEMO_SECRET_KEY must be a Stripe test-mode secret key")
+        if self.stripe_link_enabled:
+            if self.stripe_link_auth_directory is None:
+                raise ValueError(
+                    "STRIPE_LINK_AUTH_DIRECTORY is required when STRIPE_LINK_ENABLED is true"
+                )
+            if not self.stripe_link_cli_path.strip() or "\x00" in self.stripe_link_cli_path:
+                raise ValueError("STRIPE_LINK_CLI_PATH is invalid")
         return self
 
 

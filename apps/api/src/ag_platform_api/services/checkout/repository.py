@@ -191,6 +191,7 @@ class SqlAlchemyCheckoutRepository:
                 currency=execution.currency,
                 provider=payment_method.provider,
                 provider_card_id=payment_method.provider_payment_method_id,
+                provider_request_id=execution.provider_request_id,
                 card_metadata=ExpectedCardMetadata(
                     owner_id=execution.owner_id,
                     last4=payment_method.card_last4,
@@ -218,6 +219,17 @@ class SqlAlchemyCheckoutRepository:
         async with self._session_factory() as session, session.begin():
             execution = await self._running_execution_locked(session, execution_id)
             execution.browserbase_session_id = session_id
+
+    async def record_provider_request(self, execution_id: UUID, request_id: str) -> str:
+        """Persist the external request before any payment credential is retrieved."""
+        async with self._session_factory() as session, session.begin():
+            execution = await self._running_execution_locked(session, execution_id)
+            if execution.provider_request_id is not None:
+                if execution.provider_request_id != request_id:
+                    raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
+                return execution.provider_request_id
+            execution.provider_request_id = request_id
+            return request_id
 
     async def mark_submitted(self, execution_id: UUID, session_id: str) -> datetime:
         async with self._session_factory() as session, session.begin():

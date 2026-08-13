@@ -76,6 +76,13 @@ async def queue_checkout_execution(
     issuing_method = payment_method.provider == "stripe_issuing" and re.fullmatch(
         r"ic_[A-Za-z0-9]+", payment_method.provider_payment_method_id
     )
+    link_method = (
+        settings.environment.lower() in {"development", "test"}
+        and settings.stripe_link_enabled
+        and settings.stripe_link_test_mode
+        and payment_method.provider == "stripe_link"
+        and re.fullmatch(r"csmrpd_[A-Za-z0-9]+", payment_method.provider_payment_method_id)
+    )
     demo_method = (
         settings.environment.lower() in {"development", "test"}
         and settings.checkout_demo_enabled
@@ -92,7 +99,7 @@ async def queue_checkout_execution(
             "pm_stripe_demo_3ds",
         }
     )
-    if not issuing_method and not demo_method:
+    if not issuing_method and not link_method and not demo_method:
         raise CheckoutQueueError(
             "checkout_provider_unsupported",
             "Managed checkout requires an assigned supported payment method",
@@ -123,7 +130,7 @@ async def queue_checkout_execution(
         raise CheckoutQueueError(
             "checkout_adapter_unknown", "The requested checkout adapter is not configured"
         )
-    if adapter.checkout_mode == "stripe_hosted_test" and not demo_method:
+    if adapter.checkout_mode == "stripe_hosted_test" and not (demo_method or link_method):
         raise CheckoutQueueError(
             "checkout_provider_unsupported",
             "Stripe-hosted test checkout requires a configured demo payment method",

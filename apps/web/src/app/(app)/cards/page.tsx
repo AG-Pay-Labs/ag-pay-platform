@@ -12,7 +12,13 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge } from "@/components/app";
+import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PageHeader,
+  StatusBadge,
+} from "@/components/app";
 import { AddCardDialog } from "@/components/features/cards/add-card-dialog";
 import {
   AlertDialog,
@@ -46,28 +52,33 @@ export default function CardsPage() {
       <PageHeader
         eyebrow="Payment permissions"
         title="Cards"
-        description="Manage provider-tokenized payment references and the personal or business billing profiles attached to them."
+        description="Test the checkout flow in Stripe's sandbox, connect a US Stripe Link wallet, or manage provider-tokenized virtual cards."
         actions={<AddCardDialog />}
       />
 
       <div className="mb-6 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
         <ShieldAlert className="mt-0.5 size-4 shrink-0" />
         <p>
-          Never enter raw card credentials. Managed checkout supports only server-configured
-          provider references; sensitive values are retrieved inside the trusted executor and are
-          never returned to the browser or agent.
+          Never enter raw card credentials. Managed checkout supports only
+          server-configured provider references; sensitive values are retrieved
+          inside the trusted executor and are never returned to the browser or
+          agent. Stripe Link also requires a separate approval in Link before
+          it releases a one-time payment credential.
         </p>
       </div>
 
       {cards.isLoading ? <LoadingState variant="cards" rows={4} /> : null}
       {cards.error ? (
-        <ErrorState description="Payment methods could not be loaded." retry={() => cards.refetch()} />
+        <ErrorState
+          description="Payment methods could not be loaded."
+          retry={() => cards.refetch()}
+        />
       ) : null}
       {!cards.isLoading && !cards.error && cards.data?.length === 0 ? (
         <EmptyState
           icon={CreditCard}
           title="No payment methods"
-          description="Add a configured provider reference and safe card metadata, then assign it to one or more agents."
+          description="Add the Stripe sandbox card, assign it to an agent, and use it for a supervised test checkout."
           action={<AddCardDialog />}
         />
       ) : null}
@@ -88,7 +99,7 @@ function PaymentMethodCard({ card }: { card: PaymentMethodRead }) {
     <article
       className={cn(
         "w-full min-w-0 max-w-96 rounded-2xl border bg-card p-3 shadow-sm transition-shadow hover:shadow-md",
-        card.status === "disabled" && "opacity-70 grayscale-[.22]",
+        card.status === "disabled" && "opacity-70 grayscale-[.22]"
       )}
     >
       <VirtualCard card={card} />
@@ -104,12 +115,18 @@ function PaymentMethodCard({ card }: { card: PaymentMethodRead }) {
           </span>
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
-              <p className="truncate text-sm font-semibold">{billingName(card)}</p>
+              <p className="truncate text-sm font-semibold">
+                {billingName(card)}
+              </p>
               <StatusBadge status={card.status} className="shrink-0" />
             </div>
             <p className="mt-0.5 text-xs text-muted-foreground">
               {card.billing_profile_type === "business"
-                ? `Business billing · VAT ${card.billing_details.type === "business" ? card.billing_details.vat_number : "—"}`
+                ? `Business billing · VAT ${
+                    card.billing_details.type === "business"
+                      ? card.billing_details.vat_number
+                      : "—"
+                  }`
                 : "Personal billing profile"}
             </p>
           </div>
@@ -120,16 +137,22 @@ function PaymentMethodCard({ card }: { card: PaymentMethodRead }) {
             <dt className="flex items-center gap-1.5 text-muted-foreground">
               <Mail className="size-3.5" /> Billing email
             </dt>
-            <dd className="mt-1 truncate font-medium">{card.billing_details.email}</dd>
+            <dd className="mt-1 truncate font-medium">
+              {card.billing_details.email}
+            </dd>
           </div>
           <div className="min-w-0 sm:text-right">
             <dt className="text-muted-foreground">Added</dt>
-            <dd className="mt-1 font-medium">{formatDateTime(card.created_at)}</dd>
+            <dd className="mt-1 font-medium">
+              {formatDateTime(card.created_at)}
+            </dd>
           </div>
         </dl>
 
         <div className="mt-4 flex items-center justify-between gap-3 border-t pt-3">
-          <p className="text-xs text-muted-foreground">Assign this method from an agent’s details.</p>
+          <p className="text-xs text-muted-foreground">
+            Assign this method from an agent’s details.
+          </p>
           {card.status === "active" ? <DisableCardDialog card={card} /> : null}
         </div>
       </div>
@@ -145,7 +168,7 @@ function VirtualCard({ card }: { card: PaymentMethodRead }) {
     <div
       className={cn(
         "relative isolate aspect-[1.586/1] w-full overflow-hidden rounded-[1.35rem] bg-gradient-to-br p-5 text-white shadow-[0_22px_50px_-28px_rgba(30,27,75,0.95)]",
-        palette,
+        palette
       )}
       aria-label={`${card.display_name}, ${card.card_brand}, ending in ${lastFour}`}
     >
@@ -155,7 +178,9 @@ function VirtualCard({ card }: { card: PaymentMethodRead }) {
 
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
-          <p className="truncate text-sm font-semibold tracking-wide">{card.display_name}</p>
+          <p className="truncate text-sm font-semibold tracking-wide">
+            {card.display_name}
+          </p>
           <p className="mt-0.5 truncate text-[10px] font-medium tracking-[0.16em] text-white/65 uppercase">
             {card.provider} · virtual
           </p>
@@ -181,15 +206,20 @@ function VirtualCard({ card }: { card: PaymentMethodRead }) {
             </p>
             <div className="mt-4 flex min-w-0 items-end gap-6">
               <div className="min-w-0">
-                <p className="text-[8px] tracking-[0.16em] text-white/55 uppercase">Cardholder</p>
+                <p className="text-[8px] tracking-[0.16em] text-white/55 uppercase">
+                  Cardholder
+                </p>
                 <p className="mt-0.5 truncate text-[11px] font-semibold tracking-wide uppercase">
                   {cardholderName(card)}
                 </p>
               </div>
               <div className="shrink-0">
-                <p className="text-[8px] tracking-[0.16em] text-white/55 uppercase">Expires</p>
+                <p className="text-[8px] tracking-[0.16em] text-white/55 uppercase">
+                  Expires
+                </p>
                 <p className="mt-0.5 text-[11px] font-semibold tabular-nums">
-                  {String(card.expiry_month).padStart(2, "0")}/{String(card.expiry_year).slice(-2)}
+                  {String(card.expiry_month).padStart(2, "0")}/
+                  {String(card.expiry_year).slice(-2)}
                 </p>
               </div>
             </div>
@@ -205,7 +235,10 @@ function VirtualCard({ card }: { card: PaymentMethodRead }) {
 
 function CardChip() {
   return (
-    <span className="relative block h-8 w-11 overflow-hidden rounded-md border border-amber-100/70 bg-gradient-to-br from-amber-100 via-yellow-300 to-amber-500 shadow-sm" aria-hidden="true">
+    <span
+      className="relative block h-8 w-11 overflow-hidden rounded-md border border-amber-100/70 bg-gradient-to-br from-amber-100 via-yellow-300 to-amber-500 shadow-sm"
+      aria-hidden="true"
+    >
       <span className="absolute inset-y-0 left-1/2 w-px bg-amber-800/30" />
       <span className="absolute inset-x-0 top-1/2 h-px bg-amber-800/30" />
       <span className="absolute top-1/2 left-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-sm border border-amber-800/30" />
@@ -215,10 +248,30 @@ function CardChip() {
 
 function ContactlessMark({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 32 32" className={className} fill="none" aria-hidden="true">
-      <path d="M10 11.5a6.4 6.4 0 0 1 0 9" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
-      <path d="M15 7.2a12.4 12.4 0 0 1 0 17.6" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
-      <path d="M20 3.3a18 18 0 0 1 0 25.4" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
+    <svg
+      viewBox="0 0 32 32"
+      className={className}
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M10 11.5a6.4 6.4 0 0 1 0 9"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+      />
+      <path
+        d="M15 7.2a12.4 12.4 0 0 1 0 17.6"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+      />
+      <path
+        d="M20 3.3a18 18 0 0 1 0 25.4"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+      />
     </svg>
   );
 }
@@ -228,7 +281,12 @@ function safeLastFour(value: string) {
 }
 
 function paletteIndex(id: string) {
-  return Array.from(id).reduce((total, character) => total + character.charCodeAt(0), 0) % CARD_PALETTES.length;
+  return (
+    Array.from(id).reduce(
+      (total, character) => total + character.charCodeAt(0),
+      0
+    ) % CARD_PALETTES.length
+  );
 }
 
 function cardholderName(card: PaymentMethodRead) {
@@ -250,14 +308,18 @@ function DisableCardDialog({ card }: { card: PaymentMethodRead }) {
   async function disable() {
     setSubmitting(true);
     try {
-      await apiRequest<void>(`/payment-methods/${card.id}`, { method: "DELETE" });
+      await apiRequest<void>(`/payment-methods/${card.id}`, {
+        method: "DELETE",
+      });
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.cards }),
         queryClient.invalidateQueries({ queryKey: ["agents"] }),
       ]);
       toast.success(`${card.display_name} disabled`);
     } catch (caught) {
-      toast.error(getErrorMessage(caught, "Could not disable this payment method."));
+      toast.error(
+        getErrorMessage(caught, "Could not disable this payment method.")
+      );
     } finally {
       setSubmitting(false);
     }
@@ -274,9 +336,10 @@ function DisableCardDialog({ card }: { card: PaymentMethodRead }) {
         <AlertDialogHeader>
           <AlertDialogTitle>Disable {card.display_name}?</AlertDialogTitle>
           <AlertDialogDescription>
-            This removes all agent assignments immediately. Any approved item waiting for an
-            agent may no longer complete. Historical purchase attribution is retained, and the
-            current API cannot re-enable this method.
+            This removes all agent assignments immediately. Any approved item
+            waiting for an agent may no longer complete. Historical purchase
+            attribution is retained, and the current API cannot re-enable this
+            method.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
@@ -286,7 +349,11 @@ function DisableCardDialog({ card }: { card: PaymentMethodRead }) {
             disabled={submitting}
             className="bg-destructive text-white hover:bg-destructive/90"
           >
-            {submitting ? <Loader2 className="animate-spin" /> : <ShieldAlert />}
+            {submitting ? (
+              <Loader2 className="animate-spin" />
+            ) : (
+              <ShieldAlert />
+            )}
             Disable method
           </AlertDialogAction>
         </AlertDialogFooter>
