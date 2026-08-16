@@ -8,7 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from ag_platform_api.api.dependencies import get_broker
+from ag_platform_api.api.dependencies import get_broker, get_database_session_factory
 from ag_platform_api.core.config import Settings, get_settings
 from ag_platform_api.db.base import Base
 from ag_platform_api.db.session import get_db
@@ -87,6 +87,7 @@ async def client(
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_database_session_factory] = lambda: db_session_factory
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_broker] = lambda: broker
 

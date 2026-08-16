@@ -409,7 +409,7 @@ class CheckoutEvent(Base):
     cursor: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     event_id: Mapped[UUID] = mapped_column(default=uuid4, nullable=False, unique=True)
     execution_id: Mapped[UUID] = mapped_column(
-        ForeignKey("checkout_executions.id", ondelete="RESTRICT"), nullable=False, unique=True
+        ForeignKey("checkout_executions.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     owner_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True

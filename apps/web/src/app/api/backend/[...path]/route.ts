@@ -31,6 +31,7 @@ const ALLOWED_ROUTES: ReadonlyArray<readonly [string, RegExp]> = [
   ["GET", new RegExp(`^/cart-items/${UUID}$`)],
   ["POST", new RegExp(`^/cart-items/${UUID}/approve$`)],
   ["POST", new RegExp(`^/cart-items/${UUID}/cancel$`)],
+  ["POST", new RegExp(`^/cart-items/${UUID}/checkout/reconcile$`)],
   ["POST", new RegExp(`^/cart-items/${UUID}/credential/reveal$`)],
   ["GET", /^\/purchases$/],
   ["GET", new RegExp(`^/purchases/${UUID}$`)],

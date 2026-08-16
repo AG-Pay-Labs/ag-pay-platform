@@ -20,13 +20,12 @@ from ag_platform_api.services.checkout.stripe_issuing import StripeIssuingGatewa
 from ag_platform_api.services.checkout.stripe_link import LinkSpendRequest, StripeLinkGateway
 from ag_platform_api.services.checkout.stripe_payments_demo import (
     DEMO_REFERENCES,
-    StripeHostedVerification,
     StripePaymentsDemoGateway,
+    StripeTestCardFixtures,
 )
 from ag_platform_api.services.checkout.types import (
     AuthorizationOutcome,
     AuthorizationResult,
-    BrowserCheckoutResult,
     CheckoutContext,
     decimal_to_minor,
 )
@@ -47,6 +46,7 @@ class CheckoutWorker:
         issuing: StripeIssuingGateway | None,
         link: StripeLinkGateway | None = None,
         demo: StripePaymentsDemoGateway | None = None,
+        demo_cards: StripeTestCardFixtures | None = None,
         broker: BrokerLike | None,
         lease_seconds: int,
         max_attempts: int,
@@ -60,6 +60,7 @@ class CheckoutWorker:
         self._issuing = issuing
         self._link = link
         self._demo = demo
+        self._demo_cards = demo_cards or demo
         self._broker = broker
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
@@ -164,7 +165,13 @@ class CheckoutWorker:
             return self._link is not None
         return (
             context.provider == "prototype-vault"
-            and self._demo is not None
+            and (
+                self._demo is not None
+                or (
+                    context.adapter.checkout_mode == "stripe_hosted_test"
+                    and self._demo_cards is not None
+                )
+            )
             and context.provider_card_id in DEMO_REFERENCES
         )
 
@@ -425,10 +432,10 @@ class CheckoutWorker:
         self,
         context: CheckoutContext,
     ) -> TerminalNotification | None:
-        if self._demo is None:  # pragma: no cover - guarded by routing
-            raise CheckoutError(CheckoutErrorCode.provider_unsupported)
         if context.adapter.checkout_mode == "stripe_hosted_test":
             return await self._execute_hosted_demo_context(context)
+        if self._demo is None:  # pragma: no cover - guarded by routing
+            raise CheckoutError(CheckoutErrorCode.provider_unsupported)
         if context.adapter.checkout_mode != "direct":
             raise CheckoutError(CheckoutErrorCode.adapter_invalid)
         execution_id = context.execution_id
@@ -504,30 +511,13 @@ class CheckoutWorker:
         self,
         context: CheckoutContext,
     ) -> TerminalNotification | None:
-        if self._demo is None:  # pragma: no cover - guarded by routing
+        if self._demo_cards is None:  # pragma: no cover - guarded by routing
             raise CheckoutError(CheckoutErrorCode.provider_unsupported)
         execution_id = context.execution_id
-        try:
-            unit_amount_minor = decimal_to_minor(
-                context.amount / context.approved_quantity,
-                context.currency,
-            )
-        except (ArithmeticError, CheckoutError):
-            raise CheckoutError(CheckoutErrorCode.currency_precision_invalid) from None
-        hosted = await self._demo.create_checkout_session(
-            execution_id=execution_id,
-            title=context.approved_title,
-            quantity=context.approved_quantity,
-            unit_amount_minor=unit_amount_minor,
-            currency=context.currency,
-            collect_phone=bool(context.billing_details.get("phone")),
-        )
-        hosted_context = replace(context, checkout_url=hosted.checkout_url)
         submitted_at: datetime | None = None
-        verified: StripeHostedVerification | None = None
 
         async def load_card():
-            return await self._demo.retrieve_card(context.provider_card_id)
+            return await self._demo_cards.retrieve_card(context.provider_card_id)
 
         async def on_session_started(session_id: str) -> None:
             await self._repository.record_browser_session(execution_id, session_id)
@@ -539,87 +529,47 @@ class CheckoutWorker:
             nonlocal submitted_at
             submitted_at = await self._repository.mark_submitted(execution_id, session_id)
 
-        async def observe_outcome() -> AuthorizationOutcome:
-            nonlocal verified
-            verified = await self._reconcile_hosted_checkout(
-                session_id=hosted.session_id,
-                execution_id=execution_id,
-                amount_minor=context.amount_minor,
-                currency=context.currency,
-            )
-            return verified.outcome
-
-        browser_result = BrowserCheckoutResult(
-            order_reference=None,
-            receipt_url=None,
-            outcome=AuthorizationOutcome.unknown,
-        )
         try:
             browser_result = await self._browser.run(
-                hosted_context,
+                context,
                 load_card=load_card,
                 on_session_started=on_session_started,
                 prepare_submission=prepare_submission,
                 mark_submitted=mark_submitted,
-                observe_outcome=observe_outcome,
             )
         except CheckoutError:
             if submitted_at is None:
                 raise
-        if submitted_at is None:
-            raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
-
-        if verified is None:
-            verified = await self._reconcile_hosted_checkout(
-                session_id=hosted.session_id,
-                execution_id=execution_id,
-                amount_minor=context.amount_minor,
-                currency=context.currency,
-            )
-        if verified.outcome == AuthorizationOutcome.declined:
-            expired = await self._demo.expire_checkout_session(
-                hosted.session_id,
-                execution_id,
-            )
-            if not expired:
-                return await self._repository.finish_terminal(
-                    execution_id,
-                    status=CheckoutExecutionStatus.outcome_unknown,
-                    error_code=CheckoutErrorCode.payment_outcome_unknown,
-                    merchant_order_reference=hosted.session_id,
-                )
-            return await self._repository.finish_terminal(
-                execution_id,
-                status=CheckoutExecutionStatus.failed,
-                error_code=CheckoutErrorCode.payment_declined,
-                merchant_order_reference=hosted.session_id,
-            )
-        if verified.outcome == AuthorizationOutcome.action_required:
-            return await self._repository.finish_terminal(
-                execution_id,
-                status=CheckoutExecutionStatus.action_required,
-                error_code=CheckoutErrorCode.checkout_action_required,
-                merchant_order_reference=hosted.session_id,
-            )
-        if verified.outcome != AuthorizationOutcome.approved or verified.provider_reference is None:
             return await self._repository.finish_terminal(
                 execution_id,
                 status=CheckoutExecutionStatus.outcome_unknown,
                 error_code=CheckoutErrorCode.payment_outcome_unknown,
-                merchant_order_reference=hosted.session_id,
+            )
+        if submitted_at is None:
+            raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
+        if (
+            browser_result.outcome != AuthorizationOutcome.approved
+            or browser_result.order_reference is None
+            or browser_result.receipt_url is None
+        ):
+            return await self._repository.finish_terminal(
+                execution_id,
+                status=CheckoutExecutionStatus.outcome_unknown,
+                error_code=CheckoutErrorCode.payment_outcome_unknown,
+                merchant_order_reference=browser_result.order_reference,
             )
         return await self._repository.succeed(
             execution_id,
-            provider_reference=verified.provider_reference,
-            merchant_order_reference=hosted.session_id,
-            receipt_url=verified.receipt_url or browser_result.receipt_url,
+            provider_reference=browser_result.order_reference,
+            merchant_order_reference=browser_result.order_reference,
+            receipt_url=browser_result.receipt_url,
         )
 
     async def _execute_hosted_link_context(
         self,
         context: CheckoutContext,
     ) -> TerminalNotification | None:
-        if self._demo is None or self._link is None:
+        if self._link is None:
             raise CheckoutError(CheckoutErrorCode.provider_unsupported)
         request = await self._ensure_link_request(context)
         await self._link.wait_for_approval(
@@ -627,24 +577,7 @@ class CheckoutWorker:
             request=request,
         )
         execution_id = context.execution_id
-        try:
-            unit_amount_minor = decimal_to_minor(
-                context.amount / context.approved_quantity,
-                context.currency,
-            )
-        except (ArithmeticError, CheckoutError):
-            raise CheckoutError(CheckoutErrorCode.currency_precision_invalid) from None
-        hosted = await self._demo.create_checkout_session(
-            execution_id=execution_id,
-            title=context.approved_title,
-            quantity=context.approved_quantity,
-            unit_amount_minor=unit_amount_minor,
-            currency=context.currency,
-            collect_phone=bool(context.billing_details.get("phone")),
-        )
-        hosted_context = replace(context, checkout_url=hosted.checkout_url)
         submitted_at: datetime | None = None
-        verified: StripeHostedVerification | None = None
         card_loaded = False
 
         async def load_card():
@@ -668,83 +601,36 @@ class CheckoutWorker:
             nonlocal submitted_at
             submitted_at = await self._repository.mark_submitted(execution_id, session_id)
 
-        async def observe_outcome() -> AuthorizationOutcome:
-            nonlocal verified
-            verified = await self._reconcile_hosted_checkout(
-                session_id=hosted.session_id,
-                execution_id=execution_id,
-                amount_minor=context.amount_minor,
-                currency=context.currency,
-            )
-            return verified.outcome
-
-        browser_result = BrowserCheckoutResult(None, None, AuthorizationOutcome.unknown)
         try:
             browser_result = await self._browser.run(
-                hosted_context,
+                context,
                 load_card=load_card,
                 on_session_started=on_session_started,
                 prepare_submission=prepare_submission,
                 mark_submitted=mark_submitted,
-                observe_outcome=observe_outcome,
             )
-        except CheckoutError:
+        except CheckoutError as error:
             if submitted_at is None:
                 raise
+            await self._link.report_outcome(
+                owner_id=context.owner_id,
+                request_id=request.request_id,
+                merchant_url=context.checkout_origin,
+                outcome="abandoned",
+                tag=self._link_error_tag(error.code),
+            )
+            return await self._repository.finish_terminal(
+                execution_id,
+                status=CheckoutExecutionStatus.outcome_unknown,
+                error_code=CheckoutErrorCode.payment_outcome_unknown,
+            )
         if submitted_at is None:
             raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
-        if verified is None:
-            verified = await self._reconcile_hosted_checkout(
-                session_id=hosted.session_id,
-                execution_id=execution_id,
-                amount_minor=context.amount_minor,
-                currency=context.currency,
-            )
-
-        if verified.outcome == AuthorizationOutcome.declined:
-            expired = await self._demo.expire_checkout_session(hosted.session_id, execution_id)
-            if not expired:
-                await self._link.report_outcome(
-                    owner_id=context.owner_id,
-                    request_id=request.request_id,
-                    merchant_url=context.checkout_origin,
-                    outcome="abandoned",
-                    tag="other",
-                )
-                return await self._repository.finish_terminal(
-                    execution_id,
-                    status=CheckoutExecutionStatus.outcome_unknown,
-                    error_code=CheckoutErrorCode.payment_outcome_unknown,
-                    merchant_order_reference=hosted.session_id,
-                )
-            await self._link.report_outcome(
-                owner_id=context.owner_id,
-                request_id=request.request_id,
-                merchant_url=context.checkout_origin,
-                outcome="blocked",
-                tag="payment_declined",
-            )
-            return await self._repository.finish_terminal(
-                execution_id,
-                status=CheckoutExecutionStatus.failed,
-                error_code=CheckoutErrorCode.payment_declined,
-                merchant_order_reference=hosted.session_id,
-            )
-        if verified.outcome == AuthorizationOutcome.action_required:
-            await self._link.report_outcome(
-                owner_id=context.owner_id,
-                request_id=request.request_id,
-                merchant_url=context.checkout_origin,
-                outcome="blocked",
-                tag="3ds_challenge",
-            )
-            return await self._repository.finish_terminal(
-                execution_id,
-                status=CheckoutExecutionStatus.action_required,
-                error_code=CheckoutErrorCode.checkout_action_required,
-                merchant_order_reference=hosted.session_id,
-            )
-        if verified.outcome != AuthorizationOutcome.approved or verified.provider_reference is None:
+        if (
+            browser_result.outcome != AuthorizationOutcome.approved
+            or browser_result.order_reference is None
+            or browser_result.receipt_url is None
+        ):
             await self._link.report_outcome(
                 owner_id=context.owner_id,
                 request_id=request.request_id,
@@ -756,7 +642,7 @@ class CheckoutWorker:
                 execution_id,
                 status=CheckoutExecutionStatus.outcome_unknown,
                 error_code=CheckoutErrorCode.payment_outcome_unknown,
-                merchant_order_reference=hosted.session_id,
+                merchant_order_reference=browser_result.order_reference,
             )
         await self._link.report_outcome(
             owner_id=context.owner_id,
@@ -766,40 +652,10 @@ class CheckoutWorker:
         )
         return await self._repository.succeed(
             execution_id,
-            provider_reference=verified.provider_reference,
-            merchant_order_reference=hosted.session_id,
-            receipt_url=verified.receipt_url or browser_result.receipt_url,
+            provider_reference=request.request_id,
+            merchant_order_reference=browser_result.order_reference,
+            receipt_url=browser_result.receipt_url,
         )
-
-    async def _reconcile_hosted_checkout(
-        self,
-        *,
-        session_id: str,
-        execution_id: UUID,
-        amount_minor: int,
-        currency: str,
-    ) -> StripeHostedVerification:
-        if self._demo is None:  # pragma: no cover - guarded by routing
-            raise CheckoutError(CheckoutErrorCode.provider_unsupported)
-        deadline = time.monotonic() + self._authorization_timeout_seconds
-        while True:
-            try:
-                verified = await self._demo.verify_checkout_session(
-                    session_id=session_id,
-                    execution_id=execution_id,
-                    amount_minor=amount_minor,
-                    currency=currency,
-                )
-            except CheckoutError as error:
-                if error.code != CheckoutErrorCode.payment_outcome_unknown:
-                    raise
-                verified = StripeHostedVerification(AuthorizationOutcome.unknown)
-            if verified.outcome != AuthorizationOutcome.unknown:
-                return verified
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return verified
-            await asyncio.sleep(min(self._authorization_poll_seconds, remaining))
 
     async def _reconcile_authorization(
         self,

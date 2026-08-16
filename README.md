@@ -12,17 +12,21 @@ The application monorepo for the AG Pay agent-wallet prototype:
 PostgreSQL, Redis, and pgAdmin are managed by the parent base repository's
 `docker-compose.yml`. New agents default to supervised autonomy: every purchase
 proposal requires human review. Owners can configure a narrower per-agent
-review rule. Proposals with an optional configured checkout adapter can be
-queued for the managed checkout worker after approval; proposals without that
-specification keep the legacy manual/external-completion behavior. Managed
+review rule. Proposals with an explicit per-request checkout adapter and checkout
+URL can be queued for the managed checkout worker after approval; proposals
+created by direct API clients or earlier integrations without both fields keep
+the legacy approval-only/external-completion behavior. Managed
 checkout is disabled by default. The production-shaped rail supports configured
 merchant origins and Stripe Issuing card references but still requires the
-documented launch gates; development/test also has
-an explicit `stripe-hosted` Stripe Payments rail. After approval, it creates a
-test-mode Checkout Session from the exact approved facts, fills Stripe's hosted
-page through Browserbase, and verifies success, decline, or 3DS through
-Stripe's API without a real card. That proof does not order from the proposal's
-source product URL and is not an arbitrary production-merchant integration.
+documented launch gates; development/test also has an explicit, keyless
+`stripe-hosted` Stripe Payments rail. A proposal supplies a concrete merchant-created
+`checkout.stripe.com/c/pay/cs_test_...` URL. After approval, the worker opens that
+exact URL, verifies its displayed product and total, fills Stripe's hosted page
+through Browserbase with a public Stripe test-card fixture, and accepts success
+only from the allowlisted `letyouragentspay.com` result page after that server
+verifies the same Checkout Session. The worker neither creates a substitute
+Checkout Session nor loads the merchant's Stripe credentials. This remains a
+development-only Playground integration, not an arbitrary production-merchant rail.
 Managed recurring checkout is intentionally rejected until merchant interval
 verification is implemented.
 
@@ -58,8 +62,8 @@ The API is available at `http://127.0.0.1:8000`; its interactive OpenAPI UI is
 at `http://127.0.0.1:8000/docs`.
 
 Managed checkout stays off with the example configuration. For a deliberate
-Stripe test-mode run, configure the platform-only checkout, Browserbase, Stripe,
-and adapter values in the untracked `.env`, then start a third terminal:
+Stripe test-mode run, configure checkout and Browserbase values in the untracked
+`.env`, then start a third terminal:
 
 ```bash
 make checkout-worker
@@ -69,7 +73,7 @@ Never put those secrets in the web or OpenClaw environments. The base
 repository's `docs/managed-checkout.md` contains the adapter schema, security
 boundary, and end-to-end sandbox test procedure.
 
-For the recommended hosted decline/success proof, set these values in the
+For the hosted Playground success proof, set these values in the
 untracked `.env` while keeping all existing application/database values:
 
 ```dotenv
@@ -79,7 +83,6 @@ CHECKOUT_DEMO_ENABLED=true
 CHECKOUT_HOSTED_DEMO_ENABLED=true
 BROWSERBASE_API_KEY=your_browserbase_key
 BROWSERBASE_PROJECT_ID=your_browserbase_project_id
-STRIPE_DEMO_SECRET_KEY=sk_test_your_stripe_test_secret
 ```
 
 Run migrations, the API, web app, and `make checkout-worker` in separate
@@ -89,13 +92,27 @@ terminals. Create the human account and agent, then seed the safe methods:
 make seed-checkout-demo SEED_USERNAME=your-login-email@example.com
 ```
 
-The built-in adapter key is `stripe-hosted` and its bootstrap URL is
-`https://checkout.stripe.com/`; do not add or override it in
-`CHECKOUT_ADAPTERS`. It requires both demo flags, an `sk_test_...` key, and a
-development/test environment. It needs no Stripe publishable key, local demo
-merchant, tunnel, or port `8100`. The older direct-adapter fixture remains
+The built-in adapter key is `stripe-hosted`; do not add or override it in
+`CHECKOUT_ADAPTERS`. Each proposal must carry the complete merchant-created test
+Checkout URL, for example `https://checkout.stripe.com/c/pay/cs_test_...#...`.
+The Stripe origin alone is rejected, and the URL is never replaced by the worker.
+The rail requires both demo flags and a development/test environment, but no
+Stripe secret or publishable key. The older direct-adapter fixture remains
 available through `make demo-merchant-run` when adapter development specifically
-needs it.
+needs it; that legacy rail still requires `STRIPE_DEMO_SECRET_KEY=sk_test_...`.
+The keyless rail can prove only a server-verified successful redirect. A decline,
+3DS challenge, missing redirect, timeout, or conflicting result after submission
+is persisted as `outcome_unknown`; it is never retried or claimed as a
+failed/action-required Stripe outcome without provider evidence. For this
+built-in hosted sandbox rail only, the authenticated owner can call
+`POST /api/v1/cart-items/{cart_item_id}/checkout/reconcile`. The API sends the
+frozen `cs_test_...` identifier to the fixed landing verification endpoint and
+requires an exact paid-session, order-reference, normalized offer-name, amount,
+and currency match. A verified result atomically records the Purchase and a new
+durable success event. The reconciliation path never opens Browserbase or
+submits payment again; missing or conflicting proof leaves the execution
+unknown. Issuing, Stripe Link, and other merchant adapters retain their separate
+manual/provider-specific reconciliation requirements.
 
 The shared `.env` is only a local-development convenience. FastAPI uses a
 settings model that has no Browserbase or Stripe secret fields; production must
@@ -163,8 +180,8 @@ onboarding.
 
 Human approval, or an eligible server-side policy decision for a legacy
 external-completion proposal, records the selected assigned method. A proposal
-carrying a configured checkout adapter always waits for explicit human approval,
-regardless of the agent's payment rule, and then creates one durable execution:
+carrying an explicit checkout adapter and checkout URL always waits for human
+approval, regardless of the agent's payment rule, and then creates one durable execution:
 the worker validates the frozen merchant
 configuration, assignment, and allowed origins; requires the merchant product
 title, quantity, amount, and an explicit standalone ISO currency code to match
@@ -176,13 +193,19 @@ returned, logged, or sent to an LLM. Agents learn terminal managed-checkout
 outcomes through their tenant-scoped cursor event feed and cannot self-report
 completion for those requests. The built-in development-only `stripe-hosted`
 rail hardcodes Browserbase recording and session logging on because it uses
-only public Stripe test-card fixtures; Issuing and configured-merchant sessions
-keep both features off. A managed-checkout card must not be used by an
+only public Stripe test-card fixtures. It records success only when the landing
+server's pinned verification marker binds the approved amount and currency, the
+receipt query, and the submitted fixed URL to the same `cs_test_...` session;
+missing or conflicting evidence becomes `outcome_unknown`. Issuing and
+configured-merchant sessions keep recording and logging off. A managed-checkout card must not be used by an
 unrelated external flow while an execution is in progress; dedicated virtual
 cards per execution are the safest deployment model. A card is quarantined
 after an action-required or outcome-unknown execution and cannot be queued or
-reused by another execution in this MVP; an operator must reconcile it and use
-a distinct card.
+reused by another execution until that execution is reconciled. The owner route
+above can release the built-in hosted sandbox fixture card only after exact
+landing-server proof. Issuing, Stripe Link, and other unresolved executions must
+still be reconciled through their provider-specific operator process; do not
+reuse those cards while the outcome remains unknown.
 
 The `never` review mode means eligible legacy/external-completion proposals do
 not wait for a person when an active assigned method exists. It never

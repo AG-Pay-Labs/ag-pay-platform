@@ -20,6 +20,7 @@ from ag_platform_api.models import (
     PaymentMethodStatus,
 )
 from ag_platform_api.services.checkout.errors import CheckoutError
+from ag_platform_api.services.checkout.origins import validate_stripe_hosted_test_checkout_url
 from ag_platform_api.services.checkout.types import decimal_to_minor
 
 
@@ -135,6 +136,14 @@ async def queue_checkout_execution(
             "checkout_provider_unsupported",
             "Stripe-hosted test checkout requires a configured demo payment method",
         )
+    if adapter.checkout_mode == "stripe_hosted_test":
+        try:
+            validate_stripe_hosted_test_checkout_url(item.checkout_url)
+        except CheckoutError:
+            raise CheckoutQueueError(
+                "checkout_url_invalid",
+                "Stripe-hosted test checkout requires a concrete cs_test Checkout URL",
+            ) from None
     origin = checkout_url_origin(item.checkout_url)
     if origin not in adapter.allowed_origins:
         raise CheckoutQueueError(

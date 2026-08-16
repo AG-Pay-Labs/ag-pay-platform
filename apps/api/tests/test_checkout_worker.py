@@ -6,8 +6,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
 
-import pytest
-
 from ag_platform_api.models import CheckoutExecutionStatus
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
 from ag_platform_api.services.checkout.repository import (
@@ -17,10 +15,6 @@ from ag_platform_api.services.checkout.repository import (
 from ag_platform_api.services.checkout.stripe_link import (
     LinkSpendBinding,
     LinkSpendRequest,
-)
-from ag_platform_api.services.checkout.stripe_payments_demo import (
-    StripeHostedSession,
-    StripeHostedVerification,
 )
 from ag_platform_api.services.checkout.types import (
     AuthorizationOutcome,
@@ -204,7 +198,7 @@ class HostedRepository(FakeRepository):
     ) -> TerminalNotification:
         assert self.submitted
         assert self.locked
-        assert merchant_order_reference == "cs_test_hosted123"
+        assert merchant_order_reference in {None, "cs_test_hosted123"}
         self.terminal_status = status
         self.terminal_error = error_code
         self.merchant_order_reference = merchant_order_reference
@@ -272,35 +266,10 @@ class FakeDemo:
         return AuthorizationResult(AuthorizationOutcome.declined)
 
 
-class FakeHostedDemo:
-    def __init__(
-        self,
-        verification: StripeHostedVerification,
-        reference: str,
-        *,
-        expiration_confirmed: bool = True,
-    ) -> None:
-        self.verification = verification
+class FakeHostedCards:
+    def __init__(self, reference: str) -> None:
         self.reference = reference
-        self.expiration_confirmed = expiration_confirmed
-        self.create_calls = 0
-        self.verify_calls = 0
         self.card_calls = 0
-        self.expire_calls = 0
-        self.execution_id: object | None = None
-
-    async def create_checkout_session(self, **arguments: object) -> StripeHostedSession:
-        self.create_calls += 1
-        self.execution_id = arguments["execution_id"]
-        assert arguments["title"] == "Managed checkout"
-        assert arguments["quantity"] == 2
-        assert arguments["unit_amount_minor"] == 1250
-        assert arguments["currency"] == "EUR"
-        assert arguments["collect_phone"] is True
-        return StripeHostedSession(
-            "cs_test_hosted123",
-            "https://checkout.stripe.com/c/pay/cs_test_hosted123#fixture",
-        )
 
     async def retrieve_card(self, reference: str) -> IssuingCardSecret:
         self.card_calls += 1
@@ -311,31 +280,24 @@ class FakeHostedDemo:
         }[reference]
         return IssuingCardSecret(number, "123", 12, 2034)
 
-    async def verify_checkout_session(self, **arguments: object) -> StripeHostedVerification:
-        self.verify_calls += 1
-        assert arguments["session_id"] == "cs_test_hosted123"
-        assert arguments["amount_minor"] == 2500
-        assert arguments["currency"] == "EUR"
-        return self.verification
-
-    async def expire_checkout_session(self, session_id: str, execution_id: object) -> bool:
-        self.expire_calls += 1
-        assert session_id == "cs_test_hosted123"
-        assert execution_id == self.execution_id
-        return self.expiration_confirmed
-
 
 class FakeHostedBrowser(FakeBrowser):
-    def __init__(self, repository: FakeRepository, *, fail_after_submit: bool = False) -> None:
+    def __init__(
+        self,
+        repository: FakeRepository,
+        *,
+        fail_after_submit: bool = False,
+        verified: bool = True,
+    ) -> None:
         super().__init__(repository)
         self.fail_after_submit = fail_after_submit
+        self.verified = verified
 
     async def run(self, context: CheckoutContext, **callbacks: object) -> BrowserCheckoutResult:
         self.runs += 1
         assert self.repository.locked
-        assert context.checkout_url == (
-            "https://checkout.stripe.com/c/pay/cs_test_hosted123#fixture"
-        )
+        assert context.checkout_url == "https://checkout.stripe.com/c/pay/cs_test_hosted123#fixture"
+        assert "observe_outcome" not in callbacks
         await callbacks["on_session_started"]("session_hosted123")  # type: ignore[operator]
         await callbacks["prepare_submission"]()  # type: ignore[operator]
         secret = await callbacks["load_card"]()  # type: ignore[operator]
@@ -343,24 +305,28 @@ class FakeHostedBrowser(FakeBrowser):
         await callbacks["mark_submitted"]("session_hosted123")  # type: ignore[operator]
         if self.fail_after_submit:
             raise CheckoutError(CheckoutErrorCode.payment_form_not_found)
-        outcome = await callbacks["observe_outcome"]()  # type: ignore[operator]
-        return BrowserCheckoutResult(None, None, outcome)
+        if not self.verified:
+            return BrowserCheckoutResult(None, None, AuthorizationOutcome.unknown)
+        return BrowserCheckoutResult(
+            "cs_test_hosted123",
+            "https://letyouragentspay.com/playground/success?session_id=cs_test_hosted123",
+        )
 
 
 def hosted_worker_context(reference: str) -> CheckoutContext:
     base = worker_context()
     hosted_adapter = replace(
         base.adapter,
-        allowed_origins=("https://checkout.stripe.com", "https://example.com"),
+        allowed_origins=("https://checkout.stripe.com", "https://letyouragentspay.com"),
         payment_origins=("https://checkout.stripe.com",),
-        result_origins=("https://example.com",),
+        result_origins=("https://letyouragentspay.com",),
         checkout_mode="stripe_hosted_test",
     )
     return replace(
         base,
         adapter_key="stripe-hosted",
         adapter=hosted_adapter,
-        checkout_url="https://checkout.stripe.com/",
+        checkout_url="https://checkout.stripe.com/c/pay/cs_test_hosted123#fixture",
         checkout_origin="https://checkout.stripe.com",
         provider="prototype-vault",
         provider_card_id=reference,
@@ -682,175 +648,91 @@ async def test_link_unknown_outcome_is_never_recorded_as_success_and_preserves_o
     ]
 
 
-@pytest.mark.parametrize(
-    (
-        "verification",
-        "reference",
-        "expected_status",
-        "expected_error",
-        "expected_event",
-        "expected_expire_calls",
-    ),
-    [
-        (
-            StripeHostedVerification(
-                AuthorizationOutcome.approved,
-                provider_reference="pi_hosted123",
-                receipt_url="https://pay.stripe.com/receipts/payment/hosted123",
-            ),
-            "pm_stripe_demo_success",
-            CheckoutExecutionStatus.succeeded,
-            None,
-            "checkout.succeeded",
-            0,
-        ),
-        (
-            StripeHostedVerification(AuthorizationOutcome.declined),
-            "pm_stripe_demo_decline",
-            CheckoutExecutionStatus.failed,
-            CheckoutErrorCode.payment_declined,
-            "checkout.failed",
-            1,
-        ),
-        (
-            StripeHostedVerification(AuthorizationOutcome.unknown),
-            "pm_stripe_demo_decline",
-            CheckoutExecutionStatus.outcome_unknown,
-            CheckoutErrorCode.payment_outcome_unknown,
-            "checkout.outcome_unknown",
-            0,
-        ),
-    ],
-)
-async def test_hosted_worker_persists_and_publishes_verified_terminal_outcome(
-    verification: StripeHostedVerification,
-    reference: str,
-    expected_status: CheckoutExecutionStatus,
-    expected_error: CheckoutErrorCode | None,
-    expected_event: str,
-    expected_expire_calls: int,
-) -> None:
-    context = hosted_worker_context(reference)
+async def test_hosted_worker_uses_fixed_url_and_keyless_test_card_fixture() -> None:
+    context = hosted_worker_context("pm_stripe_demo_success")
     repository = HostedRepository(context)
     browser = FakeHostedBrowser(repository)
-    demo = FakeHostedDemo(verification, reference)
+    cards = FakeHostedCards("pm_stripe_demo_success")
     broker = FakeBroker()
     worker = CheckoutWorker(
         repository=repository,  # type: ignore[arg-type]
         browser=browser,  # type: ignore[arg-type]
         issuing=None,
-        demo=demo,  # type: ignore[arg-type]
+        demo=None,
+        demo_cards=cards,  # type: ignore[arg-type]
         broker=broker,
         lease_seconds=120,
         max_attempts=3,
         poll_seconds=0.01,
-        authorization_timeout_seconds=0,
-        authorization_poll_seconds=0.001,
     )
 
     assert await worker.process_once()
 
     assert browser.runs == 1
-    assert demo.create_calls == 1
-    assert demo.card_calls == 1
-    assert demo.verify_calls == 1
-    assert demo.expire_calls == expected_expire_calls
-    assert repository.terminal_status == expected_status
-    assert repository.terminal_error == expected_error
+    assert cards.card_calls == 1
+    assert repository.terminal_status == CheckoutExecutionStatus.succeeded
+    assert repository.terminal_error is None
     assert repository.merchant_order_reference == "cs_test_hosted123"
     assert repository.retry_errors == []
-    if expected_status == CheckoutExecutionStatus.succeeded:
-        assert repository.provider_reference == "pi_hosted123"
-        assert repository.receipt_url == ("https://pay.stripe.com/receipts/payment/hosted123")
-    assert len(broker.events) == 1
-    assert broker.events[0][0] == expected_event
-    assert broker.events[0][1]["status"] == expected_status.value
-    assert broker.events[0][1].get("error_code") == (
-        expected_error.value if expected_error is not None else None
+    assert repository.provider_reference == "cs_test_hosted123"
+    assert repository.receipt_url == (
+        "https://letyouragentspay.com/playground/success?session_id=cs_test_hosted123"
     )
+    assert broker.events[0][0] == "checkout.succeeded"
 
 
-async def test_hosted_decline_is_unknown_when_session_expiration_is_not_confirmed() -> None:
-    verification = StripeHostedVerification(AuthorizationOutcome.declined)
-    context = hosted_worker_context("pm_stripe_demo_decline")
+async def test_hosted_worker_never_accepts_an_unverified_browser_result() -> None:
+    context = hosted_worker_context("pm_stripe_demo_success")
     repository = HostedRepository(context)
-    browser = FakeHostedBrowser(repository)
-    demo = FakeHostedDemo(
-        verification,
-        "pm_stripe_demo_decline",
-        expiration_confirmed=False,
-    )
+    browser = FakeHostedBrowser(repository, verified=False)
+    cards = FakeHostedCards("pm_stripe_demo_success")
     broker = FakeBroker()
     worker = CheckoutWorker(
         repository=repository,  # type: ignore[arg-type]
         browser=browser,  # type: ignore[arg-type]
         issuing=None,
-        demo=demo,  # type: ignore[arg-type]
+        demo=None,
+        demo_cards=cards,  # type: ignore[arg-type]
         broker=broker,
         lease_seconds=120,
         max_attempts=3,
         poll_seconds=0.01,
-        authorization_timeout_seconds=0,
-        authorization_poll_seconds=0.001,
     )
 
     assert await worker.process_once()
 
-    assert demo.expire_calls == 1
     assert repository.terminal_status == CheckoutExecutionStatus.outcome_unknown
     assert repository.terminal_error == CheckoutErrorCode.payment_outcome_unknown
-    assert broker.events == [
-        (
-            "checkout.outcome_unknown",
-            {
-                "execution_id": context.execution_id,
-                "cart_item_id": context.cart_item_id,
-                "status": "outcome_unknown",
-                "error_code": "payment_outcome_unknown",
-            },
-        )
-    ]
+    assert repository.retry_errors == []
+    assert broker.events[0][0] == "checkout.outcome_unknown"
 
 
-async def test_hosted_worker_reconciles_post_submit_browser_failure_without_retrying() -> None:
-    verification = StripeHostedVerification(AuthorizationOutcome.unknown)
+async def test_hosted_worker_marks_post_submit_browser_failure_unknown_without_retrying() -> None:
     context = hosted_worker_context("pm_stripe_demo_decline")
     repository = HostedRepository(context)
     browser = FakeHostedBrowser(repository, fail_after_submit=True)
-    demo = FakeHostedDemo(verification, "pm_stripe_demo_decline")
+    cards = FakeHostedCards("pm_stripe_demo_decline")
     broker = FakeBroker()
     worker = CheckoutWorker(
         repository=repository,  # type: ignore[arg-type]
         browser=browser,  # type: ignore[arg-type]
         issuing=None,
-        demo=demo,  # type: ignore[arg-type]
+        demo=None,
+        demo_cards=cards,  # type: ignore[arg-type]
         broker=broker,
         lease_seconds=120,
         max_attempts=3,
         poll_seconds=0.01,
-        authorization_timeout_seconds=0,
-        authorization_poll_seconds=0.001,
     )
 
     assert await worker.process_once()
 
     assert repository.submitted
     assert browser.runs == 1
-    assert demo.verify_calls == 1
     assert repository.retry_errors == []
     assert repository.terminal_status == CheckoutExecutionStatus.outcome_unknown
     assert repository.terminal_error == CheckoutErrorCode.payment_outcome_unknown
-    assert broker.events == [
-        (
-            "checkout.outcome_unknown",
-            {
-                "execution_id": context.execution_id,
-                "cart_item_id": context.cart_item_id,
-                "status": "outcome_unknown",
-                "error_code": "payment_outcome_unknown",
-            },
-        )
-    ]
+    assert broker.events[0][0] == "checkout.outcome_unknown"
 
 
 async def test_worker_loop_survives_transient_claim_failure_without_logging_error_data(

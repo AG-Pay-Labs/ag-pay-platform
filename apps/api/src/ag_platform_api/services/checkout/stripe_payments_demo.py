@@ -33,11 +33,29 @@ class StripeHostedVerification:
     receipt_url: str | None = None
 
 
-class StripePaymentsDemoGateway:
-    """Development-only Stripe Payments fixture provider.
+class StripeTestCardFixtures:
+    """Worker-only access to Stripe's public test-card fixtures."""
 
-    Public Stripe test values are materialized only in the worker process. AG Pay stores
-    and exposes the safe pm_stripe_demo_* reference, never the test card values.
+    async def retrieve_card(self, reference: str) -> IssuingCardSecret:
+        # Official Stripe test fixtures. Do not log, persist, return, or expose these values.
+        values = {
+            "pm_stripe_demo_success": ("4242424242424242", "123"),
+            "pm_stripe_demo_decline": ("4000000000000002", "123"),
+            "pm_stripe_demo_3ds": ("4000000000003220", "123"),
+        }
+        try:
+            number, cvc = values[reference]
+        except KeyError:
+            raise CheckoutError(CheckoutErrorCode.card_reference_invalid) from None
+        return IssuingCardSecret(number, cvc, 12, 2034)
+
+
+class StripePaymentsDemoGateway(StripeTestCardFixtures):
+    """Development-only Stripe API fixture provider for legacy demo rails.
+
+    The keyless fixed-URL hosted rail uses :class:`StripeTestCardFixtures`
+    directly. This gateway remains credentialed because its legacy operations
+    create and retrieve Stripe objects.
     """
 
     def __init__(
@@ -57,19 +75,6 @@ class StripePaymentsDemoGateway:
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()
-
-    async def retrieve_card(self, reference: str) -> IssuingCardSecret:
-        # Official Stripe test fixtures. Do not log, persist, return, or expose these values.
-        values = {
-            "pm_stripe_demo_success": ("4242424242424242", "123"),
-            "pm_stripe_demo_decline": ("4000000000000002", "123"),
-            "pm_stripe_demo_3ds": ("4000000000003220", "123"),
-        }
-        try:
-            number, cvc = values[reference]
-        except KeyError:
-            raise CheckoutError(CheckoutErrorCode.card_reference_invalid) from None
-        return IssuingCardSecret(number, cvc, 12, 2034)
 
     async def create_checkout_session(
         self,

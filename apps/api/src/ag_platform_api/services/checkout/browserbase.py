@@ -1,9 +1,9 @@
 import re
-import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -13,6 +13,7 @@ from ag_platform_api.services.checkout.origins import (
     normalize_origin,
     validate_checkout_url,
     validate_receipt_url,
+    validate_stripe_hosted_test_checkout_url,
 )
 from ag_platform_api.services.checkout.types import (
     CURRENCY_EXPONENTS,
@@ -22,10 +23,16 @@ from ag_platform_api.services.checkout.types import (
     CheckoutAdapter,
     CheckoutContext,
     IssuingCardSecret,
+    normalize_item_text,
 )
 
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,255}$")
 ORDER_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/# -]{0,127}$")
+STRIPE_TEST_SESSION_PATTERN = re.compile(r"^cs_test_[A-Za-z0-9]+$")
+STRIPE_HOSTED_QUANTITY_LABEL_PATTERN = re.compile(r"(?:^|\b)(?:qty|quantity)\b")
+STRIPE_HOSTED_QUANTITY_VALUE_PATTERN = re.compile(
+    r"(?:^|\b)(?:qty|quantity)\s*[:x×]?\s*(\d+)(?=\b|,)"
+)
 NUMBER_PATTERN = re.compile(r"(?<!\d)(\d{1,3}(?:[., ]\d{3})*[.,]\d{1,3}|\d+[.,]\d{1,3}|\d+)(?!\d)")
 
 
@@ -240,6 +247,8 @@ class BrowserbaseCheckout:
             raise CheckoutError(CheckoutErrorCode.origin_blocked)
         checkout_url = validate_checkout_url(context.checkout_url, merchant_origins)
         observe_test_session = adapter.checkout_mode == "stripe_hosted_test"
+        if observe_test_session:
+            checkout_url = validate_stripe_hosted_test_checkout_url(checkout_url)
         session = await self._gateway.create_session(
             allowed_origins + payment_origins + resource_origins,
             record_session=observe_test_session,
@@ -295,10 +304,16 @@ class BrowserbaseCheckout:
             finally:
                 del card
             if adapter.checkout_mode == "stripe_hosted_test":
-                if observe_outcome is None:
-                    raise CheckoutError(CheckoutErrorCode.adapter_invalid)
-                outcome = await observe_outcome()
-                return BrowserCheckoutResult(None, None, outcome)
+                if observe_outcome is not None:
+                    outcome = await observe_outcome()
+                    return BrowserCheckoutResult(None, None, outcome)
+                return await self._wait_for_hosted_test_result(
+                    page,
+                    context,
+                    merchant_origins,
+                    result_origins,
+                    payment_origins,
+                )
             return await self._wait_for_result(
                 page,
                 adapter,
@@ -391,23 +406,23 @@ class BrowserbaseCheckout:
             CheckoutErrorCode.item_mismatch,
             timeout_ms=10_000,
         )
-        quantity: LocatedElement | None
-        try:
+        hosted_test = context.adapter.checkout_mode == "stripe_hosted_test"
+        if hosted_test and context.approved_quantity == 1:
+            quantity = await self._optional_unique_visible(
+                page,
+                context.adapter.quantity_selector,
+                allowed_origins,
+                CheckoutErrorCode.quantity_mismatch,
+                timeout_ms=1_000,
+            )
+        else:
             quantity = await self._unique_visible(
                 page,
                 context.adapter.quantity_selector,
                 allowed_origins,
                 CheckoutErrorCode.quantity_mismatch,
-                timeout_ms=(1_000 if context.approved_quantity == 1 else 10_000),
+                timeout_ms=10_000,
             )
-        except CheckoutError:
-            if (
-                context.adapter.checkout_mode == "stripe_hosted_test"
-                and context.approved_quantity == 1
-            ):
-                quantity = None
-            else:
-                raise
         try:
             merchant_title = normalize_item_text((await title.locator.inner_text())[:500])
         except Exception:
@@ -427,13 +442,23 @@ class BrowserbaseCheckout:
         if quantity is None:
             return
         normalized_quantity = normalize_item_text(merchant_quantity)
-        match = (
-            re.search(r"(?:^|\b)qty\s*[:x×]?\s*(\d+)(?:\b|,)", normalized_quantity)
-            if context.adapter.checkout_mode == "stripe_hosted_test"
-            else re.fullmatch(
-                r"(?:qty|quantity)?\s*[:x×]?\s*(\d+)",
-                normalized_quantity,
-            )
+        if hosted_test:
+            labels = STRIPE_HOSTED_QUANTITY_LABEL_PATTERN.findall(normalized_quantity)
+            matches = STRIPE_HOSTED_QUANTITY_VALUE_PATTERN.findall(normalized_quantity)
+            if not labels and not matches and context.approved_quantity == 1:
+                # Stripe omits an explicit Qty label for a single line item and
+                # renders this element as the product description.
+                return
+            if (
+                len(labels) != 1
+                or len(matches) != 1
+                or int(matches[0]) != context.approved_quantity
+            ):
+                raise CheckoutError(CheckoutErrorCode.quantity_mismatch)
+            return
+        match = re.fullmatch(
+            r"(?:qty|quantity)?\s*[:x×]?\s*(\d+)",
+            normalized_quantity,
         )
         if match is None or int(match.group(1)) != context.approved_quantity:
             raise CheckoutError(CheckoutErrorCode.quantity_mismatch)
@@ -599,6 +624,72 @@ class BrowserbaseCheckout:
             elapsed += interval
         raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
 
+    async def _wait_for_hosted_test_result(
+        self,
+        page: PageLike,
+        context: CheckoutContext,
+        merchant_origins: tuple[str, ...],
+        result_origins: tuple[str, ...],
+        payment_origins: tuple[str, ...],
+    ) -> BrowserCheckoutResult:
+        """Accept only the landing server's verified Stripe-session marker."""
+        if result_origins != ("https://letyouragentspay.com",):
+            raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+        expected_session_id = urlsplit(context.checkout_url).path.rstrip("/").rsplit("/", 1)[-1]
+        if STRIPE_TEST_SESSION_PATTERN.fullmatch(expected_session_id) is None:
+            raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+        allowed_page_origins = tuple(dict.fromkeys(merchant_origins + result_origins))
+        elapsed = 0
+        interval = 250
+        while elapsed <= self._result_timeout_ms:
+            self._validate_page(page, allowed_page_origins, payment_origins)
+            try:
+                marker = await self._unique_visible(
+                    page,
+                    context.adapter.success_selector,
+                    result_origins,
+                    CheckoutErrorCode.payment_outcome_unknown,
+                )
+            except CheckoutError:
+                marker = None
+            if marker is not None:
+                try:
+                    session_id = await marker.locator.get_attribute("data-agpay-stripe-session-id")
+                    order_reference = await marker.locator.get_attribute(
+                        "data-agpay-order-reference"
+                    )
+                    offer = await marker.locator.get_attribute("data-agpay-offer")
+                    amount_minor = await marker.locator.get_attribute("data-agpay-amount-minor")
+                    currency = await marker.locator.get_attribute("data-agpay-currency")
+                    receipt_url = validate_receipt_url(
+                        page.url,
+                        base_url=page.url,
+                        allowed_origins=result_origins,
+                    )
+                    receipt = urlsplit(receipt_url)
+                    receipt_session_ids = parse_qs(receipt.query).get("session_id", [])
+                except Exception:
+                    raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown) from None
+                verified = (
+                    session_id is not None
+                    and STRIPE_TEST_SESSION_PATTERN.fullmatch(session_id) is not None
+                    and session_id == expected_session_id
+                    and order_reference == session_id
+                    and offer is not None
+                    and 0 < len(offer) <= 128
+                    and amount_minor == str(context.amount_minor)
+                    and currency is not None
+                    and currency.upper() == context.currency.upper()
+                    and receipt.path == "/playground/success"
+                    and receipt_session_ids == [session_id]
+                )
+                if not verified:
+                    raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
+                return BrowserCheckoutResult(session_id, receipt_url)
+            await page.wait_for_timeout(interval)
+            elapsed += interval
+        raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
+
     async def _extract_order_reference(
         self,
         page: PageLike,
@@ -676,6 +767,44 @@ class BrowserbaseCheckout:
                 return matches[0]
             if len(matches) > 1 or elapsed >= timeout_ms:
                 raise CheckoutError(missing_code)
+            await page.wait_for_timeout(interval)
+            elapsed += interval
+
+    async def _optional_unique_visible(
+        self,
+        page: PageLike,
+        selector: str,
+        allowed_origins: tuple[str, ...],
+        invalid_code: CheckoutErrorCode,
+        *,
+        timeout_ms: int = 0,
+    ) -> LocatedElement | None:
+        """Allow zero matches, while rejecting selector errors and ambiguity."""
+        elapsed = 0
+        interval = 100
+        allowed = set(allowed_origins)
+        while True:
+            matches: list[LocatedElement] = []
+            for frame in page.frames:
+                if not frame.url or frame.url == "about:blank":
+                    continue
+                if normalize_origin(frame.url) not in allowed:
+                    continue
+                try:
+                    collection = frame.locator(selector)
+                    count = await collection.count()
+                    for index in range(count):
+                        candidate = collection.nth(index)
+                        if await candidate.is_visible():
+                            matches.append(LocatedElement(locator=candidate, frame=frame))
+                except Exception:
+                    raise CheckoutError(invalid_code) from None
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise CheckoutError(invalid_code)
+            if elapsed >= timeout_ms:
+                return None
             await page.wait_for_timeout(interval)
             elapsed += interval
 
@@ -787,11 +916,6 @@ def parse_display_amount(value: str, *, decimal_places: int = 2) -> Decimal:
     else:
         compact = compact.replace(",", "").replace(".", "")
     return Decimal(compact)
-
-
-def normalize_item_text(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value)
-    return " ".join(normalized.split()).casefold()
 
 
 async def _connect_playwright(connect_url: str) -> ConnectedBrowser:

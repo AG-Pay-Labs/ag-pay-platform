@@ -21,7 +21,6 @@ CheckoutSelector = Annotated[
 ]
 CHECKOUT_ADAPTER_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 STRIPE_HOSTED_TEST_ADAPTER_KEY = "stripe-hosted"
-STRIPE_HOSTED_TEST_BOOTSTRAP_URL = "https://checkout.stripe.com/"
 
 
 def normalize_checkout_origin(value: str) -> str:
@@ -108,11 +107,14 @@ class CheckoutAdapterSettings(BaseModel):
 
 
 def stripe_hosted_test_adapter() -> CheckoutAdapterSettings:
-    """Pinned, development-only adapter for Stripe's live hosted test checkout."""
+    """Pinned adapter for a merchant-created Stripe sandbox Checkout Session."""
     return CheckoutAdapterSettings(
         checkout_mode="stripe_hosted_test",
-        allowed_origins=["https://checkout.stripe.com", "https://example.com"],
-        result_origins=["https://example.com"],
+        allowed_origins=[
+            "https://checkout.stripe.com",
+            "https://letyouragentspay.com",
+        ],
+        result_origins=["https://letyouragentspay.com"],
         payment_origins=[
             "https://checkout.stripe.com",
             "https://js.stripe.com",
@@ -148,8 +150,9 @@ def stripe_hosted_test_adapter() -> CheckoutAdapterSettings:
         billing_region_selector="#billingAdministrativeArea",
         billing_postal_code_selector="#billingPostalCode",
         submit_selector='[data-testid="hosted-payment-submit-button"]',
-        # Hosted mode observes the provider API; this selector is never authoritative.
-        success_selector="body",
+        # The landing server renders this marker only after it retrieves and
+        # verifies the paid Stripe Checkout Session.
+        success_selector=('#agpay-payment-verification[data-agpay-payment-status="verified"]'),
     )
 
 
@@ -274,6 +277,15 @@ class CheckoutWorkerSettings(CheckoutRuntimeSettings):
     stripe_link_approval_timeout_seconds: int = Field(default=600, ge=30, le=900)
     stripe_link_cli_timeout_seconds: int = Field(default=30, ge=5, le=120)
 
+    @field_validator("stripe_demo_secret_key", mode="before")
+    @classmethod
+    def normalize_empty_demo_secret(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        if isinstance(value, SecretStr) and not value.get_secret_value().strip():
+            return None
+        return value
+
     @field_validator("browserbase_api_url", "stripe_api_url")
     @classmethod
     def validate_provider_api_url(cls, value: str, info) -> str:
@@ -300,10 +312,14 @@ class CheckoutWorkerSettings(CheckoutRuntimeSettings):
         if self.checkout_demo_enabled:
             if self.environment.lower() not in {"development", "test"}:
                 raise ValueError("CHECKOUT_DEMO_ENABLED is development/test-only")
-            if self.stripe_demo_secret_key is None or not (
+            if self.stripe_demo_secret_key is not None and not (
                 self.stripe_demo_secret_key.get_secret_value().startswith("sk_test_")
             ):
                 raise ValueError("STRIPE_DEMO_SECRET_KEY must be a Stripe test-mode secret key")
+            if self.stripe_demo_secret_key is None and not self.checkout_hosted_demo_enabled:
+                raise ValueError(
+                    "STRIPE_DEMO_SECRET_KEY is required for the legacy direct demo rail"
+                )
         if self.stripe_link_enabled:
             if self.stripe_link_auth_directory is None:
                 raise ValueError(

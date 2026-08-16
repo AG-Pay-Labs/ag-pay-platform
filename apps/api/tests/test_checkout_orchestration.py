@@ -20,24 +20,56 @@ from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ag_platform_api.api.dependencies import get_payment_verifier
 from ag_platform_api.core.config import (
     STRIPE_HOSTED_TEST_ADAPTER_KEY,
-    STRIPE_HOSTED_TEST_BOOTSTRAP_URL,
     CheckoutAdapterSettings,
     Settings,
     stripe_hosted_test_adapter,
 )
+from ag_platform_api.main import app
 from ag_platform_api.models import (
+    Agent,
+    AgentPaymentMethod,
+    AgentStatus,
     CartItem,
     CheckoutEvent,
     CheckoutExecution,
     CheckoutExecutionStatus,
     CheckoutStatusTransition,
+    PaymentMethod,
+    PaymentMethodStatus,
+    Purchase,
     PurchaseCredential,
     User,
 )
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
-from ag_platform_api.services.checkout.repository import SqlAlchemyCheckoutRepository
+from ag_platform_api.services.checkout.repository import (
+    HostedPaymentProof,
+    HostedReconciliationCandidate,
+    SqlAlchemyCheckoutRepository,
+)
+
+STRIPE_HOSTED_TEST_CHECKOUT_URL = "https://checkout.stripe.com/c/pay/cs_test_fixed123#fixture"
+
+
+class ExactHostedProofVerifier:
+    def __init__(self) -> None:
+        self.candidates: list[HostedReconciliationCandidate] = []
+
+    async def verify(
+        self,
+        candidate: HostedReconciliationCandidate,
+    ) -> HostedPaymentProof:
+        self.candidates.append(candidate)
+        return HostedPaymentProof(
+            session_id=candidate.stripe_session_id,
+            order_reference=candidate.stripe_session_id,
+            offer_slug="approved-offer",
+            offer_name=candidate.approved_title,
+            amount_minor=candidate.amount_minor,
+            currency=candidate.currency.lower(),
+        )
 
 
 def adapter_payload(**overrides: Any) -> dict[str, Any]:
@@ -143,6 +175,56 @@ async def set_auto_approval(client: AsyncClient, wallet: dict[str, str]) -> None
     assert response.status_code == 200, response.text
 
 
+async def unknown_hosted_demo_checkout(
+    client: AsyncClient,
+    settings: Settings,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    *,
+    username: str,
+) -> tuple[dict[str, str], dict[str, Any], str]:
+    settings.checkout_enabled = True
+    settings.checkout_demo_enabled = True
+    settings.checkout_hosted_demo_enabled = True
+    settings.checkout_adapters = {STRIPE_HOSTED_TEST_ADAPTER_KEY: stripe_hosted_test_adapter()}
+    wallet = await managed_wallet(client, username)
+    demo_method = await create_payment_method(
+        client,
+        wallet["user_token"],
+        payload=personal_payment_method("pm_stripe_demo_success"),
+    )
+    await assign_payment_method(
+        client,
+        wallet["user_token"],
+        wallet["agent_id"],
+        demo_method["id"],
+    )
+    proposed = await propose_managed(
+        client,
+        wallet,
+        suffix=f"{username}-unknown",
+        adapter=STRIPE_HOSTED_TEST_ADAPTER_KEY,
+        checkout_url=STRIPE_HOSTED_TEST_CHECKOUT_URL,
+    )
+    approval = await client.post(
+        f"{API}/cart-items/{proposed['id']}/approve",
+        headers=bearer(wallet["user_token"]),
+        json={"payment_method_id": demo_method["id"]},
+    )
+    assert approval.status_code == 200, approval.text
+    repository = SqlAlchemyCheckoutRepository(db_session_factory)
+    claim = await repository.claim_next(lease_seconds=120, max_attempts=1)
+    assert claim and claim.execution_id == UUID(approval.json()["execution"]["id"])
+    await repository.prepare(claim.execution_id)
+    await repository.mark_submitted(claim.execution_id, "browserbase_session_reconcile")
+    terminal = await repository.finish_terminal(
+        claim.execution_id,
+        status=CheckoutExecutionStatus.outcome_unknown,
+        error_code=CheckoutErrorCode.payment_outcome_unknown,
+    )
+    assert terminal and terminal.status == CheckoutExecutionStatus.outcome_unknown
+    return wallet, proposed, demo_method["id"]
+
+
 def test_checkout_adapter_configuration_is_strict() -> None:
     with pytest.raises(ValidationError):
         CheckoutAdapterSettings.model_validate(
@@ -203,7 +285,7 @@ async def test_hosted_checkout_queues_one_pinned_frozen_adapter_snapshot(
         wallet,
         suffix="hosted-frozen",
         adapter=STRIPE_HOSTED_TEST_ADAPTER_KEY,
-        checkout_url=STRIPE_HOSTED_TEST_BOOTSTRAP_URL,
+        checkout_url=STRIPE_HOSTED_TEST_CHECKOUT_URL,
     )
     approval = await client.post(
         f"{API}/cart-items/{proposed['id']}/approve",
@@ -230,8 +312,249 @@ async def test_hosted_checkout_queues_one_pinned_frozen_adapter_snapshot(
 
     assert frozen.adapter_key == STRIPE_HOSTED_TEST_ADAPTER_KEY
     assert frozen.adapter.checkout_mode == "stripe_hosted_test"
-    assert frozen.adapter.result_origins == ("https://example.com",)
+    assert frozen.adapter.result_origins == ("https://letyouragentspay.com",)
     assert frozen.adapter.submit_selector == '[data-testid="hosted-payment-submit-button"]'
+    assert frozen.checkout_url == STRIPE_HOSTED_TEST_CHECKOUT_URL
+
+
+async def test_owner_reconciles_unknown_hosted_payment_once_and_releases_card(
+    client: AsyncClient,
+    settings: Settings,
+    broker,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    wallet, proposed, demo_method_id = await unknown_hosted_demo_checkout(
+        client,
+        settings,
+        db_session_factory,
+        username="managed-hosted-reconcile",
+    )
+    other_wallet = await managed_wallet(client, "managed-hosted-reconcile-other")
+    verifier = ExactHostedProofVerifier()
+    app.dependency_overrides[get_payment_verifier] = lambda: verifier
+
+    hidden = await client.post(
+        f"{API}/cart-items/{proposed['id']}/checkout/reconcile",
+        headers=bearer(other_wallet["user_token"]),
+    )
+    reconciled = await client.post(
+        f"{API}/cart-items/{proposed['id']}/checkout/reconcile",
+        headers=bearer(wallet["user_token"]),
+    )
+    repeated = await client.post(
+        f"{API}/cart-items/{proposed['id']}/checkout/reconcile",
+        headers=bearer(wallet["user_token"]),
+    )
+
+    assert hidden.status_code == 404
+    assert reconciled.status_code == 200, reconciled.text
+    assert repeated.status_code == 200, repeated.text
+    assert len(verifier.candidates) == 1
+    body = reconciled.json()
+    assert body["status"] == "purchased"
+    assert body["execution"]["status"] == "succeeded"
+    assert body["execution"]["error_code"] is None
+    assert body["execution"]["merchant_order_reference"] == "cs_test_fixed123"
+    assert [item["status"] for item in body["execution"]["status_history"]][-2:] == [
+        "outcome_unknown",
+        "succeeded",
+    ]
+    assert repeated.json()["execution"]["status"] == "succeeded"
+
+    async with db_session_factory() as db:
+        execution = await db.scalar(
+            select(CheckoutExecution).where(CheckoutExecution.cart_item_id == UUID(proposed["id"]))
+        )
+        purchase = await db.scalar(
+            select(Purchase).where(Purchase.cart_item_id == UUID(proposed["id"]))
+        )
+        events = list(
+            await db.scalars(
+                select(CheckoutEvent)
+                .where(CheckoutEvent.execution_id == execution.id)
+                .order_by(CheckoutEvent.cursor)
+            )
+        )
+    assert execution is not None
+    assert purchase is not None
+    assert purchase.provider_reference == "cs_test_fixed123"
+    assert purchase.merchant_order_reference == "cs_test_fixed123"
+    assert purchase.amount == Decimal("25.00")
+    assert purchase.currency == "EUR"
+    assert purchase.receipt_url == (
+        "https://letyouragentspay.com/playground/success?session_id=cs_test_fixed123"
+    )
+    assert [event.status for event in events] == [
+        CheckoutExecutionStatus.outcome_unknown,
+        CheckoutExecutionStatus.succeeded,
+    ]
+    assert events[-1].purchase_id == purchase.id
+    assert [event[0] for event in broker.events].count("checkout.succeeded") == 1
+
+    follow_up = await propose_managed(
+        client,
+        wallet,
+        suffix="hosted-after-reconciliation",
+        adapter=STRIPE_HOSTED_TEST_ADAPTER_KEY,
+        checkout_url="https://checkout.stripe.com/c/pay/cs_test_followup456#fixture",
+    )
+    follow_up_approval = await client.post(
+        f"{API}/cart-items/{follow_up['id']}/approve",
+        headers=bearer(wallet["user_token"]),
+        json={"payment_method_id": demo_method_id},
+    )
+    assert follow_up_approval.status_code == 200, follow_up_approval.text
+
+
+async def test_reconciliation_proof_failure_leaves_unknown_checkout_unchanged(
+    client: AsyncClient,
+    settings: Settings,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    wallet, proposed, _ = await unknown_hosted_demo_checkout(
+        client,
+        settings,
+        db_session_factory,
+        username="managed-hosted-proof-failure",
+    )
+
+    class WrongProofVerifier(ExactHostedProofVerifier):
+        async def verify(
+            self,
+            candidate: HostedReconciliationCandidate,
+        ) -> HostedPaymentProof:
+            proof = await super().verify(candidate)
+            return HostedPaymentProof(
+                session_id=proof.session_id,
+                order_reference=proof.order_reference,
+                offer_slug=proof.offer_slug,
+                offer_name="Different offer",
+                amount_minor=proof.amount_minor,
+                currency=proof.currency,
+            )
+
+    verifier = WrongProofVerifier()
+    app.dependency_overrides[get_payment_verifier] = lambda: verifier
+    response = await client.post(
+        f"{API}/cart-items/{proposed['id']}/checkout/reconcile",
+        headers=bearer(wallet["user_token"]),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "This checkout is not eligible for payment reconciliation."
+    )
+    async with db_session_factory() as db:
+        execution = await db.scalar(
+            select(CheckoutExecution).where(CheckoutExecution.cart_item_id == UUID(proposed["id"]))
+        )
+        purchase_count = await db.scalar(
+            select(func.count())
+            .select_from(Purchase)
+            .where(Purchase.cart_item_id == UUID(proposed["id"]))
+        )
+        event_count = await db.scalar(
+            select(func.count())
+            .select_from(CheckoutEvent)
+            .where(CheckoutEvent.execution_id == execution.id)
+        )
+    assert execution is not None
+    assert execution.status == CheckoutExecutionStatus.outcome_unknown
+    assert execution.error_code == CheckoutErrorCode.payment_outcome_unknown.value
+    assert purchase_count == 0
+    assert event_count == 1
+
+
+async def test_paid_unknown_reconciliation_ignores_mutable_post_charge_state(
+    client: AsyncClient,
+    settings: Settings,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    wallet, proposed, demo_method_id = await unknown_hosted_demo_checkout(
+        client,
+        settings,
+        db_session_factory,
+        username="managed-hosted-post-charge-state",
+    )
+    async with db_session_factory() as db, db.begin():
+        agent = await db.get(Agent, UUID(wallet["agent_id"]))
+        payment_method = await db.get(PaymentMethod, UUID(demo_method_id))
+        assert agent is not None and payment_method is not None
+        agent.status = AgentStatus.revoked
+        payment_method.status = PaymentMethodStatus.disabled
+        await db.execute(
+            delete(AgentPaymentMethod).where(
+                AgentPaymentMethod.agent_id == agent.id,
+                AgentPaymentMethod.payment_method_id == payment_method.id,
+            )
+        )
+
+    verifier = ExactHostedProofVerifier()
+    app.dependency_overrides[get_payment_verifier] = lambda: verifier
+    response = await client.post(
+        f"{API}/cart-items/{proposed['id']}/checkout/reconcile",
+        headers=bearer(wallet["user_token"]),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "purchased"
+    assert response.json()["execution"]["status"] == "succeeded"
+    async with db_session_factory() as db:
+        purchase_count = await db.scalar(
+            select(func.count())
+            .select_from(Purchase)
+            .where(Purchase.cart_item_id == UUID(proposed["id"]))
+        )
+    assert purchase_count == 1
+
+
+@pytest.mark.parametrize(
+    ("suffix", "checkout_url"),
+    [
+        ("root", "https://checkout.stripe.com/"),
+        ("live", "https://checkout.stripe.com/c/pay/cs_live_fixed123#fixture"),
+    ],
+)
+async def test_hosted_checkout_queue_rejects_non_test_session_urls(
+    client: AsyncClient,
+    settings: Settings,
+    suffix: str,
+    checkout_url: str,
+) -> None:
+    settings.checkout_enabled = True
+    settings.checkout_demo_enabled = True
+    settings.checkout_hosted_demo_enabled = True
+    settings.checkout_adapters = {STRIPE_HOSTED_TEST_ADAPTER_KEY: stripe_hosted_test_adapter()}
+    wallet = await managed_wallet(client, f"managed-hosted-invalid-{suffix}")
+    demo_method = await create_payment_method(
+        client,
+        wallet["user_token"],
+        payload=personal_payment_method("pm_stripe_demo_success"),
+    )
+    await assign_payment_method(
+        client,
+        wallet["user_token"],
+        wallet["agent_id"],
+        demo_method["id"],
+    )
+    proposed = await propose_managed(
+        client,
+        wallet,
+        suffix=f"hosted-invalid-{suffix}",
+        adapter=STRIPE_HOSTED_TEST_ADAPTER_KEY,
+        checkout_url=checkout_url,
+    )
+
+    approval = await client.post(
+        f"{API}/cart-items/{proposed['id']}/approve",
+        headers=bearer(wallet["user_token"]),
+        json={"payment_method_id": demo_method["id"]},
+    )
+
+    assert approval.status_code == 409
+    assert approval.json()["detail"] == (
+        "Stripe-hosted test checkout requires a concrete cs_test Checkout URL"
+    )
 
 
 async def test_human_approval_queues_one_frozen_safe_execution(

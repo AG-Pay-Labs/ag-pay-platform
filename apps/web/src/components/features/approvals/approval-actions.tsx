@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useQueryClient } from "@tanstack/react-query";
-import { Check, Copy, KeyRound, Loader2, ShieldCheck, X } from "lucide-react";
+import { Check, Copy, KeyRound, Loader2, RefreshCw, ShieldCheck, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Money, SafeCardLabel } from "@/components/app";
@@ -42,6 +42,7 @@ import { queryKeys, useAgentPaymentMethods } from "@/hooks/use-api-data";
 
 export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: AgentRead }) {
   const queryClient = useQueryClient();
+  const hasManagedCheckout = Boolean(item.checkout_adapter && item.checkout_url);
   const [open, setOpen] = useState(false);
   const [selectedCard, setSelectedCard] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -63,7 +64,7 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
     const form = new FormData(event.currentTarget);
 
     try {
-      await apiRequest<CartItemRead>(`/cart-items/${item.id}/approve`, {
+      const approved = await apiRequest<CartItemRead>(`/cart-items/${item.id}/approve`, {
         method: "POST",
         body: JSON.stringify({
           payment_method_id: selectedCard,
@@ -72,9 +73,9 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
       });
       await queryClient.invalidateQueries({ queryKey: queryKeys.cart });
       toast.success(
-        item.checkout_adapter
+        approved.execution
           ? "Purchase approved; secure checkout queued"
-          : "Purchase approved for legacy external completion",
+          : "Approval recorded. No payment or checkout was queued.",
       );
       setOpen(false);
     } catch (caught) {
@@ -104,15 +105,17 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
         <DialogHeader>
           <DialogTitle>Approve this purchase?</DialogTitle>
           <DialogDescription>
-            {item.checkout_adapter ? (
+            {hasManagedCheckout ? (
               <>
                 This authorizes AG Pay to run the configured checkout after approval. Payment
                 credentials stay inside the trusted executor and are never sent to the agent.
               </>
             ) : (
               <>
-                This authorizes {agent?.name ?? "the agent"} to complete the item through the
-                legacy external flow and report its result.
+                This proposal has no managed checkout URL. Approving records your decision and
+                selected card, but AG Pay will not make or queue a payment. If you expect AG Pay to
+                execute checkout, ask {agent?.name ?? "the agent"} to create a new proposal with
+                the exact checkout adapter and URL.
               </>
             )}
           </DialogDescription>
@@ -201,7 +204,13 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
             disabled={submitting || activeCards.length === 0}
           >
             {submitting ? <Loader2 className="animate-spin" /> : <ShieldCheck />}
-            Approve · <Money amount={item.total_amount} currency={item.currency} />
+            {hasManagedCheckout ? (
+              <>
+                Approve &amp; queue · <Money amount={item.total_amount} currency={item.currency} />
+              </>
+            ) : (
+              "Record approval only"
+            )}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -266,6 +275,98 @@ export function CancelProposalDialog({ item }: { item: CartItemRead }) {
               {submitting ? <Loader2 className="animate-spin" /> : <X />}
               Cancel proposal
             </AlertDialogAction>
+          </AlertDialogFooter>
+        </form>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+export function ReconcilePaymentDialog({ item }: { item: CartItemRead }) {
+  const queryClient = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (
+    item.execution?.status !== "outcome_unknown" ||
+    item.checkout_adapter !== "stripe-hosted" ||
+    !item.checkout_url
+  ) {
+    return null;
+  }
+
+  async function reconcile(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      const updated = await apiRequest<CartItemRead>(
+        `/cart-items/${item.id}/checkout/reconcile`,
+        { method: "POST" },
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.cart }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.purchases }),
+      ]);
+
+      if (updated.execution?.status !== "succeeded") {
+        setError(
+          "The existing payment could not be confirmed. It remains unresolved, and no new payment was submitted.",
+        );
+        return;
+      }
+      toast.success("Payment confirmed and purchase recorded");
+      setOpen(false);
+    } catch (caught) {
+      setError(getErrorMessage(caught, "Could not reconcile this payment."));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <AlertDialog
+      open={open}
+      onOpenChange={(next) => {
+        if (submitting) return;
+        setOpen(next);
+        if (!next) setError(null);
+      }}
+    >
+      <AlertDialogTrigger asChild>
+        <Button variant="outline" size="sm">
+          <RefreshCw /> Reconcile payment
+        </Button>
+      </AlertDialogTrigger>
+      <AlertDialogContent>
+        <form id={`reconcile-${item.id}`} onSubmit={reconcile}>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Reconcile this payment?</AlertDialogTitle>
+            <AlertDialogDescription>
+              AG Pay will check provider and merchant evidence for the existing checkout attempt
+              and update its recorded outcome. It will not submit the card, retry checkout, or
+              create another payment.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <p className="my-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
+            If the available evidence is still incomplete, the outcome will remain unresolved and
+            the payment method will stay quarantined.
+          </p>
+          {error ? (
+            <p role="alert" className="mb-4 text-sm text-destructive">
+              {error}
+            </p>
+          ) : null}
+          <AlertDialogFooter>
+            <AlertDialogCancel type="button" disabled={submitting}>
+              Cancel
+            </AlertDialogCancel>
+            <Button type="submit" disabled={submitting}>
+              {submitting ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              {submitting ? "Checking existing payment…" : "Reconcile payment"}
+            </Button>
           </AlertDialogFooter>
         </form>
       </AlertDialogContent>

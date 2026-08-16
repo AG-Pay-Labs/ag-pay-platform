@@ -1,7 +1,10 @@
 import ipaddress
+import re
 from urllib.parse import urljoin, urlsplit
 
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
+
+STRIPE_HOSTED_TEST_PATH_PATTERN = re.compile(r"^/c/pay/cs_test_[A-Za-z0-9]+/?$")
 
 
 def normalize_origin(value: str) -> str:
@@ -35,6 +38,26 @@ def validate_checkout_url(value: str, allowed_origins: tuple[str, ...]) -> str:
     origin = normalize_origin(value)
     normalized_allowed = {normalize_origin(item) for item in allowed_origins}
     if origin not in normalized_allowed:
+        raise CheckoutError(CheckoutErrorCode.origin_blocked)
+    return value
+
+
+def validate_stripe_hosted_test_checkout_url(value: str) -> str:
+    """Require a concrete Stripe test Checkout Session rather than its origin."""
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise CheckoutError(CheckoutErrorCode.origin_blocked) from None
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname != "checkout.stripe.com"
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.query)
+        or STRIPE_HOSTED_TEST_PATH_PATTERN.fullmatch(parsed.path) is None
+    ):
         raise CheckoutError(CheckoutErrorCode.origin_blocked)
     return value
 

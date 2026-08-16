@@ -7,6 +7,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from ag_platform_api.checkout_worker import build_worker
 from ag_platform_api.core.config import (
     STRIPE_HOSTED_TEST_ADAPTER_KEY,
     CheckoutRuntimeSettings,
@@ -21,7 +22,11 @@ from ag_platform_api.services.checkout.browserbase import (
     money_text_matches,
 )
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
-from ag_platform_api.services.checkout.origins import normalize_origin, validate_checkout_url
+from ag_platform_api.services.checkout.origins import (
+    normalize_origin,
+    validate_checkout_url,
+    validate_stripe_hosted_test_checkout_url,
+)
 from ag_platform_api.services.checkout.stripe_issuing import StripeIssuingGateway
 from ag_platform_api.services.checkout.stripe_payments_demo import StripePaymentsDemoGateway
 from ag_platform_api.services.checkout.types import (
@@ -108,8 +113,39 @@ def test_stripe_hosted_adapter_is_pinned_and_development_test_only() -> None:
         "stripe_hosted_test"
     )
     assert runtime.checkout_adapters[STRIPE_HOSTED_TEST_ADAPTER_KEY].result_origins == [
-        "https://example.com"
+        "https://letyouragentspay.com"
     ]
+    assert runtime.checkout_adapters[STRIPE_HOSTED_TEST_ADAPTER_KEY].success_selector == (
+        '#agpay-payment-verification[data-agpay-payment-status="verified"]'
+    )
+
+    keyless_worker = CheckoutWorkerSettings(
+        _env_file=None,
+        environment="test",
+        checkout_enabled=True,
+        checkout_demo_enabled=True,
+        checkout_hosted_demo_enabled=True,
+        stripe_demo_secret_key="   ",
+    )
+    assert keyless_worker.stripe_demo_secret_key is None
+
+    with pytest.raises(ValidationError, match="test-mode secret key"):
+        CheckoutWorkerSettings(
+            _env_file=None,
+            environment="test",
+            checkout_enabled=True,
+            checkout_demo_enabled=True,
+            checkout_hosted_demo_enabled=True,
+            stripe_demo_secret_key="sk_live_not-allowed",
+        )
+
+    with pytest.raises(ValidationError, match="legacy direct demo rail"):
+        CheckoutWorkerSettings(
+            _env_file=None,
+            environment="test",
+            checkout_enabled=True,
+            checkout_demo_enabled=True,
+        )
 
     with pytest.raises(ValidationError, match="requires CHECKOUT_DEMO_ENABLED"):
         CheckoutRuntimeSettings(
@@ -136,6 +172,26 @@ def test_stripe_hosted_adapter_is_pinned_and_development_test_only() -> None:
                 )
             },
         )
+
+
+async def test_keyless_hosted_worker_builds_without_stripe_gateway() -> None:
+    settings = CheckoutWorkerSettings(
+        _env_file=None,
+        environment="test",
+        checkout_enabled=True,
+        checkout_demo_enabled=True,
+        checkout_hosted_demo_enabled=True,
+        browserbase_api_key="browserbase-test-key",
+        browserbase_project_id="browserbase-project",
+        stripe_demo_secret_key="",
+    )
+
+    _, browserbase, issuing, demo = build_worker(settings, object())  # type: ignore[arg-type]
+    try:
+        assert issuing is None
+        assert demo is None
+    finally:
+        await browserbase.close()
 
 
 async def test_browserbase_session_payload_honors_observation_and_limits_domains() -> None:
@@ -219,6 +275,20 @@ def test_checkout_origins_reject_non_https_private_and_credentialed_urls(url: st
     with pytest.raises(CheckoutError) as caught:
         validate_checkout_url(url, ("https://merchant.example.test",))
     assert caught.value.code == CheckoutErrorCode.origin_blocked
+
+
+def test_hosted_test_checkout_url_requires_and_preserves_concrete_test_session() -> None:
+    fixed_url = "https://checkout.stripe.com/c/pay/cs_test_fixed123#preserved-fragment"
+    assert validate_stripe_hosted_test_checkout_url(fixed_url) == fixed_url
+
+    for invalid_url in (
+        "https://checkout.stripe.com/",
+        "https://checkout.stripe.com/c/pay/cs_live_fixed123#fragment",
+        "https://checkout.stripe.com/c/pay/cs_test_fixed123?prefilled_email=not-approved",
+    ):
+        with pytest.raises(CheckoutError) as caught:
+            validate_stripe_hosted_test_checkout_url(invalid_url)
+        assert caught.value.code == CheckoutErrorCode.origin_blocked
 
 
 def test_origin_normalization_and_total_matching_are_exact() -> None:

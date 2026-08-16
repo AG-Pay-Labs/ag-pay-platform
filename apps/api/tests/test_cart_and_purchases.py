@@ -47,6 +47,9 @@ async def test_agent_proposal_owner_approval_credential_reveal_and_purchase(
     assert proposed["total_amount"] == "25.00"
     assert proposed["currency"] == "EUR"
     assert proposed["account_email"] == "buyer-approved@example.com"
+    assert proposed["checkout_adapter"] is None
+    assert proposed["checkout_url"] is None
+    assert proposed["execution"] is None
     assert "password" not in proposed
 
     wrong_reveal = await client.post(
@@ -76,6 +79,10 @@ async def test_agent_proposal_owner_approval_credential_reveal_and_purchase(
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
     assert approved.json()["selected_payment_method_id"] == wallet["payment_method_id"]
+    # Legacy proposals intentionally record the human decision without queuing payment.
+    assert approved.json()["checkout_adapter"] is None
+    assert approved.json()["checkout_url"] is None
+    assert approved.json()["execution"] is None
 
     wrong_total = await client.post(
         f"{API}/agent/cart-items/{proposed['id']}/purchase",

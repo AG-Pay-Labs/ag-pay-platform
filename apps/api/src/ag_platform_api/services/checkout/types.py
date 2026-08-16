@@ -1,3 +1,4 @@
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -229,3 +230,8 @@ def decimal_to_minor(amount: Decimal, currency: str) -> int:
     if minor != integral or amount < 0:
         raise CheckoutError(CheckoutErrorCode.currency_precision_invalid)
     return int(integral)
+
+
+def normalize_item_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    return " ".join(normalized.split()).casefold()

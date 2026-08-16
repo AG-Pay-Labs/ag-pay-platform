@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
@@ -6,19 +7,43 @@ import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ag_platform_api.core.config import Settings, get_settings
 from ag_platform_api.core.security import decode_access_token, hash_opaque_token
-from ag_platform_api.db.session import get_db
+from ag_platform_api.db.session import SessionFactory, get_db
 from ag_platform_api.models import Agent, AgentStatus, User
 from ag_platform_api.services.broker import EventBroker
+from ag_platform_api.services.checkout.reconciliation import (
+    LandingPaymentVerificationClient,
+    TrustedPaymentVerifier,
+)
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
 BearerCredentials = Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)]
+
+
+def get_database_session_factory() -> async_sessionmaker[AsyncSession]:
+    return SessionFactory
+
+
+DatabaseSessionFactory = Annotated[
+    async_sessionmaker[AsyncSession], Depends(get_database_session_factory)
+]
+
+
+async def get_payment_verifier() -> AsyncIterator[TrustedPaymentVerifier]:
+    verifier = LandingPaymentVerificationClient()
+    try:
+        yield verifier
+    finally:
+        await verifier.close()
+
+
+PaymentVerifier = Annotated[TrustedPaymentVerifier, Depends(get_payment_verifier)]
 
 
 def utc(value: datetime) -> datetime:

@@ -27,6 +27,7 @@ import {
 import {
   ApproveDialog,
   CancelProposalDialog,
+  ReconcilePaymentDialog,
   RevealCredentialDialog,
 } from "@/components/features/approvals/approval-actions";
 import { Button } from "@/components/ui/button";
@@ -354,7 +355,11 @@ function ApprovalsContent() {
                     <Detail label="Merchant account" value={selected.account_email} />
                     <Detail
                       label="Checkout mode"
-                      value={selected.checkout_adapter ?? "Legacy external completion"}
+                      value={
+                        selected.checkout_adapter && selected.checkout_url
+                          ? selected.checkout_adapter
+                          : "Approval only — no checkout"
+                      }
                     />
                     <Detail label="Submitted" value={formatDateTime(selected.created_at)} />
                   </dl>
@@ -375,9 +380,16 @@ function ApprovalsContent() {
                   <div>
                     <div className="mb-4 flex gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
                       <ShieldCheck className="mt-0.5 size-4 shrink-0" />
-                      <p>
-                        Review the product, rationale, total, and recurring terms before you decide.
-                      </p>
+                      {selected.checkout_adapter && selected.checkout_url ? (
+                        <p>
+                          Review the product, rationale, total, and recurring terms before you decide.
+                        </p>
+                      ) : (
+                        <p>
+                          This proposal has no managed checkout URL. Approval records your decision,
+                          but it will not make or queue a payment.
+                        </p>
+                      )}
                     </div>
                     <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
                       <CancelProposalDialog item={selected} />
@@ -500,6 +512,13 @@ function ExecutionState({ item }: { item: CartItemRead }) {
             </a>
           </p>
         ) : null}
+        {execution.status === "outcome_unknown" &&
+        item.checkout_adapter === "stripe-hosted" &&
+        item.checkout_url ? (
+          <div className="mt-4 border-t border-current/20 pt-4">
+            <ReconcilePaymentDialog item={item} />
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -543,9 +562,11 @@ function LegacyApprovedState({ item }: { item: CartItemRead }) {
     <div className="flex gap-3 rounded-lg border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100">
       <CalendarClock className="mt-0.5 size-5 shrink-0" />
       <div>
-        <p className="font-medium">Waiting for legacy completion</p>
+        <p className="font-medium">Approval recorded — no checkout queued</p>
         <p className="mt-1 leading-6">
-          Approved {approved}. The agent must complete checkout externally and report the result.
+          Approved {approved}. This proposal did not include a managed checkout URL, so AG Pay did
+          not attempt a payment. This item cannot be upgraded; create a new proposal with the exact
+          checkout adapter and URL to use managed checkout.
         </p>
       </div>
     </div>

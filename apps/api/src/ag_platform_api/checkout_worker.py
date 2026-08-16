@@ -13,7 +13,10 @@ from ag_platform_api.services.checkout.browserbase import BrowserbaseCheckout, B
 from ag_platform_api.services.checkout.repository import SqlAlchemyCheckoutRepository
 from ag_platform_api.services.checkout.stripe_issuing import StripeIssuingGateway
 from ag_platform_api.services.checkout.stripe_link import StripeLinkGateway
-from ag_platform_api.services.checkout.stripe_payments_demo import StripePaymentsDemoGateway
+from ag_platform_api.services.checkout.stripe_payments_demo import (
+    StripePaymentsDemoGateway,
+    StripeTestCardFixtures,
+)
 from ag_platform_api.services.checkout.worker import CheckoutWorker
 
 
@@ -93,6 +96,7 @@ def build_worker(
         if settings.checkout_demo_enabled and settings.stripe_demo_secret_key is not None
         else None
     )
+    demo_cards = StripeTestCardFixtures() if settings.checkout_demo_enabled else None
     worker = CheckoutWorker(
         repository=SqlAlchemyCheckoutRepository(SessionFactory),
         browser=BrowserbaseCheckout(
@@ -102,6 +106,7 @@ def build_worker(
         issuing=issuing,
         link=link,
         demo=demo,
+        demo_cards=demo_cards,
         broker=CheckoutRedisPublisher(redis),
         lease_seconds=settings.checkout_lease_seconds,
         max_attempts=settings.checkout_max_attempts,

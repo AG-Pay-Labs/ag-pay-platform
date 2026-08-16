@@ -8,6 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import and_, func, or_, select, update
@@ -34,11 +35,18 @@ from ag_platform_api.services.checkout.errors import (
     CheckoutError,
     CheckoutErrorCode,
 )
-from ag_platform_api.services.checkout.origins import normalize_origin, validate_checkout_url
+from ag_platform_api.services.checkout.origins import (
+    normalize_origin,
+    validate_checkout_url,
+    validate_stripe_hosted_test_checkout_url,
+)
+from ag_platform_api.services.checkout.stripe_payments_demo import DEMO_REFERENCES
 from ag_platform_api.services.checkout.types import (
     CheckoutAdapter,
     CheckoutContext,
     ExpectedCardMetadata,
+    decimal_to_minor,
+    normalize_item_text,
 )
 
 TERMINAL_STATUSES = frozenset(
@@ -49,6 +57,10 @@ TERMINAL_STATUSES = frozenset(
         CheckoutExecutionStatus.outcome_unknown,
     }
 )
+STRIPE_HOSTED_ADAPTER_KEY = "stripe-hosted"
+STRIPE_CHECKOUT_ORIGIN = "https://checkout.stripe.com"
+TRUSTED_RESULT_ORIGIN = "https://letyouragentspay.com"
+TRUSTED_RECEIPT_PATH = "/playground/success"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +77,43 @@ class ClaimResult:
     execution_id: UUID | None
     cart_item_id: UUID
     notification: TerminalNotification | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class HostedReconciliationCandidate:
+    execution_id: UUID
+    cart_item_id: UUID
+    owner_id: UUID
+    agent_id: UUID
+    payment_method_id: UUID
+    stripe_session_id: str
+    approved_title: str
+    amount: Decimal
+    amount_minor: int
+    currency: str
+    receipt_url: str
+    already_succeeded: bool
+
+    def __repr__(self) -> str:
+        return (
+            "HostedReconciliationCandidate("
+            f"execution_id={self.execution_id!r}, cart_item_id={self.cart_item_id!r}, "
+            f"owner_id={self.owner_id!r}, stripe_session_id=<redacted>, "
+            f"already_succeeded={self.already_succeeded!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class HostedPaymentProof:
+    session_id: str
+    order_reference: str
+    offer_slug: str
+    offer_name: str
+    amount_minor: int
+    currency: str
+
+    def __repr__(self) -> str:
+        return "HostedPaymentProof(<redacted>)"
 
 
 class SqlAlchemyCheckoutRepository:
@@ -377,6 +426,292 @@ class SqlAlchemyCheckoutRepository:
                 error_code=None,
                 purchase_id=purchase.id,
             )
+
+    async def hosted_reconciliation_candidate(
+        self,
+        *,
+        owner_id: UUID,
+        cart_item_id: UUID,
+    ) -> HostedReconciliationCandidate | None:
+        """Snapshot an owner-scoped unknown hosted checkout without locking it."""
+        async with self._session_factory() as session:
+            return await self._load_hosted_reconciliation_candidate(
+                session,
+                owner_id=owner_id,
+                cart_item_id=cart_item_id,
+                for_update=False,
+            )
+
+    async def reconcile_hosted_succeeded(
+        self,
+        candidate: HostedReconciliationCandidate,
+        proof: HostedPaymentProof,
+    ) -> TerminalNotification | None:
+        """Record independently proven payment without submitting payment again."""
+        async with self._session_factory() as session, session.begin():
+            # Approval locks the selected method before checking unresolved
+            # executions. Preserve that order so releasing quarantine cannot
+            # deadlock a concurrent proposal approval for the same method.
+            payment_method = await session.scalar(
+                select(PaymentMethod)
+                .where(
+                    PaymentMethod.id == candidate.payment_method_id,
+                    PaymentMethod.owner_id == candidate.owner_id,
+                )
+                .with_for_update()
+            )
+            if payment_method is None:
+                raise CheckoutError(CheckoutErrorCode.execution_invalid)
+            current = await self._load_hosted_reconciliation_candidate(
+                session,
+                owner_id=candidate.owner_id,
+                cart_item_id=candidate.cart_item_id,
+                for_update=True,
+            )
+            if current is None:
+                raise CheckoutError(CheckoutErrorCode.execution_invalid)
+            if current.already_succeeded:
+                return None
+            if current != candidate or not self.proof_matches_candidate(proof, current):
+                raise CheckoutError(CheckoutErrorCode.execution_invalid)
+
+            execution = await self._execution_locked(session, current.execution_id)
+            cart = await session.scalar(
+                select(CartItem).where(CartItem.id == current.cart_item_id).with_for_update()
+            )
+            if cart is None:
+                raise CheckoutError(CheckoutErrorCode.execution_invalid)
+            now = datetime.now(UTC)
+            purchase = Purchase(
+                owner_id=current.owner_id,
+                agent_id=current.agent_id,
+                payment_method_id=current.payment_method_id,
+                cart_item_id=current.cart_item_id,
+                status=PurchaseStatus.completed,
+                amount=current.amount,
+                currency=current.currency,
+                provider_reference=proof.session_id,
+                merchant_order_reference=proof.order_reference,
+                receipt_url=current.receipt_url,
+                purchased_at=now,
+            )
+            session.add(purchase)
+            cart.status = CartItemStatus.purchased
+            execution.status = CheckoutExecutionStatus.succeeded
+            execution.completed_at = now
+            execution.lease_expires_at = None
+            execution.error_code = None
+            execution.error_message = None
+            execution.merchant_order_reference = proof.order_reference
+            session.add(
+                self._transition(
+                    execution,
+                    status=CheckoutExecutionStatus.succeeded,
+                    occurred_at=now,
+                )
+            )
+            try:
+                await session.flush()
+            except IntegrityError:
+                raise CheckoutError(CheckoutErrorCode.execution_invalid) from None
+            session.add(
+                self._event(
+                    execution,
+                    status=CheckoutExecutionStatus.succeeded,
+                    purchase_id=purchase.id,
+                )
+            )
+            return TerminalNotification(
+                execution_id=execution.id,
+                cart_item_id=cart.id,
+                status=CheckoutExecutionStatus.succeeded,
+                error_code=None,
+                purchase_id=purchase.id,
+            )
+
+    async def _load_hosted_reconciliation_candidate(
+        self,
+        session: AsyncSession,
+        *,
+        owner_id: UUID,
+        cart_item_id: UUID,
+        for_update: bool,
+    ) -> HostedReconciliationCandidate | None:
+        execution_query = select(CheckoutExecution).where(
+            CheckoutExecution.owner_id == owner_id,
+            CheckoutExecution.cart_item_id == cart_item_id,
+        )
+        if for_update:
+            execution_query = execution_query.with_for_update()
+        execution = await session.scalar(execution_query)
+        if execution is None:
+            return None
+
+        cart_query = select(CartItem).where(
+            CartItem.id == cart_item_id,
+            CartItem.owner_id == owner_id,
+        )
+        agent_query = select(Agent).where(
+            Agent.id == execution.agent_id,
+            Agent.owner_id == owner_id,
+        )
+        payment_query = select(PaymentMethod).where(
+            PaymentMethod.id == execution.payment_method_id,
+            PaymentMethod.owner_id == owner_id,
+        )
+        if for_update:
+            cart_query = cart_query.with_for_update()
+            agent_query = agent_query.with_for_update()
+            payment_query = payment_query.with_for_update()
+        cart = await session.scalar(cart_query)
+        agent = await session.scalar(agent_query)
+        payment_method = await session.scalar(payment_query)
+        if cart is None or agent is None or payment_method is None:
+            raise CheckoutError(CheckoutErrorCode.execution_invalid)
+
+        if (
+            cart.agent_id != execution.agent_id
+            or cart.selected_payment_method_id != execution.payment_method_id
+            or execution.adapter_key != STRIPE_HOSTED_ADAPTER_KEY
+            or cart.checkout_adapter != STRIPE_HOSTED_ADAPTER_KEY
+            or cart.checkout_url is None
+            or cart.billing_period is not None
+            or execution.submitted_at is None
+            or execution.completed_at is None
+            or execution.attempt_count < 1
+            or execution.approved_amount != cart.unit_price * cart.quantity
+            or execution.currency.upper() != cart.currency.upper()
+            or execution.checkout_origin != STRIPE_CHECKOUT_ORIGIN
+            or payment_method.provider != "prototype-vault"
+            or payment_method.provider_payment_method_id not in DEMO_REFERENCES
+            or execution.provider_request_id is not None
+        ):
+            raise CheckoutError(CheckoutErrorCode.execution_invalid)
+
+        try:
+            validate_stripe_hosted_test_checkout_url(cart.checkout_url)
+            adapter = CheckoutAdapter.from_snapshot(execution.adapter_config)
+            session_id = urlsplit(cart.checkout_url).path.rstrip("/").rsplit("/", 1)[-1]
+            amount_minor = decimal_to_minor(execution.approved_amount, execution.currency)
+        except CheckoutError:
+            raise CheckoutError(CheckoutErrorCode.execution_invalid) from None
+        if (
+            adapter.checkout_mode != "stripe_hosted_test"
+            or adapter.allowed_origins != (STRIPE_CHECKOUT_ORIGIN, TRUSTED_RESULT_ORIGIN)
+            or adapter.result_origins != (TRUSTED_RESULT_ORIGIN,)
+            or normalize_origin(cart.checkout_url) != execution.checkout_origin
+        ):
+            raise CheckoutError(CheckoutErrorCode.execution_invalid)
+
+        purchase = await session.scalar(
+            select(Purchase).where(Purchase.cart_item_id == cart.id).with_for_update()
+            if for_update
+            else select(Purchase).where(Purchase.cart_item_id == cart.id)
+        )
+        latest_transition = await session.scalar(
+            select(CheckoutStatusTransition)
+            .where(CheckoutStatusTransition.execution_id == execution.id)
+            .order_by(CheckoutStatusTransition.sequence.desc())
+            .limit(1)
+        )
+        events = list(
+            await session.scalars(
+                select(CheckoutEvent)
+                .where(CheckoutEvent.execution_id == execution.id)
+                .order_by(CheckoutEvent.cursor)
+            )
+        )
+        receipt_url = f"{TRUSTED_RESULT_ORIGIN}{TRUSTED_RECEIPT_PATH}?session_id={session_id}"
+        events_are_bound = all(
+            event.owner_id == execution.owner_id
+            and event.agent_id == execution.agent_id
+            and event.cart_item_id == execution.cart_item_id
+            and event.amount == execution.approved_amount
+            and event.currency.upper() == execution.currency.upper()
+            for event in events
+        )
+
+        if execution.status == CheckoutExecutionStatus.outcome_unknown:
+            valid_unknown = (
+                cart.status == CartItemStatus.approved
+                and execution.error_code == CheckoutErrorCode.payment_outcome_unknown.value
+                and purchase is None
+                and latest_transition is not None
+                and latest_transition.status == CheckoutExecutionStatus.outcome_unknown
+                and latest_transition.attempt_count == execution.attempt_count
+                and latest_transition.error_code == CheckoutErrorCode.payment_outcome_unknown.value
+                and len(events) == 1
+                and events_are_bound
+                and events[0].status == CheckoutExecutionStatus.outcome_unknown
+                and events[0].error_code == CheckoutErrorCode.payment_outcome_unknown.value
+                and events[0].purchase_id is None
+            )
+            already_succeeded = False
+        elif execution.status == CheckoutExecutionStatus.succeeded:
+            valid_unknown = (
+                cart.status == CartItemStatus.purchased
+                and execution.error_code is None
+                and execution.merchant_order_reference == session_id
+                and purchase is not None
+                and purchase.owner_id == owner_id
+                and purchase.agent_id == execution.agent_id
+                and purchase.payment_method_id == execution.payment_method_id
+                and purchase.amount == execution.approved_amount
+                and purchase.currency.upper() == execution.currency.upper()
+                and purchase.provider_reference == session_id
+                and purchase.merchant_order_reference == session_id
+                and purchase.receipt_url == receipt_url
+                and latest_transition is not None
+                and latest_transition.status == CheckoutExecutionStatus.succeeded
+                and latest_transition.attempt_count == execution.attempt_count
+                and len(events) in {1, 2}
+                and events_are_bound
+                and events[-1].status == CheckoutExecutionStatus.succeeded
+                and events[-1].error_code is None
+                and events[-1].purchase_id == purchase.id
+                and (
+                    len(events) == 1
+                    or (
+                        events[0].status == CheckoutExecutionStatus.outcome_unknown
+                        and events[0].error_code == CheckoutErrorCode.payment_outcome_unknown.value
+                        and events[0].purchase_id is None
+                    )
+                )
+            )
+            already_succeeded = True
+        else:
+            raise CheckoutError(CheckoutErrorCode.execution_invalid)
+        if not valid_unknown:
+            raise CheckoutError(CheckoutErrorCode.execution_invalid)
+
+        return HostedReconciliationCandidate(
+            execution_id=execution.id,
+            cart_item_id=cart.id,
+            owner_id=owner_id,
+            agent_id=execution.agent_id,
+            payment_method_id=execution.payment_method_id,
+            stripe_session_id=session_id,
+            approved_title=cart.title,
+            amount=execution.approved_amount,
+            amount_minor=amount_minor,
+            currency=execution.currency.upper(),
+            receipt_url=receipt_url,
+            already_succeeded=already_succeeded,
+        )
+
+    @staticmethod
+    def proof_matches_candidate(
+        proof: HostedPaymentProof,
+        candidate: HostedReconciliationCandidate,
+    ) -> bool:
+        return (
+            proof.session_id == candidate.stripe_session_id
+            and proof.order_reference == candidate.stripe_session_id
+            and normalize_item_text(proof.offer_name)
+            == normalize_item_text(candidate.approved_title)
+            and proof.amount_minor == candidate.amount_minor
+            and proof.currency.upper() == candidate.currency
+        )
 
     async def _load_and_validate_locked(
         self,

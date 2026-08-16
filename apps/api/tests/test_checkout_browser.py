@@ -31,6 +31,7 @@ class FakeElement:
         value: str | None = None,
         visible: bool = True,
         href: str | None = None,
+        attributes: dict[str, str] | None = None,
         clicked: Callable[[], None] | None = None,
     ) -> None:
         self.name = name
@@ -39,6 +40,7 @@ class FakeElement:
         self.value = value
         self.visible = visible
         self.href = href
+        self.attributes = attributes or {}
         self.clicked = clicked
 
     async def count(self) -> int:
@@ -78,7 +80,7 @@ class FakeElement:
             self.clicked()
 
     async def get_attribute(self, name: str) -> str | None:
-        return self.href if name == "href" else None
+        return self.href if name == "href" else self.attributes.get(name)
 
     async def element_handle(self) -> "FakeElement":
         return self
@@ -526,6 +528,229 @@ async def test_hosted_checkout_accepts_stripes_implicit_single_quantity() -> Non
 
     checkout = BrowserbaseCheckout(FakeGateway(FakeBrowser(page)))  # type: ignore[arg-type]
     await checkout._verify_item(page, checkout_context, ("https://checkout.stripe.com",))
+
+
+async def test_hosted_checkout_accepts_product_description_as_implicit_one() -> None:
+    events: list[str] = []
+    checkout_url = "https://checkout.stripe.com/c/pay/cs_test_session123#fixture"
+    main = FakeFrame(
+        checkout_url,
+        {
+            "#product-title": [FakeElement("product-title", events, text="Ship fuel")],
+            "#quantity": [
+                FakeElement(
+                    "quantity",
+                    events,
+                    text=(
+                        "A one-time support purchase for AG Pay development. "
+                        "No physical item or subscription."
+                    ),
+                )
+            ],
+        },
+    )
+    page = FakePage(main.url, [main], {})
+    hosted_adapter = adapter(
+        allowed_origins=("https://checkout.stripe.com",),
+        payment_origins=("https://checkout.stripe.com",),
+        checkout_mode="stripe_hosted_test",
+    )
+    checkout_context = replace(
+        context(hosted_adapter),
+        approved_title="Ship fuel",
+        checkout_url=checkout_url,
+        checkout_origin="https://checkout.stripe.com",
+        approved_quantity=1,
+    )
+
+    checkout = BrowserbaseCheckout(FakeGateway(FakeBrowser(page)))  # type: ignore[arg-type]
+    await checkout._verify_item(page, checkout_context, ("https://checkout.stripe.com",))
+
+
+@pytest.mark.parametrize(
+    ("checkout_mode", "approved_quantity", "description"),
+    [
+        ("stripe_hosted_test", 1, "Qty 2, €5.00 each"),
+        ("stripe_hosted_test", 1, "Quantity 2, €5.00 each"),
+        ("stripe_hosted_test", 1, "Qty two, €5.00 each"),
+        ("stripe_hosted_test", 1, "Qty 1, Qty 2"),
+        ("stripe_hosted_test", 2, "A one-time support purchase."),
+        ("direct", 1, "A one-time support purchase."),
+    ],
+)
+async def test_checkout_rejects_nonmatching_or_unverifiable_quantity(
+    checkout_mode: str,
+    approved_quantity: int,
+    description: str,
+) -> None:
+    events: list[str] = []
+    checkout_url = "https://checkout.stripe.com/c/pay/cs_test_session123#fixture"
+    main = FakeFrame(
+        checkout_url,
+        {
+            "#product-title": [FakeElement("product-title", events, text="Ship fuel")],
+            "#quantity": [FakeElement("quantity", events, text=description)],
+        },
+    )
+    page = FakePage(main.url, [main], {})
+    checkout_adapter = adapter(
+        allowed_origins=("https://checkout.stripe.com",),
+        payment_origins=("https://checkout.stripe.com",),
+        checkout_mode=checkout_mode,
+    )
+    checkout_context = replace(
+        context(checkout_adapter),
+        approved_title="Ship fuel",
+        checkout_url=checkout_url,
+        checkout_origin="https://checkout.stripe.com",
+        approved_quantity=approved_quantity,
+    )
+
+    checkout = BrowserbaseCheckout(FakeGateway(FakeBrowser(page)))  # type: ignore[arg-type]
+    with pytest.raises(CheckoutError) as caught:
+        await checkout._verify_item(
+            page,
+            checkout_context,
+            ("https://checkout.stripe.com",),
+        )
+
+    assert caught.value.code == CheckoutErrorCode.quantity_mismatch
+
+
+async def test_hosted_implicit_one_rejects_ambiguous_quantity_elements() -> None:
+    events: list[str] = []
+    checkout_url = "https://checkout.stripe.com/c/pay/cs_test_session123#fixture"
+    main = FakeFrame(
+        checkout_url,
+        {
+            "#product-title": [FakeElement("product-title", events, text="Ship fuel")],
+            "#quantity": [
+                FakeElement("quantity-one", events, text="Description one"),
+                FakeElement("quantity-two", events, text="Description two"),
+            ],
+        },
+    )
+    page = FakePage(main.url, [main], {})
+    hosted_adapter = adapter(
+        allowed_origins=("https://checkout.stripe.com",),
+        payment_origins=("https://checkout.stripe.com",),
+        checkout_mode="stripe_hosted_test",
+    )
+    checkout_context = replace(
+        context(hosted_adapter),
+        approved_title="Ship fuel",
+        checkout_url=checkout_url,
+        checkout_origin="https://checkout.stripe.com",
+        approved_quantity=1,
+    )
+
+    checkout = BrowserbaseCheckout(FakeGateway(FakeBrowser(page)))  # type: ignore[arg-type]
+    with pytest.raises(CheckoutError) as caught:
+        await checkout._verify_item(
+            page,
+            checkout_context,
+            ("https://checkout.stripe.com",),
+        )
+
+    assert caught.value.code == CheckoutErrorCode.quantity_mismatch
+
+
+@pytest.mark.parametrize(
+    ("marker_session", "receipt_session", "succeeds"),
+    [
+        ("cs_test_session123", "cs_test_session123", True),
+        ("cs_test_different123", "cs_test_different123", False),
+        ("cs_test_session123", "cs_test_different123", False),
+    ],
+)
+async def test_keyless_hosted_checkout_requires_result_bound_to_fixed_session(
+    marker_session: str,
+    receipt_session: str,
+    succeeds: bool,
+) -> None:
+    events: list[str] = []
+    checkout_url = "https://checkout.stripe.com/c/pay/cs_test_session123#fixture"
+    success_url = f"https://letyouragentspay.com/playground/success?session_id={receipt_session}"
+    success_selector = '#agpay-payment-verification[data-agpay-payment-status="verified"]'
+    marker = FakeElement(
+        "verified-payment",
+        events,
+        attributes={
+            "data-agpay-stripe-session-id": marker_session,
+            "data-agpay-order-reference": marker_session,
+            "data-agpay-offer": "managed-checkout",
+            "data-agpay-amount-minor": "2500",
+            "data-agpay-currency": "eur",
+        },
+    )
+    result_frame = FakeFrame(success_url, {success_selector: [marker]})
+    page: FakePage
+
+    def redirect_to_verified_result() -> None:
+        page.url = success_url
+        page.frames = [result_frame]
+
+    checkout_frame = FakeFrame(
+        checkout_url,
+        {
+            "#product-title": [FakeElement("product-title", events, text="Managed checkout")],
+            "#quantity": [FakeElement("quantity", events, text="Qty 2, EUR 12.50 each")],
+            "#total": [FakeElement("total", events, text="EUR 25.00")],
+            "#name": [FakeElement("name", events)],
+            "#email": [FakeElement("email", events)],
+            "#number": [FakeElement("number", events)],
+            "#expiry": [FakeElement("expiry", events)],
+            "#cvc": [FakeElement("cvc", events)],
+            "#submit": [FakeElement("submit", events, clicked=redirect_to_verified_result)],
+        },
+    )
+    page = FakePage(checkout_url, [checkout_frame], {})
+    hosted_adapter = adapter(
+        allowed_origins=("https://checkout.stripe.com", "https://letyouragentspay.com"),
+        payment_origins=("https://checkout.stripe.com",),
+        result_origins=("https://letyouragentspay.com",),
+        checkout_mode="stripe_hosted_test",
+        success_selector=success_selector,
+        order_reference_selector=None,
+        receipt_url_selector=None,
+    )
+    checkout_context = replace(
+        context(hosted_adapter),
+        checkout_url=checkout_url,
+        checkout_origin="https://checkout.stripe.com",
+    )
+    checkout = BrowserbaseCheckout(
+        FakeGateway(FakeBrowser(page)),  # type: ignore[arg-type]
+        result_timeout_seconds=0.01,
+    )
+
+    async def load_card() -> IssuingCardSecret:
+        return IssuingCardSecret("4242424242424242", "123", 12, 2030)
+
+    async def nothing(_: str = "") -> None:
+        return None
+
+    if not succeeds:
+        with pytest.raises(CheckoutError) as caught:
+            await checkout.run(
+                checkout_context,
+                load_card=load_card,
+                on_session_started=nothing,
+                prepare_submission=nothing,
+                mark_submitted=nothing,
+            )
+        assert caught.value.code == CheckoutErrorCode.payment_outcome_unknown
+        return
+
+    result = await checkout.run(
+        checkout_context,
+        load_card=load_card,
+        on_session_started=nothing,
+        prepare_submission=nothing,
+        mark_submitted=nothing,
+    )
+    assert result.order_reference == "cs_test_session123"
+    assert result.receipt_url == success_url
 
 
 async def test_browser_checkout_rejects_unapproved_frame_before_loading_card() -> None:

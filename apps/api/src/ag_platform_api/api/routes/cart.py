@@ -11,6 +11,8 @@ from ag_platform_api.api.dependencies import (
     Broker,
     CurrentUser,
     DatabaseSession,
+    DatabaseSessionFactory,
+    PaymentVerifier,
 )
 from ag_platform_api.core.security import decrypt_secret, verify_password
 from ag_platform_api.models import (
@@ -28,6 +30,12 @@ from ag_platform_api.schemas import (
     CredentialRevealRequest,
     HumanCartItemRead,
 )
+from ag_platform_api.services.checkout.reconciliation import (
+    CheckoutReconciliationService,
+    ReconciliationError,
+    ReconciliationErrorCode,
+)
+from ag_platform_api.services.checkout.repository import SqlAlchemyCheckoutRepository
 from ag_platform_api.services.checkout_queue import CheckoutQueueError, queue_checkout_execution
 from ag_platform_api.services.serializers import human_cart_item_read
 
@@ -105,6 +113,45 @@ async def get_cart_item(
     db: DatabaseSession,
 ) -> HumanCartItemRead:
     return human_cart_item_read(await owned_cart_item(db, user.id, cart_item_id))
+
+
+@router.post("/{cart_item_id}/checkout/reconcile", response_model=HumanCartItemRead)
+async def reconcile_checkout(
+    cart_item_id: UUID,
+    user: CurrentUser,
+    db: DatabaseSession,
+    session_factory: DatabaseSessionFactory,
+    settings: AppSettings,
+    verifier: PaymentVerifier,
+    broker: Broker,
+) -> HumanCartItemRead:
+    service = CheckoutReconciliationService(
+        repository=SqlAlchemyCheckoutRepository(session_factory),
+        verifier=verifier,
+        settings=settings,
+    )
+    try:
+        notification = await service.reconcile(owner_id=user.id, cart_item_id=cart_item_id)
+    except ReconciliationError as error:
+        if error.code == ReconciliationErrorCode.not_found:
+            status_code = 404
+        elif error.code == ReconciliationErrorCode.unavailable:
+            status_code = 503
+        else:
+            status_code = 409
+        raise HTTPException(status_code=status_code, detail=error.safe_message) from error
+
+    if notification is not None:
+        await broker.publish(
+            "checkout.succeeded",
+            {
+                "execution_id": notification.execution_id,
+                "cart_item_id": notification.cart_item_id,
+                "status": notification.status.value,
+                "purchase_id": notification.purchase_id,
+            },
+        )
+    return human_cart_item_read(await load_cart_item(db, cart_item_id))
 
 
 @router.post("/{cart_item_id}/approve", response_model=HumanCartItemRead)
