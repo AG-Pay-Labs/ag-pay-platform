@@ -466,6 +466,30 @@ async def test_assignment_removed_after_prepare_blocks_submission_without_retryi
     assert execution and execution.submitted_at is None
 
 
+async def test_card_expiring_after_prepare_blocks_submission(
+    checkout_db: tuple[SessionMaker, SqlAlchemyCheckoutRepository],
+) -> None:
+    session_factory, repository = checkout_db
+    execution_id = await seed_execution(session_factory)
+    await repository.claim_next(lease_seconds=120, max_attempts=3)
+    await repository.prepare(execution_id)
+    async with session_factory() as session, session.begin():
+        execution = await session.get(CheckoutExecution, execution_id)
+        assert execution is not None
+        payment_method = await session.get(PaymentMethod, execution.payment_method_id)
+        assert payment_method is not None
+        payment_method.expiry_month = 12
+        payment_method.expiry_year = 2020
+
+    with pytest.raises(CheckoutError) as caught:
+        await repository.mark_submitted(execution_id, "session_12345")
+
+    assert caught.value.code == CheckoutErrorCode.payment_method_expired
+    async with session_factory() as session:
+        execution = await session.get(CheckoutExecution, execution_id)
+    assert execution is not None and execution.submitted_at is None
+
+
 async def test_checkout_url_changed_after_prepare_blocks_submission(
     checkout_db: tuple[SessionMaker, SqlAlchemyCheckoutRepository],
 ) -> None:

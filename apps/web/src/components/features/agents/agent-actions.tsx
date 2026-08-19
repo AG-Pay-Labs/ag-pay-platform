@@ -90,7 +90,8 @@ export function AgentCardAssignmentsDialog({ agent }: { agent: AgentRead }) {
             <CreditCard className="mx-auto mb-3 size-6 text-muted-foreground" />
             <p className="font-medium">No active payment methods</p>
             <p className="mt-1 text-sm text-muted-foreground">
-              Add a sandbox/tokenized method on the Cards page first.
+              Add a direct, sandbox, or provider-backed method on the Cards page
+              first.
             </p>
           </div>
         ) : (

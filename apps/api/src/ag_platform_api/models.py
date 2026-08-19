@@ -189,12 +189,29 @@ class PaymentMethod(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     assigned_agents: Mapped[list["AgentPaymentMethod"]] = relationship(
         back_populates="payment_method", cascade="all, delete-orphan"
     )
+    stored_card_credential: Mapped["StoredCardCredential | None"] = relationship(
+        back_populates="payment_method", cascade="all, delete-orphan", uselist=False
+    )
 
     __table_args__ = (
         UniqueConstraint(
             "owner_id", "provider", "provider_payment_method_id", name="provider_reference"
         ),
     )
+
+
+class StoredCardCredential(TimestampMixin, Base):
+    __tablename__ = "stored_card_credentials"
+
+    payment_method_id: Mapped[UUID] = mapped_column(
+        ForeignKey("payment_methods.id", ondelete="CASCADE"), primary_key=True
+    )
+    owner_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    encrypted_pan: Mapped[str] = mapped_column(Text, nullable=False)
+
+    payment_method: Mapped[PaymentMethod] = relationship(back_populates="stored_card_credential")
 
 
 class AgentPaymentMethod(TimestampMixin, Base):
@@ -298,6 +315,7 @@ class CheckoutExecution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     adapter_key: Mapped[str] = mapped_column(String(64), nullable=False)
     adapter_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    resolved_form_config: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     approved_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     checkout_origin: Mapped[str] = mapped_column(String(512), nullable=False)

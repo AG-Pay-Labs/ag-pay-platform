@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ag_platform_api.core.config import (
+    LOCAL_DIRECT_CARD_PROVIDER,
     STRIPE_HOSTED_TEST_ADAPTER_KEY,
     Settings,
     normalize_checkout_origin,
@@ -18,10 +19,11 @@ from ag_platform_api.models import (
     CheckoutStatusTransition,
     PaymentMethod,
     PaymentMethodStatus,
+    StoredCardCredential,
 )
 from ag_platform_api.services.checkout.errors import CheckoutError
 from ag_platform_api.services.checkout.origins import validate_stripe_hosted_test_checkout_url
-from ag_platform_api.services.checkout.types import decimal_to_minor
+from ag_platform_api.services.checkout.types import decimal_to_minor, is_card_expired
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,11 @@ async def queue_checkout_execution(
         decimal_to_minor(item.unit_price * item.quantity, item.currency)
     except CheckoutError as error:
         raise CheckoutQueueError(f"checkout_{error.code.value}", error.safe_message) from None
+    if is_card_expired(payment_method.expiry_month, payment_method.expiry_year):
+        raise CheckoutQueueError(
+            "payment_method_expired",
+            "The approved payment method has expired",
+        )
     issuing_method = payment_method.provider == "stripe_issuing" and re.fullmatch(
         r"ic_[A-Za-z0-9]+", payment_method.provider_payment_method_id
     )
@@ -100,7 +107,13 @@ async def queue_checkout_execution(
             "pm_stripe_demo_3ds",
         }
     )
-    if not issuing_method and not link_method and not demo_method:
+    direct_card_method = (
+        settings.environment.lower() in {"development", "test"}
+        and settings.local_direct_card_enabled
+        and payment_method.provider == LOCAL_DIRECT_CARD_PROVIDER
+        and re.fullmatch(r"ldc_[A-Za-z0-9_-]+", payment_method.provider_payment_method_id)
+    )
+    if not issuing_method and not link_method and not demo_method and not direct_card_method:
         raise CheckoutQueueError(
             "checkout_provider_unsupported",
             "Managed checkout requires an assigned supported payment method",
@@ -136,6 +149,29 @@ async def queue_checkout_execution(
             "checkout_provider_unsupported",
             "Stripe-hosted test checkout requires a configured demo payment method",
         )
+    if direct_card_method and (
+        adapter.checkout_mode != "direct"
+        or adapter.payment_form_strategy != "browserbase_ai"
+        or adapter.order_reference_selector is None
+    ):
+        raise CheckoutQueueError(
+            "checkout_adapter_invalid",
+            "Stored direct cards require an AI-mapped direct adapter with an order reference",
+        )
+    if direct_card_method:
+        stored_credential = await db.scalar(
+            select(StoredCardCredential.payment_method_id)
+            .where(
+                StoredCardCredential.payment_method_id == payment_method.id,
+                StoredCardCredential.owner_id == item.owner_id,
+            )
+            .with_for_update()
+        )
+        if stored_credential is None:
+            raise CheckoutQueueError(
+                "checkout_provider_unsupported",
+                "The stored direct-card credential is unavailable",
+            )
     if adapter.checkout_mode == "stripe_hosted_test":
         try:
             validate_stripe_hosted_test_checkout_url(item.checkout_url)

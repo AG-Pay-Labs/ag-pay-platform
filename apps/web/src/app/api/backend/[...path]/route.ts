@@ -24,6 +24,7 @@ const ALLOWED_ROUTES: ReadonlyArray<readonly [string, RegExp]> = [
   ["DELETE", new RegExp(`^/agents/${UUID}/payment-methods/${UUID}$`)],
   ["GET", /^\/payment-methods$/],
   ["POST", /^\/payment-methods$/],
+  ["POST", /^\/payment-methods\/direct-card$/],
   ["DELETE", new RegExp(`^/payment-methods/${UUID}$`)],
   ["GET", /^\/payment-policies$/],
   ["PATCH", new RegExp(`^/agents/${UUID}/payment-policy$`)],

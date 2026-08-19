@@ -14,6 +14,7 @@ from ag_platform_api.core.security import decode_access_token, hash_opaque_token
 from ag_platform_api.db.session import SessionFactory, get_db
 from ag_platform_api.models import Agent, AgentStatus, User
 from ag_platform_api.services.broker import EventBroker
+from ag_platform_api.services.checkout.cvc_broker import LocalDirectCardCvcClient
 from ag_platform_api.services.checkout.reconciliation import (
     LandingPaymentVerificationClient,
     TrustedPaymentVerifier,
@@ -111,3 +112,20 @@ def get_broker(request: Request) -> EventBroker:
 
 
 Broker = Annotated[EventBroker, Depends(get_broker)]
+
+
+def get_direct_card_cvc_client(
+    settings: AppSettings,
+) -> LocalDirectCardCvcClient | None:
+    if not settings.local_direct_card_enabled or settings.local_direct_card_broker_token is None:
+        return None
+    return LocalDirectCardCvcClient(
+        socket_path=settings.local_direct_card_socket_path,
+        broker_token=settings.local_direct_card_broker_token.get_secret_value(),
+        timeout_seconds=settings.local_direct_card_socket_timeout_seconds,
+    )
+
+
+DirectCardCvcClient = Annotated[
+    LocalDirectCardCvcClient | None, Depends(get_direct_card_cvc_client)
+]

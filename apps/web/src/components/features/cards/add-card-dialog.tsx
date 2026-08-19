@@ -21,6 +21,7 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { apiRequest, getErrorMessage } from "@/lib/api-client";
 import type {
   BillingProfileType,
+  DirectCardPaymentMethodCreate,
   PaymentMethodCreate,
   PaymentMethodRead,
 } from "@/lib/api-types";
@@ -34,7 +35,7 @@ function optional(form: FormData, name: string) {
   return value(form, name) || null;
 }
 
-type SetupMode = "sandbox" | "link" | "reference";
+type SetupMode = "direct" | "sandbox" | "link" | "reference";
 
 export function AddCardDialog() {
   const queryClient = useQueryClient();
@@ -66,58 +67,85 @@ export function AddCardDialog() {
       address,
     };
 
-    const paymentMethodFields =
-      setupMode === "sandbox"
+    const billingDetails =
+      profileType === "personal"
         ? {
-            display_name: "Stripe sandbox Visa",
-            provider: "prototype-vault",
-            provider_payment_method_id: "pm_stripe_demo_success",
-            card_brand: "Visa",
-            card_last4: "4242",
-            expiry_month: 12,
-            expiry_year: 2034,
+            type: "personal" as const,
+            full_name: value(form, "full_name"),
+            ...shared,
           }
         : {
-            display_name:
-              setupMode === "link"
-                ? "Stripe Link wallet"
-                : value(form, "display_name"),
-            provider:
-              setupMode === "link" ? "stripe_link" : value(form, "provider"),
-            provider_payment_method_id: value(form, "provider_reference"),
-            card_brand: value(form, "card_brand"),
-            card_last4: value(form, "card_last4"),
-            expiry_month: Number(value(form, "expiry_month")),
-            expiry_year: Number(value(form, "expiry_year")),
+            type: "business" as const,
+            legal_name: value(form, "legal_name"),
+            vat_number: value(form, "vat_number"),
+            registration_number: optional(form, "registration_number"),
+            contact_name: value(form, "contact_name"),
+            ...shared,
           };
 
-    const payload: PaymentMethodCreate = {
-      ...paymentMethodFields,
-      billing_details:
-        profileType === "personal"
-          ? {
-              type: "personal",
-              full_name: value(form, "full_name"),
-              ...shared,
-            }
-          : {
-              type: "business",
-              legal_name: value(form, "legal_name"),
-              vat_number: value(form, "vat_number"),
-              registration_number: optional(form, "registration_number"),
-              contact_name: value(form, "contact_name"),
-              ...shared,
-            },
-    };
-
     try {
-      await apiRequest<PaymentMethodRead>("/payment-methods", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
+      if (setupMode === "direct") {
+        const panInput = event.currentTarget.elements.namedItem("card_number");
+        const payload: DirectCardPaymentMethodCreate = {
+          display_name: value(form, "display_name"),
+          card_number: value(form, "card_number").replace(/[\s-]/g, ""),
+          expiry_month: Number(value(form, "expiry_month")),
+          expiry_year: Number(value(form, "expiry_year")),
+          billing_details: billingDetails,
+        };
+        const serializedPayload = JSON.stringify(payload);
+        payload.card_number = "";
+        form.delete("card_number");
+        const request = apiRequest<PaymentMethodRead>(
+          "/payment-methods/direct-card",
+          {
+            method: "POST",
+            body: serializedPayload,
+          }
+        );
+        if (panInput instanceof HTMLInputElement) panInput.value = "";
+        await request;
+      } else {
+        const paymentMethodFields =
+          setupMode === "sandbox"
+            ? {
+                display_name: "Stripe sandbox Visa",
+                provider: "prototype-vault",
+                provider_payment_method_id: "pm_stripe_demo_success",
+                card_brand: "Visa",
+                card_last4: "4242",
+                expiry_month: 12,
+                expiry_year: 2034,
+              }
+            : {
+                display_name:
+                  setupMode === "link"
+                    ? "Stripe Link wallet"
+                    : value(form, "display_name"),
+                provider:
+                  setupMode === "link"
+                    ? "stripe_link"
+                    : value(form, "provider"),
+                provider_payment_method_id: value(form, "provider_reference"),
+                card_brand: value(form, "card_brand"),
+                card_last4: value(form, "card_last4"),
+                expiry_month: Number(value(form, "expiry_month")),
+                expiry_year: Number(value(form, "expiry_year")),
+              };
+        const payload: PaymentMethodCreate = {
+          ...paymentMethodFields,
+          billing_details: billingDetails,
+        };
+        await apiRequest<PaymentMethodRead>("/payment-methods", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+      }
       await queryClient.invalidateQueries({ queryKey: queryKeys.cards });
       toast.success(
-        setupMode === "link"
+        setupMode === "direct"
+          ? "Direct card added"
+          : setupMode === "link"
           ? "Stripe Link wallet added"
           : "Payment method added"
       );
@@ -141,9 +169,9 @@ export function AddCardDialog() {
         <DialogHeader>
           <DialogTitle>Add a payment method</DialogTitle>
           <DialogDescription>
-            Add the ready-to-use Stripe sandbox card for an end-to-end agent
-            checkout, connect a Stripe Link wallet, or register an existing
-            Stripe Issuing virtual card.
+            Store a card directly for local research, add the ready-to-use
+            Stripe sandbox card, connect a Stripe Link wallet, or register an
+            existing Stripe Issuing virtual card.
           </DialogDescription>
         </DialogHeader>
 
@@ -155,8 +183,13 @@ export function AddCardDialog() {
           <RadioGroup
             value={setupMode}
             onValueChange={(next) => setSetupMode(next as SetupMode)}
-            className="grid gap-3 sm:grid-cols-3"
+            className="grid gap-3 sm:grid-cols-2"
           >
+            <SetupChoice
+              value="direct"
+              title="Direct card"
+              description="Local research with encrypted card storage"
+            />
             <SetupChoice
               value="sandbox"
               title="Stripe sandbox card"
@@ -174,7 +207,18 @@ export function AddCardDialog() {
             />
           </RadioGroup>
 
-          {setupMode === "sandbox" ? (
+          {setupMode === "direct" ? (
+            <div className="flex gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
+              <ShieldCheck className="mt-0.5 size-4 shrink-0" />
+              <p>
+                <strong>Local research only.</strong> AG Pay stores the card
+                number encrypted. The CVC is not stored with the card; you will
+                enter it while approving each managed checkout, and it is held
+                only briefly for that checkout. Card credentials are never sent
+                to the agent.
+              </p>
+            </div>
+          ) : setupMode === "sandbox" ? (
             <div className="flex gap-3 rounded-lg border border-violet-200 bg-violet-50 p-3 text-sm text-violet-950 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-100">
               <FlaskConical className="mt-0.5 size-4 shrink-0" />
               <p>
@@ -234,7 +278,73 @@ export function AddCardDialog() {
             </div>
           )}
 
-          {setupMode === "link" ? (
+          {setupMode === "direct" ? (
+            <section className="space-y-3">
+              <div>
+                <h3 className="font-medium">Card details</h3>
+                <p className="text-xs text-muted-foreground">
+                  The API derives the brand and last four digits. AG Pay never
+                  returns the full card number after this request.
+                </p>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="sm:col-span-2">
+                  <Field
+                    label="Display name"
+                    name="display_name"
+                    placeholder="Personal Visa"
+                    maxLength={120}
+                  />
+                </div>
+                <div className="space-y-1.5 sm:col-span-2">
+                  <Label htmlFor="direct_card_pan">Card number</Label>
+                  <Input
+                    id="direct_card_pan"
+                    name="card_number"
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    placeholder="1234 5678 9012 3456"
+                    minLength={12}
+                    maxLength={23}
+                    pattern="[0-9 -]{12,23}"
+                    title="Enter 12 to 19 card digits; spaces and hyphens are allowed"
+                    aria-describedby="direct-card-pan-help"
+                    required
+                  />
+                  <p
+                    id="direct-card-pan-help"
+                    className="text-xs text-muted-foreground"
+                  >
+                    Enter 12 to 19 digits. This field is cleared as soon as the
+                    enrollment request is sent.
+                  </p>
+                </div>
+                <Field
+                  label="Expiry month"
+                  name="expiry_month"
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  max={12}
+                  placeholder="12"
+                  autoComplete="off"
+                />
+                <Field
+                  label="Expiry year"
+                  name="expiry_year"
+                  type="number"
+                  inputMode="numeric"
+                  min={new Date().getFullYear()}
+                  max={2200}
+                  placeholder="2030"
+                  autoComplete="off"
+                />
+              </div>
+            </section>
+          ) : setupMode === "link" ? (
             <section className="space-y-3">
               <div>
                 <h3 className="font-medium">Link wallet reference</h3>
@@ -490,9 +600,11 @@ export function AddCardDialog() {
             ) : (
               <ShieldCheck />
             )}
-            {setupMode === "sandbox"
-              ? "Add Stripe sandbox card"
-              : setupMode === "link"
+            {setupMode === "direct"
+              ? "Store direct card"
+              : setupMode === "sandbox"
+                ? "Add Stripe sandbox card"
+                : setupMode === "link"
                 ? "Add Stripe Link wallet"
                 : "Add payment method"}
           </Button>

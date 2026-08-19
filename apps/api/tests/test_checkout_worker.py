@@ -6,7 +6,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
 
+from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
 from ag_platform_api.models import CheckoutExecutionStatus
+from ag_platform_api.services.checkout.cvc_broker import CvcUnavailableError
+from ag_platform_api.services.checkout.direct_card import DirectCardPan
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
 from ag_platform_api.services.checkout.repository import (
     ClaimResult,
@@ -70,6 +73,7 @@ class FakeRepository:
         self.locked = False
         self.provider_reference: str | None = None
         self.retry_errors: list[CheckoutErrorCode] = []
+        self.retryable_errors: list[bool] = []
 
     @asynccontextmanager
     async def card_lock(self, card_id: str):
@@ -108,8 +112,16 @@ class FakeRepository:
     ) -> TerminalNotification | None:
         assert self.locked
         self.retry_errors.append(error.code)
+        self.retryable_errors.append(error.retryable)
         if not self.submitted:
-            return None
+            if error.retryable:
+                return None
+            return TerminalNotification(
+                self.context.execution_id,
+                self.context.cart_item_id,
+                CheckoutExecutionStatus.failed,
+                error.code.value,
+            )
         return TerminalNotification(
             self.context.execution_id,
             self.context.cart_item_id,
@@ -780,3 +792,276 @@ async def test_invalid_zero_decimal_amount_fails_before_browser_session_or_submi
     assert issuing.snapshot_calls == 0
     assert not repository.submitted
     assert repository.retry_errors == [CheckoutErrorCode.currency_precision_invalid]
+
+
+def local_direct_context() -> CheckoutContext:
+    context = worker_context()
+    return replace(
+        context,
+        adapter=replace(
+            context.adapter,
+            payment_form_strategy="browserbase_ai",
+            card_number_selector=None,
+            cvc_selector=None,
+            submit_selector=None,
+            expiry_selector=None,
+        ),
+        provider=LOCAL_DIRECT_CARD_PROVIDER,
+        provider_card_id="ldc_card123",
+    )
+
+
+class LocalDirectRepository(FakeRepository):
+    def __init__(self, context: CheckoutContext) -> None:
+        super().__init__(context)
+        self.saved_form: dict[str, object] | None = None
+        self.terminal_status: CheckoutExecutionStatus | None = None
+        self.terminal_error: CheckoutErrorCode | None = None
+
+    async def record_resolved_form_config(
+        self,
+        execution_id: object,
+        config: dict[str, object],
+    ) -> None:
+        assert execution_id == self.context.execution_id
+        assert self.locked
+        assert not self.submitted
+        self.saved_form = dict(config)
+
+    async def succeed(
+        self,
+        execution_id: object,
+        *,
+        provider_reference: str,
+        merchant_order_reference: str | None,
+        receipt_url: str | None,
+    ) -> TerminalNotification:
+        assert execution_id == self.context.execution_id
+        assert self.locked
+        assert self.submitted
+        assert provider_reference == merchant_order_reference == "order_local123"
+        assert receipt_url == "https://merchant.example.test/receipt/local"
+        self.provider_reference = provider_reference
+        self.terminal_status = CheckoutExecutionStatus.succeeded
+        return TerminalNotification(
+            self.context.execution_id,
+            self.context.cart_item_id,
+            CheckoutExecutionStatus.succeeded,
+            None,
+            uuid4(),
+        )
+
+    async def finish_terminal(
+        self,
+        execution_id: object,
+        *,
+        status: CheckoutExecutionStatus,
+        error_code: CheckoutErrorCode,
+        merchant_order_reference: str | None = None,
+    ) -> TerminalNotification:
+        assert execution_id == self.context.execution_id
+        assert self.locked
+        assert self.submitted
+        assert merchant_order_reference is None
+        self.terminal_status = status
+        self.terminal_error = error_code
+        return TerminalNotification(
+            self.context.execution_id,
+            self.context.cart_item_id,
+            status,
+            error_code.value,
+        )
+
+
+class FakeDirectCards:
+    def __init__(self, context: CheckoutContext) -> None:
+        self.context = context
+        self.calls = 0
+
+    async def retrieve_pan(self, **arguments: object) -> DirectCardPan:
+        self.calls += 1
+        assert arguments == {
+            "owner_id": self.context.owner_id,
+            "payment_method_id": self.context.payment_method_id,
+            "provider_card_id": self.context.provider_card_id,
+            "expected": self.context.card_metadata,
+        }
+        return DirectCardPan("4242424242424242", 12, 2030)
+
+
+class OneShotCvcStore:
+    def __init__(self, context: CheckoutContext) -> None:
+        self.context = context
+        self.calls = 0
+        self.consumed = False
+
+    async def take(self, **arguments: object) -> str:
+        self.calls += 1
+        assert arguments == {
+            "execution_id": self.context.execution_id,
+            "owner_id": self.context.owner_id,
+            "payment_method_id": self.context.payment_method_id,
+        }
+        if self.consumed:
+            raise CvcUnavailableError()
+        self.consumed = True
+        return "987"
+
+
+class LocalDirectBrowser(FakeBrowser):
+    def __init__(
+        self,
+        repository: FakeRepository,
+        *,
+        fail_after_load_before_submit: bool = False,
+        fail_after_submit: bool = False,
+    ) -> None:
+        super().__init__(repository)
+        self.fail_after_load_before_submit = fail_after_load_before_submit
+        self.fail_after_submit = fail_after_submit
+        self.loaded_secrets: list[tuple[str, str]] = []
+
+    async def run(
+        self,
+        context: CheckoutContext,
+        **callbacks: object,
+    ) -> BrowserCheckoutResult:
+        self.runs += 1
+        assert self.repository.locked
+        await callbacks["on_session_started"]("session_local123")  # type: ignore[operator]
+        await callbacks["on_form_mapped"](  # type: ignore[operator]
+            {
+                "card_number_selector": "#number",
+                "cvc_selector": "#security-code",
+                "submit_selector": "#pay",
+            }
+        )
+        await callbacks["prepare_submission"]()  # type: ignore[operator]
+        secret = await callbacks["load_card"]()  # type: ignore[operator]
+        self.loaded_secrets.append((secret.number, secret.cvc))
+        if self.fail_after_load_before_submit:
+            raise CheckoutError(CheckoutErrorCode.form_analysis_failed, retryable=True)
+        await callbacks["mark_submitted"]("session_local123")  # type: ignore[operator]
+        if self.fail_after_submit:
+            raise CheckoutError(CheckoutErrorCode.payment_form_not_found)
+        return BrowserCheckoutResult(
+            "order_local123",
+            "https://merchant.example.test/receipt/local",
+        )
+
+
+async def test_local_direct_worker_consumes_cvc_once_and_records_success() -> None:
+    context = local_direct_context()
+    repository = LocalDirectRepository(context)
+    browser = LocalDirectBrowser(repository)
+    direct_cards = FakeDirectCards(context)
+    cvcs = OneShotCvcStore(context)
+    broker = FakeBroker()
+    worker = CheckoutWorker(
+        repository=repository,  # type: ignore[arg-type]
+        browser=browser,  # type: ignore[arg-type]
+        issuing=None,
+        direct_cards=direct_cards,  # type: ignore[arg-type]
+        direct_card_cvcs=cvcs,
+        broker=broker,
+        lease_seconds=120,
+        max_attempts=3,
+        poll_seconds=0.01,
+    )
+
+    assert await worker.process_once()
+
+    assert direct_cards.calls == 1
+    assert cvcs.calls == 1
+    assert cvcs.consumed
+    assert browser.loaded_secrets == [("4242424242424242", "987")]
+    assert repository.saved_form == {
+        "card_number_selector": "#number",
+        "cvc_selector": "#security-code",
+        "submit_selector": "#pay",
+    }
+    assert repository.terminal_status == CheckoutExecutionStatus.succeeded
+    assert repository.provider_reference == "order_local123"
+    assert repository.retry_errors == []
+    assert broker.events[0][0] == "checkout.succeeded"
+
+
+async def test_local_direct_post_submit_browser_error_is_unknown_without_retry() -> None:
+    context = local_direct_context()
+    repository = LocalDirectRepository(context)
+    browser = LocalDirectBrowser(repository, fail_after_submit=True)
+    direct_cards = FakeDirectCards(context)
+    cvcs = OneShotCvcStore(context)
+    broker = FakeBroker()
+    worker = CheckoutWorker(
+        repository=repository,  # type: ignore[arg-type]
+        browser=browser,  # type: ignore[arg-type]
+        issuing=None,
+        direct_cards=direct_cards,  # type: ignore[arg-type]
+        direct_card_cvcs=cvcs,
+        broker=broker,
+        lease_seconds=120,
+        max_attempts=3,
+        poll_seconds=0.01,
+    )
+
+    assert await worker.process_once()
+
+    assert repository.submitted
+    assert browser.runs == 1
+    assert cvcs.calls == 1
+    assert cvcs.consumed
+    assert repository.retry_errors == []
+    assert repository.terminal_status == CheckoutExecutionStatus.outcome_unknown
+    assert repository.terminal_error == CheckoutErrorCode.payment_outcome_unknown
+    assert broker.events == [
+        (
+            "checkout.outcome_unknown",
+            {
+                "execution_id": context.execution_id,
+                "cart_item_id": context.cart_item_id,
+                "status": "outcome_unknown",
+                "error_code": "payment_outcome_unknown",
+            },
+        )
+    ]
+
+
+async def test_local_direct_never_retries_after_one_shot_cvc_is_consumed() -> None:
+    context = local_direct_context()
+    repository = LocalDirectRepository(context)
+    browser = LocalDirectBrowser(repository, fail_after_load_before_submit=True)
+    direct_cards = FakeDirectCards(context)
+    cvcs = OneShotCvcStore(context)
+    broker = FakeBroker()
+    worker = CheckoutWorker(
+        repository=repository,  # type: ignore[arg-type]
+        browser=browser,  # type: ignore[arg-type]
+        issuing=None,
+        direct_cards=direct_cards,  # type: ignore[arg-type]
+        direct_card_cvcs=cvcs,
+        broker=broker,
+        lease_seconds=120,
+        max_attempts=3,
+        poll_seconds=0.01,
+    )
+
+    assert await worker.process_once()
+
+    assert browser.runs == 1
+    assert not repository.submitted
+    assert direct_cards.calls == 1
+    assert cvcs.calls == 1 and cvcs.consumed
+    assert repository.retry_errors == [CheckoutErrorCode.card_security_code_unavailable]
+    assert repository.retryable_errors == [False]
+    assert broker.events == [
+        (
+            "checkout.failed",
+            {
+                "execution_id": context.execution_id,
+                "cart_item_id": context.cart_item_id,
+                "status": "failed",
+                "error_code": "card_security_code_unavailable",
+            },
+        )
+    ]

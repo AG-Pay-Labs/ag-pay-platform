@@ -8,8 +8,14 @@ from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
+from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
 from ag_platform_api.models import CheckoutExecutionStatus
 from ag_platform_api.services.checkout.browserbase import BrowserbaseCheckout
+from ag_platform_api.services.checkout.cvc_broker import (
+    CvcUnavailableError,
+    DirectCardCvcStore,
+)
+from ag_platform_api.services.checkout.direct_card import LocalDirectCardGateway
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
 from ag_platform_api.services.checkout.repository import (
     ClaimResult,
@@ -27,6 +33,7 @@ from ag_platform_api.services.checkout.types import (
     AuthorizationOutcome,
     AuthorizationResult,
     CheckoutContext,
+    IssuingCardSecret,
     decimal_to_minor,
 )
 
@@ -47,6 +54,8 @@ class CheckoutWorker:
         link: StripeLinkGateway | None = None,
         demo: StripePaymentsDemoGateway | None = None,
         demo_cards: StripeTestCardFixtures | None = None,
+        direct_cards: LocalDirectCardGateway | None = None,
+        direct_card_cvcs: DirectCardCvcStore | None = None,
         broker: BrokerLike | None,
         lease_seconds: int,
         max_attempts: int,
@@ -61,6 +70,8 @@ class CheckoutWorker:
         self._link = link
         self._demo = demo
         self._demo_cards = demo_cards or demo
+        self._direct_cards = direct_cards
+        self._direct_card_cvcs = direct_card_cvcs
         self._broker = broker
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
@@ -156,6 +167,10 @@ class CheckoutWorker:
             if self._link is None:
                 raise CheckoutError(CheckoutErrorCode.provider_unsupported)
             return await self._execute_link_context(context)
+        if context.provider == LOCAL_DIRECT_CARD_PROVIDER:
+            if self._direct_cards is None or self._direct_card_cvcs is None:
+                raise CheckoutError(CheckoutErrorCode.provider_unsupported)
+            return await self._execute_local_direct_context(context)
         raise CheckoutError(CheckoutErrorCode.provider_unsupported)
 
     def _provider_supported(self, context: CheckoutContext) -> bool:
@@ -163,6 +178,14 @@ class CheckoutWorker:
             return self._issuing is not None
         if context.provider == "stripe_link":
             return self._link is not None
+        if context.provider == LOCAL_DIRECT_CARD_PROVIDER:
+            return (
+                self._direct_cards is not None
+                and self._direct_card_cvcs is not None
+                and context.adapter.checkout_mode == "direct"
+                and context.adapter.payment_form_strategy == "browserbase_ai"
+                and context.provider_card_id.startswith("ldc_")
+            )
         return (
             context.provider == "prototype-vault"
             and (
@@ -173,6 +196,112 @@ class CheckoutWorker:
                 )
             )
             and context.provider_card_id in DEMO_REFERENCES
+        )
+
+    async def _execute_local_direct_context(
+        self,
+        context: CheckoutContext,
+    ) -> TerminalNotification | None:
+        if self._direct_cards is None or self._direct_card_cvcs is None:
+            raise CheckoutError(CheckoutErrorCode.provider_unsupported)
+        execution_id = context.execution_id
+        submitted_at: datetime | None = None
+        card_loaded = False
+
+        async def load_card() -> IssuingCardSecret:
+            nonlocal card_loaded
+            if card_loaded:
+                raise CheckoutError(CheckoutErrorCode.card_security_code_unavailable)
+            pan = await self._direct_cards.retrieve_pan(
+                owner_id=context.owner_id,
+                payment_method_id=context.payment_method_id,
+                provider_card_id=context.provider_card_id,
+                expected=context.card_metadata,
+            )
+            try:
+                cvc = await self._direct_card_cvcs.take(
+                    execution_id=context.execution_id,
+                    owner_id=context.owner_id,
+                    payment_method_id=context.payment_method_id,
+                )
+            except CvcUnavailableError:
+                del pan
+                raise CheckoutError(CheckoutErrorCode.card_security_code_unavailable) from None
+            card_loaded = True
+            try:
+                return IssuingCardSecret(
+                    number=pan.number,
+                    cvc=cvc,
+                    expiry_month=pan.expiry_month,
+                    expiry_year=pan.expiry_year,
+                )
+            finally:
+                del pan, cvc
+
+        async def on_session_started(session_id: str) -> None:
+            await self._repository.record_browser_session(execution_id, session_id)
+
+        async def on_form_mapped(config: dict[str, object]) -> None:
+            await self._repository.record_resolved_form_config(execution_id, config)
+
+        async def prepare_submission() -> None:
+            return None
+
+        async def mark_submitted(session_id: str) -> None:
+            nonlocal submitted_at
+            submitted_at = await self._repository.mark_submitted(execution_id, session_id)
+
+        try:
+            result = await self._browser.run(
+                context,
+                load_card=load_card,
+                on_session_started=on_session_started,
+                prepare_submission=prepare_submission,
+                mark_submitted=mark_submitted,
+                on_form_mapped=on_form_mapped,
+            )
+        except CheckoutError:
+            if submitted_at is None:
+                if card_loaded:
+                    raise CheckoutError(CheckoutErrorCode.card_security_code_unavailable) from None
+                raise
+            return await self._repository.finish_terminal(
+                execution_id,
+                status=CheckoutExecutionStatus.outcome_unknown,
+                error_code=CheckoutErrorCode.payment_outcome_unknown,
+            )
+        except Exception:
+            if submitted_at is None and card_loaded:
+                raise CheckoutError(CheckoutErrorCode.card_security_code_unavailable) from None
+            raise
+        if submitted_at is None:
+            raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
+        if result.outcome == AuthorizationOutcome.declined:
+            return await self._repository.finish_terminal(
+                execution_id,
+                status=CheckoutExecutionStatus.failed,
+                error_code=CheckoutErrorCode.payment_declined,
+                merchant_order_reference=result.order_reference,
+            )
+        if result.outcome == AuthorizationOutcome.action_required:
+            return await self._repository.finish_terminal(
+                execution_id,
+                status=CheckoutExecutionStatus.action_required,
+                error_code=CheckoutErrorCode.checkout_action_required,
+                merchant_order_reference=result.order_reference,
+            )
+        if result.outcome != AuthorizationOutcome.approved or result.order_reference is None:
+            return await self._repository.finish_terminal(
+                execution_id,
+                status=CheckoutExecutionStatus.outcome_unknown,
+                error_code=CheckoutErrorCode.payment_outcome_unknown,
+                merchant_order_reference=result.order_reference,
+            )
+        return await self._repository.succeed(
+            execution_id,
+            provider_reference=result.order_reference,
+            merchant_order_reference=result.order_reference,
+            receipt_url=result.receipt_url,
         )
 
     async def _execute_issuing_context(
