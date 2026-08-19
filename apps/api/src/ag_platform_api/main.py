@@ -43,7 +43,7 @@ app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
     description=(
-        "Backend for connecting autonomous agents, assigning tokenized payment methods, "
+        "Backend for connecting autonomous agents, assigning payment methods, "
         "approving purchase proposals, and tracking purchases and subscriptions."
     ),
     lifespan=lifespan,

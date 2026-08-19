@@ -7,6 +7,8 @@ from uuid import uuid4
 import pytest
 
 from ag_platform_api.services.checkout.browserbase import (
+    CARD_FIELD_PREFLIGHT_CLEANUP_SCRIPT,
+    CARD_FIELD_PREFLIGHT_SCRIPT,
     BrowserbaseCheckout,
     _PlaywrightBrowser,
 )
@@ -42,6 +44,7 @@ class FakeElement:
         self.href = href
         self.attributes = attributes or {}
         self.clicked = clicked
+        self.probe_markers: set[str] = set()
 
     async def count(self) -> int:
         return 1
@@ -64,6 +67,21 @@ class FakeElement:
 
     async def fill(self, _: str) -> None:
         self.events.append(f"fill:{self.name}")
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        if expression == CARD_FIELD_PREFLIGHT_SCRIPT:
+            assert isinstance(arg, dict) and isinstance(arg.get("marker"), str)
+            marker = arg["marker"]
+            if marker in self.probe_markers:
+                return False
+            self.probe_markers.add(marker)
+            return True
+        if expression == CARD_FIELD_PREFLIGHT_CLEANUP_SCRIPT:
+            assert isinstance(arg, str)
+            self.probe_markers.discard(arg)
+            return None
+        self.events.append(f"fill:{self.name}")
+        return None
 
     async def select_option(
         self,

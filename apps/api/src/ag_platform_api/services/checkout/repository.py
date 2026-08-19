@@ -15,6 +15,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
 from ag_platform_api.models import (
     Agent,
     AgentPaymentMethod,
@@ -29,6 +30,7 @@ from ag_platform_api.models import (
     PaymentMethodStatus,
     Purchase,
     PurchaseStatus,
+    StoredCardCredential,
 )
 from ag_platform_api.services.checkout.errors import (
     SAFE_ERROR_MESSAGES,
@@ -46,6 +48,7 @@ from ag_platform_api.services.checkout.types import (
     CheckoutContext,
     ExpectedCardMetadata,
     decimal_to_minor,
+    is_card_expired,
     normalize_item_text,
 )
 
@@ -249,6 +252,11 @@ class SqlAlchemyCheckoutRepository:
                     expiry_year=payment_method.expiry_year,
                 ),
                 billing_details=deepcopy(payment_method.billing_details),
+                resolved_form_config=(
+                    deepcopy(execution.resolved_form_config)
+                    if isinstance(execution.resolved_form_config, Mapping)
+                    else None
+                ),
             )
 
     async def renew_lease(self, execution_id: UUID, *, lease_seconds: int) -> bool:
@@ -268,6 +276,22 @@ class SqlAlchemyCheckoutRepository:
         async with self._session_factory() as session, session.begin():
             execution = await self._running_execution_locked(session, execution_id)
             execution.browserbase_session_id = session_id
+
+    async def record_resolved_form_config(
+        self,
+        execution_id: UUID,
+        config: Mapping[str, object],
+    ) -> None:
+        snapshot = deepcopy(dict(config))
+        async with self._session_factory() as session, session.begin():
+            execution = await self._running_execution_locked(session, execution_id)
+            if execution.submitted_at is not None:
+                raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
+            if execution.resolved_form_config is not None:
+                if execution.resolved_form_config != snapshot:
+                    raise CheckoutError(CheckoutErrorCode.form_analysis_failed)
+                return
+            execution.resolved_form_config = snapshot
 
     async def record_provider_request(self, execution_id: UUID, request_id: str) -> str:
         """Persist the external request before any payment credential is retrieved."""
@@ -754,6 +778,8 @@ class SqlAlchemyCheckoutRepository:
             or cart.selected_payment_method_id != payment_method.id
         ):
             raise CheckoutError(CheckoutErrorCode.payment_method_unavailable)
+        if is_card_expired(payment_method.expiry_month, payment_method.expiry_year):
+            raise CheckoutError(CheckoutErrorCode.payment_method_expired)
         unresolved_sibling = await session.scalar(
             select(CheckoutExecution.id)
             .where(
@@ -795,6 +821,23 @@ class SqlAlchemyCheckoutRepository:
         validate_checkout_url(cart.checkout_url, adapter.allowed_origins)
         if normalize_origin(cart.checkout_url) != normalize_origin(execution.checkout_origin):
             raise CheckoutError(CheckoutErrorCode.origin_blocked)
+        if payment_method.provider == LOCAL_DIRECT_CARD_PROVIDER:
+            if (
+                adapter.checkout_mode != "direct"
+                or adapter.payment_form_strategy != "browserbase_ai"
+                or adapter.order_reference_selector is None
+            ):
+                raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+            credential = await session.scalar(
+                select(StoredCardCredential.payment_method_id)
+                .where(
+                    StoredCardCredential.payment_method_id == payment_method.id,
+                    StoredCardCredential.owner_id == execution.owner_id,
+                )
+                .with_for_update()
+            )
+            if credential is None:
+                raise CheckoutError(CheckoutErrorCode.card_unavailable)
         return execution, cart, agent, payment_method
 
     @staticmethod

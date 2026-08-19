@@ -10,6 +10,12 @@ from redis.exceptions import RedisError
 from ag_platform_api.core.config import CheckoutWorkerSettings, get_worker_settings
 from ag_platform_api.db.session import SessionFactory, engine
 from ag_platform_api.services.checkout.browserbase import BrowserbaseCheckout, BrowserbaseGateway
+from ag_platform_api.services.checkout.cvc_broker import (
+    DirectCardCvcStore,
+    LocalDirectCardCvcBroker,
+)
+from ag_platform_api.services.checkout.direct_card import LocalDirectCardGateway
+from ag_platform_api.services.checkout.form_mapping import StagehandCheckoutFormMapper
 from ag_platform_api.services.checkout.repository import SqlAlchemyCheckoutRepository
 from ag_platform_api.services.checkout.stripe_issuing import StripeIssuingGateway
 from ag_platform_api.services.checkout.stripe_link import StripeLinkGateway
@@ -41,7 +47,10 @@ class CheckoutRedisPublisher:
 
 
 def build_worker(
-    settings: CheckoutWorkerSettings, redis: Redis
+    settings: CheckoutWorkerSettings,
+    redis: Redis,
+    *,
+    direct_card_cvcs: DirectCardCvcStore | None = None,
 ) -> tuple[
     CheckoutWorker,
     BrowserbaseGateway,
@@ -56,8 +65,11 @@ def build_worker(
         settings.stripe_secret_key is None
         and not settings.checkout_demo_enabled
         and not settings.stripe_link_enabled
+        and not settings.local_direct_card_enabled
     ):
         raise RuntimeError("No checkout payment provider is configured.")
+    if settings.local_direct_card_enabled and direct_card_cvcs is None:
+        raise RuntimeError("The local direct-card CVC broker is not running.")
 
     # Link validates its executable and auth directory synchronously; fail before
     # allocating any network clients so startup errors cannot leak resources.
@@ -78,7 +90,15 @@ def build_worker(
         project_id=settings.browserbase_project_id,
         region=settings.browserbase_region,
         api_url=settings.browserbase_api_url,
-        session_timeout_seconds=settings.checkout_result_timeout_seconds + 60,
+        session_timeout_seconds=(
+            settings.checkout_result_timeout_seconds
+            + (
+                settings.checkout_form_analysis_timeout_seconds
+                if settings.local_direct_card_enabled
+                else 0
+            )
+            + 60
+        ),
     )
     issuing = (
         StripeIssuingGateway(
@@ -97,16 +117,36 @@ def build_worker(
         else None
     )
     demo_cards = StripeTestCardFixtures() if settings.checkout_demo_enabled else None
+    direct_cards = (
+        LocalDirectCardGateway(
+            SessionFactory,
+            encryption_key=settings.direct_card_encryption_key.get_secret_value(),
+        )
+        if settings.local_direct_card_enabled and settings.direct_card_encryption_key is not None
+        else None
+    )
+    form_mapper = (
+        StagehandCheckoutFormMapper(
+            browserbase_api_key=settings.browserbase_api_key.get_secret_value(),
+            model_name=settings.checkout_form_analysis_model,
+            timeout_seconds=settings.checkout_form_analysis_timeout_seconds,
+        )
+        if settings.local_direct_card_enabled
+        else None
+    )
     worker = CheckoutWorker(
         repository=SqlAlchemyCheckoutRepository(SessionFactory),
         browser=BrowserbaseCheckout(
             browserbase,
             result_timeout_seconds=settings.checkout_result_timeout_seconds,
+            form_mapper=form_mapper,
         ),
         issuing=issuing,
         link=link,
         demo=demo,
         demo_cards=demo_cards,
+        direct_cards=direct_cards,
+        direct_card_cvcs=direct_card_cvcs,
         broker=CheckoutRedisPublisher(redis),
         lease_seconds=settings.checkout_lease_seconds,
         max_attempts=settings.checkout_max_attempts,
@@ -133,8 +173,24 @@ async def run() -> None:
     browserbase: BrowserbaseGateway | None = None
     issuing: StripeIssuingGateway | None = None
     demo: StripePaymentsDemoGateway | None = None
+    cvc_broker: LocalDirectCardCvcBroker | None = None
     try:
-        worker, browserbase, issuing, demo = build_worker(settings, redis)
+        if (
+            settings.local_direct_card_enabled
+            and settings.local_direct_card_broker_token is not None
+        ):
+            cvc_broker = LocalDirectCardCvcBroker(
+                socket_path=settings.local_direct_card_socket_path,
+                broker_token=settings.local_direct_card_broker_token.get_secret_value(),
+                ttl_seconds=settings.local_direct_card_cvc_ttl_seconds,
+                timeout_seconds=settings.local_direct_card_socket_timeout_seconds,
+            )
+            await cvc_broker.start()
+        worker, browserbase, issuing, demo = build_worker(
+            settings,
+            redis,
+            direct_card_cvcs=cvc_broker,
+        )
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -150,6 +206,8 @@ async def run() -> None:
             await issuing.close()
         if demo is not None:
             await demo.close()
+        if cvc_broker is not None:
+            await cvc_broker.close()
         await redis.aclose()
         await engine.dispose()
 

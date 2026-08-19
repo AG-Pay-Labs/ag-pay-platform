@@ -35,10 +35,21 @@ import { Textarea } from "@/components/ui/textarea";
 import { apiRequest, getErrorMessage } from "@/lib/api-client";
 import type {
   AgentRead,
+  CartApproval,
   CartItemRead,
   CredentialReveal,
+  PaymentMethodRead,
 } from "@/lib/api-types";
 import { queryKeys, useAgentPaymentMethods } from "@/hooks/use-api-data";
+
+function isPaymentMethodUnexpired(
+  paymentMethod: Pick<PaymentMethodRead, "expiry_month" | "expiry_year">,
+  now = new Date(),
+) {
+  const expiryUtcMonth = paymentMethod.expiry_year * 12 + paymentMethod.expiry_month - 1;
+  const currentUtcMonth = now.getUTCFullYear() * 12 + now.getUTCMonth();
+  return expiryUtcMonth >= currentUtcMonth;
+}
 
 export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: AgentRead }) {
   const queryClient = useQueryClient();
@@ -48,10 +59,23 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const assigned = useAgentPaymentMethods(item.agent_id, open);
-  const activeCards = useMemo(
-    () => (assigned.data ?? []).filter((card) => card.status === "active"),
-    [assigned.data],
+  const selectableCards = useMemo(
+    () => {
+      const now = new Date();
+      return (assigned.data ?? []).filter(
+        (card) =>
+          card.status === "active" &&
+          isPaymentMethodUnexpired(card, now) &&
+          (hasManagedCheckout || card.provider !== "local_direct_card"),
+      );
+    },
+    [assigned.data, hasManagedCheckout],
   );
+  const selectedPaymentMethod = selectableCards.find(
+    (card) => card.id === selectedCard,
+  );
+  const requiresCvc =
+    hasManagedCheckout && selectedPaymentMethod?.provider === "local_direct_card";
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -59,18 +83,33 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
       setError("Select an assigned payment method.");
       return;
     }
+    const form = new FormData(event.currentTarget);
+    const cvcInput = event.currentTarget.elements.namedItem("cvc");
+    let cvc = requiresCvc ? String(form.get("cvc") ?? "").trim() : undefined;
+    if (requiresCvc && !/^\d{3,4}$/.test(cvc ?? "")) {
+      setError("Enter the 3 or 4 digit CVC for the selected direct card.");
+      if (cvcInput instanceof HTMLInputElement) cvcInput.focus();
+      return;
+    }
     setSubmitting(true);
     setError(null);
-    const form = new FormData(event.currentTarget);
 
     try {
-      const approved = await apiRequest<CartItemRead>(`/cart-items/${item.id}/approve`, {
+      const payload: CartApproval = {
+        payment_method_id: selectedCard,
+        note: String(form.get("note") ?? "").trim() || null,
+        ...(cvc ? { cvc } : {}),
+      };
+      const serializedPayload = JSON.stringify(payload);
+      delete payload.cvc;
+      form.delete("cvc");
+      cvc = undefined;
+      const request = apiRequest<CartItemRead>(`/cart-items/${item.id}/approve`, {
         method: "POST",
-        body: JSON.stringify({
-          payment_method_id: selectedCard,
-          note: String(form.get("note") ?? "").trim() || null,
-        }),
+        body: serializedPayload,
       });
+      if (cvcInput instanceof HTMLInputElement) cvcInput.value = "";
+      const approved = await request;
       await queryClient.invalidateQueries({ queryKey: queryKeys.cart });
       toast.success(
         approved.execution
@@ -80,6 +119,7 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
       setOpen(false);
     } catch (caught) {
       setError(getErrorMessage(caught, "Could not approve this proposal."));
+      if (cvcInput instanceof HTMLInputElement) cvcInput.focus();
     } finally {
       setSubmitting(false);
     }
@@ -89,6 +129,7 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
     <Dialog
       open={open}
       onOpenChange={(next) => {
+        if (submitting) return;
         setOpen(next);
         if (!next) {
           setSelectedCard("");
@@ -139,11 +180,15 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
               <div className="flex items-center gap-2 rounded-lg border p-4 text-sm text-muted-foreground">
                 <Loader2 className="size-4 animate-spin" /> Loading assigned cards
               </div>
-            ) : activeCards.length === 0 ? (
+            ) : selectableCards.length === 0 ? (
               <div className="rounded-lg border border-dashed p-4 text-sm">
-                <p className="font-medium">No active card is assigned</p>
+                <p className="font-medium">
+                  No compatible active, unexpired card is assigned
+                </p>
                 <p className="mt-1 text-muted-foreground">
-                  Assign a card to {agent?.name ?? "this agent"} before approving.
+                  {hasManagedCheckout
+                    ? `Assign an active, unexpired card to ${agent?.name ?? "this agent"} before approving.`
+                    : "Direct cards require managed checkout. Assign an active, unexpired provider-backed card to record this approval."}
                 </p>
                 <Button variant="outline" size="sm" className="mt-3" asChild>
                   <Link href="/agents">Manage agent cards</Link>
@@ -151,7 +196,7 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
               </div>
             ) : (
               <RadioGroup value={selectedCard} onValueChange={setSelectedCard} className="space-y-2">
-                {activeCards.map((card) => (
+                {selectableCards.map((card) => (
                   <Label
                     key={card.id}
                     htmlFor={`approval-card-${card.id}`}
@@ -171,6 +216,37 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
               </RadioGroup>
             )}
           </div>
+          {requiresCvc ? (
+            <div key={selectedCard} className="space-y-1.5">
+              <Label htmlFor={`approval-cvc-${item.id}`}>
+                Card security code (CVC)
+              </Label>
+              <Input
+                id={`approval-cvc-${item.id}`}
+                name="cvc"
+                type="password"
+                inputMode="numeric"
+                autoComplete="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                minLength={3}
+                maxLength={4}
+                pattern="[0-9]{3,4}"
+                title="Enter the 3 or 4 digit card security code"
+                aria-describedby={`approval-cvc-help-${item.id}`}
+                className="font-mono tracking-[0.3em]"
+                required
+              />
+              <p
+                id={`approval-cvc-help-${item.id}`}
+                className="text-xs leading-5 text-muted-foreground"
+              >
+                Required for this direct card only. It is sent with this
+                approval, held briefly for the queued checkout, and never added
+                to the stored card.
+              </p>
+            </div>
+          ) : null}
           <div className="space-y-1.5">
             <Label htmlFor={`approval-note-${item.id}`}>Decision note</Label>
             <Textarea
@@ -195,13 +271,17 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
         </form>
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => setOpen(false)}>
+          <Button
+            variant="outline"
+            onClick={() => setOpen(false)}
+            disabled={submitting}
+          >
             Back
           </Button>
           <Button
             type="submit"
             form={`approve-${item.id}`}
-            disabled={submitting || activeCards.length === 0}
+            disabled={submitting || selectableCards.length === 0}
           >
             {submitting ? <Loader2 className="animate-spin" /> : <ShieldCheck />}
             {hasManagedCheckout ? (

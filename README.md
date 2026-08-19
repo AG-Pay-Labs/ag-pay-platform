@@ -30,6 +30,23 @@ development-only Playground integration, not an arbitrary production-merchant ra
 Managed recurring checkout is intentionally rejected until merchant interval
 verification is implemented.
 
+A separate `local_direct_card` rail is implemented only for local
+development/test research. Its dedicated enrollment endpoint accepts a PAN,
+stores only Fernet-encrypted PAN in an owner-scoped PostgreSQL credential row,
+and derives the safe brand/last-four metadata returned by normal card APIs. It
+never stores CVC: the human supplies CVC with the managed-checkout approval,
+FastAPI stages it over an authenticated private Unix socket in worker-owned
+memory with a short TTL, and the worker consumes it once immediately before
+form fill. This rail requires an explicit operator-configured `direct` adapter
+with `payment_form_strategy=browserbase_ai` and an order-reference selector.
+Stagehand uses Browserbase `observe` only, before any PAN or CVC is loaded, to
+map empty payment/billing controls; validated selectors are frozen, while
+native JavaScript value setters and Playwright perform every fill and click.
+The model never receives card values and never acts on the page. A visible
+merchant success marker and order reference can create the local AG Pay
+purchase record, but that merchant-observed result is not issuer authorization,
+settlement proof, arbitrary-site support, or a production payment integration.
+
 For the complete multi-repository setup, including the AG Pay OpenClaw plugin
 and playground, follow the [base quick start](https://github.com/AG-Pay-Labs/ag-pay#quick-start).
 
@@ -118,6 +135,70 @@ The shared `.env` is only a local-development convenience. FastAPI uses a
 settings model that has no Browserbase or Stripe secret fields; production must
 inject those provider variables only into the checkout-worker process.
 
+### Local direct-card research rail
+
+This experiment is off by default and fails configuration outside
+`development` or `test`. In the untracked platform `.env`, enable checkout and
+provide distinct locally generated secrets:
+
+```dotenv
+ENVIRONMENT=development
+CHECKOUT_ENABLED=true
+LOCAL_DIRECT_CARD_ENABLED=true
+DIRECT_CARD_ENCRYPTION_KEY=generate-a-dedicated-fernet-key
+LOCAL_DIRECT_CARD_BROKER_TOKEN=generate-a-separate-random-token
+LOCAL_DIRECT_CARD_SOCKET_PATH=/tmp/agpay-direct-card/cvc.sock
+LOCAL_DIRECT_CARD_CVC_TTL_SECONDS=300
+LOCAL_DIRECT_CARD_SOCKET_TIMEOUT_SECONDS=2
+CHECKOUT_FORM_ANALYSIS_MODEL=google/gemini-2.5-flash
+CHECKOUT_FORM_ANALYSIS_TIMEOUT_SECONDS=120
+BROWSERBASE_API_KEY=your_browserbase_key
+BROWSERBASE_PROJECT_ID=your_browserbase_project_id
+CHECKOUT_ADAPTERS={"research_store":{"allowed_origins":["https://merchant.example.test"],"payment_origins":["https://merchant.example.test"],"checkout_mode":"direct","payment_form_strategy":"browserbase_ai","product_title_selector":"[data-test=product-title]","quantity_selector":"[data-test=quantity]","total_selector":"[data-test=total]","success_selector":"[data-test=success]","decline_selector":"[data-test=declined]","action_required_selector":"[data-test=action-required]","order_reference_selector":"[data-test=order-id]","receipt_url_selector":"[data-test=receipt]"}}
+```
+
+Generate the two values with the commands documented in `.env.example`; do not
+reuse the JWT or merchant-credential key. Replace the illustrative public HTTPS
+origin and selectors with a controlled research checkout. Run migrations, the
+API, web app, and `make checkout-worker`; the worker owns a 0700-style private
+parent directory and `0600` Unix socket, and therefore must be running before a
+direct-card approval can stage CVC. Add the
+card from **Cards**, assign it to an agent, and approve only a
+new managed proposal carrying the exact configured adapter and checkout URL.
+The approval dialog asks for CVC for that execution only. A missing/expired CVC
+fails safely and requires a new proposal/approval; it is never recovered from
+PostgreSQL, Redis, logs, or a file.
+
+For a controlled no-charge browser test, start the built-in fixture in another
+terminal:
+
+```bash
+make direct-card-fixture-run
+```
+
+It listens only on `127.0.0.1:8101`. Its `/checkout` page contains realistic
+card, split-expiry, billing, and submit controls, but its submit handler prevents
+navigation/network submission, clears the form, and reveals
+`#research-success` plus a generated `#research-order-reference`. Its CSP also
+sets `connect-src 'none'` and `form-action 'none'`; there is no processor and no
+charge. Use only Luhn-valid synthetic/test card values—never a live card.
+
+Browserbase cannot reach loopback, so expose only port `8101` through an
+operator-chosen HTTPS tunnel and configure its exact origin (no wildcard):
+
+```dotenv
+CHECKOUT_ADAPTERS={"direct-card-fixture":{"allowed_origins":["https://YOUR-FIXTURE-HOST"],"payment_origins":["https://YOUR-FIXTURE-HOST"],"checkout_mode":"direct","payment_form_strategy":"browserbase_ai","product_title_selector":"#research-product-title","quantity_selector":"#research-quantity","total_selector":"#research-total","success_selector":"#research-success:not([hidden])","order_reference_selector":"#research-order-reference"}}
+```
+
+Use `direct-card-fixture` and
+`https://YOUR-FIXTURE-HOST/checkout` in a new one-time proposal for exactly one
+**AG Pay direct-card research fixture** at `EUR 25.00`, then approve with a
+synthetic/test direct card and test CVC. A concrete public fixture is PAN
+`4242 4242 4242 4242`, any future expiry such as `12/2034`, and CVC `123`;
+these values are test data, never a live card. Do not tunnel the AG Pay API,
+PostgreSQL, Redis, or OpenClaw. This change has not run a live Browserbase E2E:
+that requires the operator's Browserbase credentials and chosen HTTPS tunnel.
+
 ## Run the web app
 
 Keep the API running and use another terminal from this repository:
@@ -134,8 +215,9 @@ server and defaults to `http://localhost:8000`. Do not expose it as a
 
 The management UI includes registration/login, an overview, compact
 OpenClaw/Hermes runtime cards with detail sheets, realistic but safely masked
-virtual cards, agent/card assignment, personal/business sandbox
-payment-method entry, per-agent approval rules at `/rules`, queues for
+virtual cards, agent/card assignment, personal/business sandbox/provider entry,
+the feature-gated local direct-card enrollment and approval-time CVC flow,
+per-agent approval rules at `/rules`, queues for
 proposed, approved, needs-attention, and historical items, ordered checkout
 status timelines, active Browserbase session inspection, terminal outcome
 toasts, merchant-credential reveal after password confirmation, purchases, and
@@ -170,13 +252,14 @@ transition rules.
 
 ## Card and payment boundary
 
-Never enter or add fields for raw PAN, CVC, PIN, or 3-D Secure secrets. The
-prototype card dialog accepts opaque fake/sandbox or Stripe test-mode Issuing
-references plus safe metadata such as brand, last four digits, expiry, and
-billing details. The managed worker verifies an Issuing reference and its
-provider-owned tenant binding immediately before use; the dialog itself does
-not verify it. A production integration still requires provider-hosted card
-onboarding.
+The normal provider-card dialog accepts opaque fake/sandbox, Link, or Stripe
+Issuing references plus safe metadata. The separate, feature-gated local
+research dialog accepts PAN but never CVC; PAN is encrypted before PostgreSQL
+persistence and is excluded from every response and event. CVC is accepted only
+with approval of a managed proposal using a stored local card and exists only
+transiently in request handling and then worker memory. PIN and 3-D Secure
+secrets are never accepted. Production still requires provider-hosted card
+onboarding rather than this local storage path.
 
 Human approval, or an eligible server-side policy decision for a legacy
 external-completion proposal, records the selected assigned method. A proposal
@@ -188,8 +271,13 @@ title, quantity, amount, and an explicit standalone ISO currency code to match
 the approval; retrieves a
 Stripe Issuing card only into process memory; fills it through deterministic
 Browserbase automation with recording and logging disabled; and records success
-only after matching issuer authorization. Raw PAN/CVC values are never stored,
-returned, logged, or sent to an LLM. Agents learn terminal managed-checkout
+only after matching issuer authorization. For `local_direct_card`, Stagehand
+observe maps empty form controls before secrets are loaded, deterministic
+JavaScript/Playwright performs injection, encrypted PAN remains at rest, and CVC
+is consumed from short-lived worker memory. Neither value is returned, logged,
+published to Redis, or sent to an LLM. Local direct-card success reflects only
+the configured merchant marker/order reference, not an issuer authorization.
+Agents learn terminal managed-checkout
 outcomes through their tenant-scoped cursor event feed and cannot self-report
 completion for those requests. The built-in development-only `stripe-hosted`
 rail hardcodes Browserbase recording and session logging on because it uses
@@ -224,4 +312,4 @@ make web-build
 ```
 
 See the base repository's `docs/` directory for product scope, architecture,
-API, payment/compliance boundaries, and operating guidance.
+API, managed-checkout boundaries, and operating guidance.

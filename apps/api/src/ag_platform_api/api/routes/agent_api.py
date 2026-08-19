@@ -14,6 +14,7 @@ from ag_platform_api.api.dependencies import (
     DatabaseSession,
 )
 from ag_platform_api.api.routes.cart import load_cart_item
+from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
 from ag_platform_api.core.security import encrypt_secret, hash_opaque_token, new_opaque_token
 from ag_platform_api.models import (
     Agent,
@@ -140,6 +141,7 @@ async def propose_cart_item(
                 AgentPaymentMethod.agent_id == agent.id,
                 PaymentMethod.owner_id == agent.owner_id,
                 PaymentMethod.status == PaymentMethodStatus.active,
+                PaymentMethod.provider != LOCAL_DIRECT_CARD_PROVIDER,
             )
             .order_by(AgentPaymentMethod.payment_method_id)
             .limit(1)

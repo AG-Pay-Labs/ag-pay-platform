@@ -9,7 +9,8 @@ Implemented areas:
 - registration, login, sign-out, and guarded application routes;
 - workspace overview and first-run setup guidance;
 - agent pairing, connection health, revocation, and card assignment;
-- personal/business billing profiles with safe sandbox payment references;
+- personal/business billing profiles with direct, sandbox, and provider-backed
+  payment methods;
 - purchase approval and cancellation queues;
 - re-authenticated, ephemeral merchant-credential reveal;
 - purchase audit history and local recurring-subscription tracking.
@@ -34,14 +35,19 @@ short-lived FastAPI JWT in an HttpOnly, `SameSite=Lax` cookie, while the human
 API proxy forwards only an explicit method/path allowlist. Agent-facing routes
 are intentionally unavailable through that proxy.
 
-Never add inputs for raw PAN, CVC, PIN, or 3-D Secure secrets. The current card
-form accepts only opaque provider references and safe display metadata.
+The local research-only direct-card form sends a PAN once to FastAPI through the
+allowlisted BFF; it is never returned to the browser or placed in client storage
+or query caches. CVC is collected only alongside approval for a compatible
+managed direct checkout and is never part of the stored payment method. Provider
+references and their display metadata remain supported alongside this local
+mode. Never add inputs for PIN or 3-D Secure secrets.
+
 For managed checkout, approval queues the trusted AG Pay executor only when a
-server-configured merchant adapter and compatible provider reference are
-available. The UI follows that execution from queued or running through its
-verified terminal outcome. Legacy approval instead authorizes the agent to
-complete checkout externally and report the result. Merchant subscription
-cancellation remains a separate provider operation in both flows.
+server-configured merchant adapter and compatible payment method are available.
+The UI follows that execution from queued or running through its verified
+terminal outcome. Legacy approval instead authorizes the agent to complete
+checkout externally and report the result. Merchant subscription cancellation
+remains a separate provider operation in both flows.
 
 ## Checks
 

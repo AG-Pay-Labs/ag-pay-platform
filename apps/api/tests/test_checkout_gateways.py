@@ -1,15 +1,18 @@
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from urllib.parse import parse_qsl
 from uuid import uuid4
 
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
 from ag_platform_api.checkout_worker import build_worker
 from ag_platform_api.core.config import (
     STRIPE_HOSTED_TEST_ADAPTER_KEY,
+    CheckoutAdapterSettings,
     CheckoutRuntimeSettings,
     CheckoutWorkerSettings,
     Settings,
@@ -60,6 +63,61 @@ def test_api_settings_never_load_worker_provider_secrets(monkeypatch) -> None:
     assert "demo-worker-only" not in repr(worker_settings)
     assert worker_settings.browserbase_api_key is not None
     assert worker_settings.stripe_secret_key is not None
+
+
+def test_local_direct_card_configuration_is_secret_and_development_only() -> None:
+    encryption_key = Fernet.generate_key().decode()
+    socket_path = Path("/tmp/agpay-config-test/cvc.sock")
+    configured = CheckoutRuntimeSettings(
+        _env_file=None,
+        environment="test",
+        checkout_enabled=True,
+        local_direct_card_enabled=True,
+        direct_card_encryption_key=encryption_key,
+        local_direct_card_broker_token="b" * 32,
+        local_direct_card_socket_path=socket_path,
+    )
+    assert configured.local_direct_card_enabled
+    assert encryption_key not in repr(configured)
+
+    with pytest.raises(ValidationError, match="development/test-only"):
+        CheckoutRuntimeSettings(
+            _env_file=None,
+            environment="production",
+            checkout_enabled=True,
+            local_direct_card_enabled=True,
+            direct_card_encryption_key=encryption_key,
+            local_direct_card_broker_token="b" * 32,
+            local_direct_card_socket_path=socket_path,
+        )
+    with pytest.raises(ValidationError, match="valid Fernet key"):
+        CheckoutRuntimeSettings(
+            _env_file=None,
+            environment="test",
+            checkout_enabled=True,
+            local_direct_card_enabled=True,
+            direct_card_encryption_key="not-a-key",
+            local_direct_card_broker_token="b" * 32,
+            local_direct_card_socket_path=socket_path,
+        )
+
+
+def test_ai_mapped_adapter_forbids_preconfigured_payment_controls() -> None:
+    base = {
+        "allowed_origins": ["https://merchant.example.test"],
+        "payment_origins": ["https://payments.example.test"],
+        "product_title_selector": "#title",
+        "quantity_selector": "#quantity",
+        "total_selector": "#total",
+        "success_selector": "#success",
+        "payment_form_strategy": "browserbase_ai",
+        "order_reference_selector": "#order",
+    }
+    adapter = CheckoutAdapterSettings.model_validate(base)
+    assert adapter.card_number_selector is None
+
+    with pytest.raises(ValidationError, match="discovers payment and submit selectors"):
+        CheckoutAdapterSettings.model_validate({**base, "card_number_selector": "#card-number"})
 
 
 def test_stripe_link_configuration_is_pinned_and_development_test_only(tmp_path) -> None:

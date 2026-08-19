@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
+from cryptography.fernet import Fernet
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -21,6 +22,7 @@ CheckoutSelector = Annotated[
 ]
 CHECKOUT_ADAPTER_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 STRIPE_HOSTED_TEST_ADAPTER_KEY = "stripe-hosted"
+LOCAL_DIRECT_CARD_PROVIDER = "local_direct_card"
 
 
 def normalize_checkout_origin(value: str) -> str:
@@ -49,15 +51,16 @@ class CheckoutAdapterSettings(BaseModel):
     resource_origins: list[str] = Field(default_factory=list, max_length=100)
     result_origins: list[str] = Field(default_factory=list, max_length=10)
     checkout_mode: Literal["direct", "stripe_hosted_test"] = "direct"
+    payment_form_strategy: Literal["configured", "browserbase_ai"] = "configured"
     product_title_selector: CheckoutSelector
     quantity_selector: CheckoutSelector
     total_selector: CheckoutSelector
-    card_number_selector: CheckoutSelector
+    card_number_selector: CheckoutSelector | None = None
     expiry_selector: CheckoutSelector | None = None
     expiry_month_selector: CheckoutSelector | None = None
     expiry_year_selector: CheckoutSelector | None = None
-    cvc_selector: CheckoutSelector
-    submit_selector: CheckoutSelector
+    cvc_selector: CheckoutSelector | None = None
+    submit_selector: CheckoutSelector | None = None
     success_selector: CheckoutSelector
     decline_selector: CheckoutSelector | None = None
     name_selector: CheckoutSelector | None = None
@@ -85,16 +88,40 @@ class CheckoutAdapterSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_selectors(self) -> "CheckoutAdapterSettings":
-        combined_expiry = self.expiry_selector is not None
-        split_expiry = (
-            self.expiry_month_selector is not None or self.expiry_year_selector is not None
+        configured_card_selectors = (
+            self.card_number_selector,
+            self.expiry_selector,
+            self.expiry_month_selector,
+            self.expiry_year_selector,
+            self.cvc_selector,
+            self.submit_selector,
         )
-        if combined_expiry == split_expiry:
-            raise ValueError("Configure either expiry_selector or expiry month and year selectors")
-        if split_expiry and (
-            self.expiry_month_selector is None or self.expiry_year_selector is None
-        ):
-            raise ValueError("Both expiry_month_selector and expiry_year_selector are required")
+        if self.payment_form_strategy == "browserbase_ai":
+            if self.checkout_mode != "direct":
+                raise ValueError("Browserbase AI form mapping requires direct checkout mode")
+            if any(value is not None for value in configured_card_selectors):
+                raise ValueError(
+                    "Browserbase AI form mapping discovers payment and submit selectors"
+                )
+        else:
+            combined_expiry = self.expiry_selector is not None
+            split_expiry = (
+                self.expiry_month_selector is not None or self.expiry_year_selector is not None
+            )
+            if combined_expiry == split_expiry:
+                raise ValueError(
+                    "Configure either expiry_selector or expiry month and year selectors"
+                )
+            if split_expiry and (
+                self.expiry_month_selector is None or self.expiry_year_selector is None
+            ):
+                raise ValueError("Both expiry month and year selectors are required")
+            if (
+                self.card_number_selector is None
+                or self.cvc_selector is None
+                or self.submit_selector is None
+            ):
+                raise ValueError("Configured payment forms require card, CVC, and submit selectors")
         for field_name in type(self).model_fields:
             if not field_name.endswith("_selector"):
                 continue
@@ -180,6 +207,16 @@ class CheckoutRuntimeSettings(BaseSettings):
     checkout_demo_observation_seconds: float = Field(default=30.0, ge=0, le=30)
     stripe_link_enabled: bool = False
     stripe_link_test_mode: bool = False
+    local_direct_card_enabled: bool = False
+    direct_card_encryption_key: SecretStr | None = None
+    local_direct_card_socket_path: Path = Path("/tmp/agpay-direct-card/cvc.sock")
+    local_direct_card_broker_token: SecretStr | None = None
+    local_direct_card_cvc_ttl_seconds: int = Field(default=300, ge=30, le=900)
+    local_direct_card_socket_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    checkout_form_analysis_model: str = Field(
+        default="google/gemini-2.5-flash", min_length=3, max_length=120
+    )
+    checkout_form_analysis_timeout_seconds: int = Field(default=120, ge=10, le=300)
 
     @field_validator("checkout_adapters")
     @classmethod
@@ -227,6 +264,36 @@ class CheckoutRuntimeSettings(BaseSettings):
             raise ValueError("Stripe Link checkout is development/test-only")
         if self.stripe_link_test_mode and not self.stripe_link_enabled:
             raise ValueError("STRIPE_LINK_TEST_MODE requires STRIPE_LINK_ENABLED")
+        return self
+
+    @model_validator(mode="after")
+    def validate_local_direct_card_mode(self) -> "CheckoutRuntimeSettings":
+        if not self.local_direct_card_enabled:
+            return self
+        if self.environment.lower() not in {"development", "test"}:
+            raise ValueError("LOCAL_DIRECT_CARD_ENABLED is development/test-only")
+        if not self.checkout_enabled:
+            raise ValueError("LOCAL_DIRECT_CARD_ENABLED requires CHECKOUT_ENABLED")
+        if self.direct_card_encryption_key is None:
+            raise ValueError("DIRECT_CARD_ENCRYPTION_KEY is required")
+        try:
+            Fernet(self.direct_card_encryption_key.get_secret_value().encode())
+        except (TypeError, ValueError):
+            raise ValueError("DIRECT_CARD_ENCRYPTION_KEY must be a valid Fernet key") from None
+        if (
+            self.local_direct_card_broker_token is None
+            or len(self.local_direct_card_broker_token.get_secret_value()) < 32
+        ):
+            raise ValueError("LOCAL_DIRECT_CARD_BROKER_TOKEN must contain at least 32 characters")
+        socket_path = self.local_direct_card_socket_path
+        if (
+            not socket_path.is_absolute()
+            or "\x00" in str(socket_path)
+            or len(str(socket_path)) > 96
+        ):
+            raise ValueError("LOCAL_DIRECT_CARD_SOCKET_PATH must be a short absolute path")
+        if not self.checkout_form_analysis_model.strip():
+            raise ValueError("CHECKOUT_FORM_ANALYSIS_MODEL is required")
         return self
 
 

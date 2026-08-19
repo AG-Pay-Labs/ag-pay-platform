@@ -146,6 +146,14 @@ export interface PaymentMethodCreate {
   billing_details: BillingDetails;
 }
 
+export interface DirectCardPaymentMethodCreate {
+  display_name: string;
+  card_number: string;
+  expiry_month: number;
+  expiry_year: number;
+  billing_details: BillingDetails;
+}
+
 export interface PaymentMethodRead {
   id: UUID;
   display_name: string;
@@ -241,6 +249,7 @@ export interface CartItemRead {
 export interface CartApproval {
   payment_method_id: UUID;
   note?: string | null;
+  cvc?: string;
 }
 
 export interface CartCancellation {

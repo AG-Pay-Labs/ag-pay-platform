@@ -4,6 +4,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from cryptography.fernet import Fernet
 from helpers import (
     API,
     assign_payment_method,
@@ -16,11 +17,14 @@ from helpers import (
     register_user,
 )
 from httpx import AsyncClient
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ag_platform_api.api.dependencies import get_payment_verifier
+from ag_platform_api.api.dependencies import (
+    get_direct_card_cvc_client,
+    get_payment_verifier,
+)
 from ag_platform_api.core.config import (
     STRIPE_HOSTED_TEST_ADAPTER_KEY,
     CheckoutAdapterSettings,
@@ -33,6 +37,7 @@ from ag_platform_api.models import (
     AgentPaymentMethod,
     AgentStatus,
     CartItem,
+    CartItemStatus,
     CheckoutEvent,
     CheckoutExecution,
     CheckoutExecutionStatus,
@@ -43,6 +48,7 @@ from ag_platform_api.models import (
     PurchaseCredential,
     User,
 )
+from ag_platform_api.services.checkout.cvc_broker import CvcBrokerError
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
 from ag_platform_api.services.checkout.repository import (
     HostedPaymentProof,
@@ -97,6 +103,85 @@ def enable_checkout(settings: Settings, **adapter_overrides: Any) -> None:
     settings.checkout_enabled = True
     settings.checkout_adapters = {
         "demo": CheckoutAdapterSettings.model_validate(adapter_payload(**adapter_overrides))
+    }
+
+
+def enable_direct_checkout(settings: Settings) -> None:
+    settings.checkout_enabled = True
+    settings.local_direct_card_enabled = True
+    settings.direct_card_encryption_key = SecretStr(Fernet.generate_key().decode())
+    settings.checkout_adapters = {
+        "direct-ai": CheckoutAdapterSettings.model_validate(
+            adapter_payload(
+                payment_form_strategy="browserbase_ai",
+                card_number_selector=None,
+                expiry_selector=None,
+                cvc_selector=None,
+                submit_selector=None,
+            )
+        )
+    }
+
+
+class FakeDirectCardCvcClient:
+    def __init__(self, *, fail_put: bool = False) -> None:
+        self.fail_put = fail_put
+        self.puts: list[tuple[UUID, UUID, UUID, str]] = []
+        self.discards: list[tuple[UUID, str]] = []
+
+    async def put(
+        self,
+        *,
+        execution_id: UUID,
+        owner_id: UUID,
+        payment_method_id: UUID,
+        cvc: str,
+    ) -> str:
+        if self.fail_put:
+            raise CvcBrokerError()
+        self.puts.append((execution_id, owner_id, payment_method_id, cvc))
+        return "receipt-bound-to-this-staging-operation"
+
+    async def discard(self, *, execution_id: UUID, receipt: str) -> None:
+        self.discards.append((execution_id, receipt))
+
+
+async def direct_card_wallet(
+    client: AsyncClient,
+    username: str,
+) -> dict[str, str]:
+    user_token = await register_user(client, username)
+    created_agent = await create_agent(client, user_token)
+    connected = await connect_agent(
+        client,
+        created_agent["pairing_token"],
+        instance_id=f"{username}-instance",
+    )
+    safe_fixture = personal_payment_method("pm_unused")
+    response = await client.post(
+        f"{API}/payment-methods/direct-card",
+        headers=bearer(user_token),
+        json={
+            "display_name": "Local research card",
+            "card_number": "4242 4242 4242 4242",
+            "expiry_month": safe_fixture["expiry_month"],
+            "expiry_year": safe_fixture["expiry_year"],
+            "billing_details": safe_fixture["billing_details"],
+        },
+    )
+    assert response.status_code == 201, response.text
+    payment_method = response.json()
+    await assign_payment_method(
+        client,
+        user_token,
+        created_agent["id"],
+        payment_method["id"],
+    )
+    return {
+        "user_token": user_token,
+        "agent_id": created_agent["id"],
+        "agent_token": connected["agent_access_token"],
+        "payment_method_id": payment_method["id"],
     }
 
 
@@ -173,6 +258,114 @@ async def set_auto_approval(client: AsyncClient, wallet: dict[str, str]) -> None
         json={"mode": "never"},
     )
     assert response.status_code == 200, response.text
+
+
+async def test_direct_card_approval_requires_and_stages_one_checkout_cvc(
+    client: AsyncClient,
+    settings: Settings,
+) -> None:
+    enable_direct_checkout(settings)
+    cvc_client = FakeDirectCardCvcClient()
+    app.dependency_overrides[get_direct_card_cvc_client] = lambda: cvc_client
+    wallet = await direct_card_wallet(client, "direct-approval")
+    proposed = await propose_managed(
+        client,
+        wallet,
+        suffix="direct-approval",
+        adapter="direct-ai",
+    )
+
+    missing = await client.post(
+        f"{API}/cart-items/{proposed['id']}/approve",
+        headers=bearer(wallet["user_token"]),
+        json={"payment_method_id": wallet["payment_method_id"]},
+    )
+    assert missing.status_code == 422
+    assert cvc_client.puts == []
+
+    approved = await client.post(
+        f"{API}/cart-items/{proposed['id']}/approve",
+        headers=bearer(wallet["user_token"]),
+        json={"payment_method_id": wallet["payment_method_id"], "cvc": "731"},
+    )
+
+    assert approved.status_code == 200, approved.text
+    assert '"cvc":' not in approved.text.casefold()
+    execution_id = UUID(approved.json()["execution"]["id"])
+    assert len(cvc_client.puts) == 1
+    staged_execution, _, staged_method, staged_cvc = cvc_client.puts[0]
+    assert staged_execution == execution_id
+    assert staged_method == UUID(wallet["payment_method_id"])
+    assert staged_cvc == "731"
+
+
+async def test_expired_direct_card_is_rejected_before_cvc_staging(
+    client: AsyncClient,
+    settings: Settings,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    enable_direct_checkout(settings)
+    cvc_client = FakeDirectCardCvcClient()
+    app.dependency_overrides[get_direct_card_cvc_client] = lambda: cvc_client
+    wallet = await direct_card_wallet(client, "direct-expired")
+    proposed = await propose_managed(
+        client,
+        wallet,
+        suffix="direct-expired",
+        adapter="direct-ai",
+    )
+    async with db_session_factory() as db, db.begin():
+        payment_method = await db.get(PaymentMethod, UUID(wallet["payment_method_id"]))
+        assert payment_method is not None
+        payment_method.expiry_month = 12
+        payment_method.expiry_year = 2020
+
+    response = await client.post(
+        f"{API}/cart-items/{proposed['id']}/approve",
+        headers=bearer(wallet["user_token"]),
+        json={"payment_method_id": wallet["payment_method_id"], "cvc": "731"},
+    )
+
+    assert response.status_code == 409
+    assert "expired" in response.text.casefold()
+    assert '"cvc":' not in response.text.casefold()
+    assert cvc_client.puts == []
+    async with db_session_factory() as db:
+        cart = await db.get(CartItem, UUID(proposed["id"]))
+        execution_count = await db.scalar(select(func.count()).select_from(CheckoutExecution))
+    assert cart is not None and cart.status is CartItemStatus.proposed
+    assert execution_count == 0
+
+
+async def test_direct_card_approval_rolls_back_when_memory_broker_is_unavailable(
+    client: AsyncClient,
+    settings: Settings,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    enable_direct_checkout(settings)
+    cvc_client = FakeDirectCardCvcClient(fail_put=True)
+    app.dependency_overrides[get_direct_card_cvc_client] = lambda: cvc_client
+    wallet = await direct_card_wallet(client, "direct-relay-failure")
+    proposed = await propose_managed(
+        client,
+        wallet,
+        suffix="direct-relay-failure",
+        adapter="direct-ai",
+    )
+
+    response = await client.post(
+        f"{API}/cart-items/{proposed['id']}/approve",
+        headers=bearer(wallet["user_token"]),
+        json={"payment_method_id": wallet["payment_method_id"], "cvc": "731"},
+    )
+
+    assert response.status_code == 503
+    assert '"cvc":' not in response.text.casefold()
+    async with db_session_factory() as db:
+        cart = await db.get(CartItem, UUID(proposed["id"]))
+        execution_count = await db.scalar(select(func.count()).select_from(CheckoutExecution))
+    assert cart is not None and cart.status is CartItemStatus.proposed
+    assert execution_count == 0
 
 
 async def unknown_hosted_demo_checkout(

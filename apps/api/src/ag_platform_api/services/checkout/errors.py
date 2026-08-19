@@ -18,8 +18,11 @@ class CheckoutErrorCode(StrEnum):
     authorization_snapshot_failed = "authorization_snapshot_failed"
     card_reference_invalid = "card_reference_invalid"
     card_unavailable = "card_unavailable"
+    payment_method_expired = "payment_method_expired"
+    card_security_code_unavailable = "card_security_code_unavailable"
     card_reconciliation_required = "card_reconciliation_required"
     adapter_invalid = "adapter_invalid"
+    form_analysis_failed = "form_analysis_failed"
     origin_blocked = "origin_blocked"
     item_mismatch = "item_mismatch"
     quantity_mismatch = "quantity_mismatch"
@@ -58,10 +61,15 @@ SAFE_ERROR_MESSAGES: dict[CheckoutErrorCode, str] = {
     ),
     CheckoutErrorCode.card_reference_invalid: "The payment card reference is invalid.",
     CheckoutErrorCode.card_unavailable: "The approved virtual card is unavailable.",
+    CheckoutErrorCode.payment_method_expired: "The approved payment method has expired.",
+    CheckoutErrorCode.card_security_code_unavailable: (
+        "The card security code is no longer available; approve a new checkout."
+    ),
     CheckoutErrorCode.card_reconciliation_required: (
         "The virtual card is quarantined until an unresolved checkout is reconciled."
     ),
     CheckoutErrorCode.adapter_invalid: "The merchant checkout adapter is invalid.",
+    CheckoutErrorCode.form_analysis_failed: "The payment form could not be mapped safely.",
     CheckoutErrorCode.origin_blocked: "Checkout attempted to leave an approved origin.",
     CheckoutErrorCode.item_mismatch: "The merchant item does not match the approved item.",
     CheckoutErrorCode.quantity_mismatch: "The merchant quantity does not match the approval.",

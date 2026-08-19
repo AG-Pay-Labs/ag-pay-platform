@@ -52,18 +52,19 @@ export default function CardsPage() {
       <PageHeader
         eyebrow="Payment permissions"
         title="Cards"
-        description="Test the checkout flow in Stripe's sandbox, connect a US Stripe Link wallet, or manage provider-tokenized virtual cards."
+        description="Store a card for local direct checkout research, test Stripe's sandbox, connect Stripe Link, or manage provider-tokenized cards."
         actions={<AddCardDialog />}
       />
 
       <div className="mb-6 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
         <ShieldAlert className="mt-0.5 size-4 shrink-0" />
         <p>
-          Never enter raw card credentials. Managed checkout supports only
-          server-configured provider references; sensitive values are retrieved
-          inside the trusted executor and are never returned to the browser or
-          agent. Stripe Link also requires a separate approval in Link before
-          it releases a one-time payment credential.
+          Direct-card storage is a local research feature. The full card number
+          is submitted once and stored encrypted; it is never returned to this
+          browser or sent to an agent. CVC is entered only when approving a
+          managed checkout and is held briefly for that checkout. Stripe Link
+          still requires its separate approval before releasing a one-time
+          payment credential.
         </p>
       </div>
 
@@ -78,7 +79,7 @@ export default function CardsPage() {
         <EmptyState
           icon={CreditCard}
           title="No payment methods"
-          description="Add the Stripe sandbox card, assign it to an agent, and use it for a supervised test checkout."
+          description="Store a direct card or add the Stripe sandbox card, assign it to an agent, and use it for a supervised checkout."
           action={<AddCardDialog />}
         />
       ) : null}
@@ -182,7 +183,9 @@ function VirtualCard({ card }: { card: PaymentMethodRead }) {
             {card.display_name}
           </p>
           <p className="mt-0.5 truncate text-[10px] font-medium tracking-[0.16em] text-white/65 uppercase">
-            {card.provider} · virtual
+            {card.provider === "local_direct_card"
+              ? "Encrypted direct card"
+              : `${card.provider} · provider reference`}
           </p>
         </div>
         <div className="text-right">

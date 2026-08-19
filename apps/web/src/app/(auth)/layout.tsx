@@ -34,7 +34,7 @@ export default function AuthLayout({ children }: { children: React.ReactNode }) 
 
         <div className="flex items-center gap-2 text-xs text-zinc-500">
           <ShieldCheck className="size-3.5" />
-          Sandbox and provider-tokenized references only
+          Supervised checkout with local research card support
         </div>
       </section>
       <section className="flex min-h-svh items-center justify-center px-5 py-10 sm:px-8">
