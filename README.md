@@ -22,7 +22,8 @@ documented launch gates; development/test also has an explicit, keyless
 `stripe-hosted` Stripe Payments rail. A proposal supplies a concrete merchant-created
 `checkout.stripe.com/c/pay/cs_test_...` URL. After approval, the worker opens that
 exact URL, verifies its displayed product and total, fills Stripe's hosted page
-through Browserbase with a public Stripe test-card fixture, and accepts success
+through Browserbase with either an assigned public Stripe test-card fixture or
+an assigned local direct credential selected during approval, and accepts success
 only from the allowlisted `letyouragentspay.com` result page after that server
 verifies the same Checkout Session. The worker neither creates a substitute
 Checkout Session nor loads the merchant's Stripe credentials. This remains a
@@ -37,8 +38,10 @@ and derives the safe brand/last-four metadata returned by normal card APIs. It
 never stores CVC: the human supplies CVC with the managed-checkout approval,
 FastAPI stages it over an authenticated private Unix socket in worker-owned
 memory with a short TTL, and the worker consumes it once immediately before
-form fill. This rail requires an explicit operator-configured `direct` adapter
-with `payment_form_strategy=browserbase_ai` and an order-reference selector.
+form fill. It can use the pinned development-only `stripe-hosted` adapter for a
+concrete Stripe test Checkout Session. Other merchants require an explicit
+operator-configured `direct` adapter with `payment_form_strategy=browserbase_ai`
+and an order-reference selector.
 Stagehand uses Browserbase `observe` only, before any PAN or CVC is loaded, to
 map empty payment/billing controls; validated selectors are frozen, while
 native JavaScript value setters and Playwright perform every fill and click.
@@ -117,6 +120,9 @@ The rail requires both demo flags and a development/test environment, but no
 Stripe secret or publishable key. The older direct-adapter fixture remains
 available through `make demo-merchant-run` when adapter development specifically
 needs it; that legacy rail still requires `STRIPE_DEMO_SECRET_KEY=sk_test_...`.
+An assigned `local_direct_card` may also be selected for this pinned hosted test
+rail; approval requires its CVC, and Browserbase recording and session logging
+remain disabled whenever that credential type is selected.
 The keyless rail can prove only a server-verified successful redirect. A decline,
 3DS challenge, missing redirect, timeout, or conflicting result after submission
 is persisted as `outcome_unknown`; it is never retried or claimed as a
@@ -280,8 +286,9 @@ the configured merchant marker/order reference, not an issuer authorization.
 Agents learn terminal managed-checkout
 outcomes through their tenant-scoped cursor event feed and cannot self-report
 completion for those requests. The built-in development-only `stripe-hosted`
-rail hardcodes Browserbase recording and session logging on because it uses
-only public Stripe test-card fixtures. It records success only when the landing
+rail enables Browserbase recording and session logging only when it uses public
+Stripe test-card fixtures; both remain disabled for local direct credentials. It
+records success only when the landing
 server's pinned verification marker binds the approved amount and currency, the
 receipt query, and the submitted fixed URL to the same `cs_test_...` session;
 missing or conflicting evidence becomes `outcome_unknown`. Issuing and

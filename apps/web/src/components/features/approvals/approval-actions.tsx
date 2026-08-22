@@ -33,6 +33,7 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Textarea } from "@/components/ui/textarea";
 import { apiRequest, getErrorMessage } from "@/lib/api-client";
+import { cn } from "@/lib/utils";
 import type {
   AgentRead,
   CartApproval,
@@ -200,7 +201,12 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
                   <Label
                     key={card.id}
                     htmlFor={`approval-card-${card.id}`}
-                    className="flex cursor-pointer items-center gap-3 rounded-lg border p-3 has-data-[state=checked]:border-primary has-data-[state=checked]:ring-2 has-data-[state=checked]:ring-primary/15"
+                    onClick={() => setSelectedCard(card.id)}
+                    className={cn(
+                      "flex cursor-pointer items-center gap-3 rounded-lg border p-3",
+                      selectedCard === card.id &&
+                        "border-primary ring-2 ring-primary/15",
+                    )}
                   >
                     <RadioGroupItem id={`approval-card-${card.id}`} value={card.id} />
                     <SafeCardLabel

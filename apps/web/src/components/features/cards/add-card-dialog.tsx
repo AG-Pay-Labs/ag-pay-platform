@@ -626,7 +626,7 @@ function SetupChoice({
   return (
     <Label
       htmlFor={`setup-${value}`}
-      className="flex cursor-pointer items-start gap-3 rounded-lg border bg-card p-3 has-data-[state=checked]:border-primary has-data-[state=checked]:ring-2 has-data-[state=checked]:ring-primary/15"
+      className="flex cursor-pointer items-start gap-3 rounded-lg border bg-card p-3 has-[[data-state=checked]]:border-primary has-[[data-state=checked]]:ring-2 has-[[data-state=checked]]:ring-primary/15"
     >
       <RadioGroupItem id={`setup-${value}`} value={value} className="mt-0.5" />
       <span>
@@ -651,7 +651,7 @@ function ProfileChoice({
   return (
     <Label
       htmlFor={`profile-${value}`}
-      className="flex cursor-pointer items-start gap-3 rounded-lg border bg-card p-3 has-data-[state=checked]:border-primary has-data-[state=checked]:ring-2 has-data-[state=checked]:ring-primary/15"
+      className="flex cursor-pointer items-start gap-3 rounded-lg border bg-card p-3 has-[[data-state=checked]]:border-primary has-[[data-state=checked]]:ring-2 has-[[data-state=checked]]:ring-primary/15"
     >
       <RadioGroupItem
         id={`profile-${value}`}

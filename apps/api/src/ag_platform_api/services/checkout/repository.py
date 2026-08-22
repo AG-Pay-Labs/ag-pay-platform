@@ -15,7 +15,10 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
+from ag_platform_api.core.config import (
+    LOCAL_DIRECT_CARD_PROVIDER,
+    STRIPE_HOSTED_TEST_ADAPTER_KEY,
+)
 from ag_platform_api.models import (
     Agent,
     AgentPaymentMethod,
@@ -60,7 +63,6 @@ TERMINAL_STATUSES = frozenset(
         CheckoutExecutionStatus.outcome_unknown,
     }
 )
-STRIPE_HOSTED_ADAPTER_KEY = "stripe-hosted"
 STRIPE_CHECKOUT_ORIGIN = "https://checkout.stripe.com"
 TRUSTED_RESULT_ORIGIN = "https://letyouragentspay.com"
 TRUSTED_RECEIPT_PATH = "/playground/success"
@@ -596,8 +598,8 @@ class SqlAlchemyCheckoutRepository:
         if (
             cart.agent_id != execution.agent_id
             or cart.selected_payment_method_id != execution.payment_method_id
-            or execution.adapter_key != STRIPE_HOSTED_ADAPTER_KEY
-            or cart.checkout_adapter != STRIPE_HOSTED_ADAPTER_KEY
+            or execution.adapter_key != STRIPE_HOSTED_TEST_ADAPTER_KEY
+            or cart.checkout_adapter != STRIPE_HOSTED_TEST_ADAPTER_KEY
             or cart.checkout_url is None
             or cart.billing_period is not None
             or execution.submitted_at is None
@@ -822,11 +824,16 @@ class SqlAlchemyCheckoutRepository:
         if normalize_origin(cart.checkout_url) != normalize_origin(execution.checkout_origin):
             raise CheckoutError(CheckoutErrorCode.origin_blocked)
         if payment_method.provider == LOCAL_DIRECT_CARD_PROVIDER:
-            if (
-                adapter.checkout_mode != "direct"
-                or adapter.payment_form_strategy != "browserbase_ai"
-                or adapter.order_reference_selector is None
-            ):
+            direct_ai_adapter = (
+                adapter.checkout_mode == "direct"
+                and adapter.payment_form_strategy == "browserbase_ai"
+                and adapter.order_reference_selector is not None
+            )
+            hosted_test_adapter = (
+                execution.adapter_key == STRIPE_HOSTED_TEST_ADAPTER_KEY
+                and adapter.checkout_mode == "stripe_hosted_test"
+            )
+            if not (direct_ai_adapter or hosted_test_adapter):
                 raise CheckoutError(CheckoutErrorCode.adapter_invalid)
             credential = await session.scalar(
                 select(StoredCardCredential.payment_method_id)

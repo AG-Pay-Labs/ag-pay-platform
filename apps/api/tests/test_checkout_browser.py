@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
 from ag_platform_api.services.checkout.browserbase import (
     CARD_FIELD_PREFLIGHT_CLEANUP_SCRIPT,
     CARD_FIELD_PREFLIGHT_SCRIPT,
@@ -439,9 +440,14 @@ async def test_browser_checkout_supports_split_expiry_fields() -> None:
     assert "fill:year" in events
 
 
-async def test_hosted_checkout_parses_localized_facts_selects_country_and_observes_provider() -> (
-    None
-):
+@pytest.mark.parametrize(
+    ("provider", "expected_recording"),
+    [("stripe_issuing", True), (LOCAL_DIRECT_CARD_PROVIDER, False)],
+)
+async def test_hosted_checkout_parses_localized_facts_selects_country_and_observes_provider(
+    provider: str,
+    expected_recording: bool,
+) -> None:
     events: list[str] = []
     country = CapturingSelectElement("country", events)
     main_elements = {
@@ -474,6 +480,7 @@ async def test_hosted_checkout_parses_localized_facts_selects_country_and_observ
         context(hosted_adapter),
         checkout_url=checkout_url,
         checkout_origin="https://checkout.stripe.com",
+        provider=provider,
         billing_details={
             "full_name": "Alex Example",
             "email": "alex@example.test",
@@ -519,8 +526,8 @@ async def test_hosted_checkout_parses_localized_facts_selects_country_and_observ
         "https://example.com",
         "https://checkout.stripe.com",
     )
-    assert gateway.record_session is True
-    assert gateway.log_session is True
+    assert gateway.record_session is expected_recording
+    assert gateway.log_session is expected_recording
     assert browser.closed
 
 

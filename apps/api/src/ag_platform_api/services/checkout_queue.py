@@ -144,19 +144,27 @@ async def queue_checkout_execution(
         raise CheckoutQueueError(
             "checkout_adapter_unknown", "The requested checkout adapter is not configured"
         )
-    if adapter.checkout_mode == "stripe_hosted_test" and not (demo_method or link_method):
+    hosted_direct_method = (
+        direct_card_method
+        and item.checkout_adapter == STRIPE_HOSTED_TEST_ADAPTER_KEY
+        and adapter.checkout_mode == "stripe_hosted_test"
+    )
+    if adapter.checkout_mode == "stripe_hosted_test" and not (
+        demo_method or link_method or hosted_direct_method
+    ):
         raise CheckoutQueueError(
             "checkout_provider_unsupported",
             "Stripe-hosted test checkout requires a configured demo payment method",
         )
-    if direct_card_method and (
-        adapter.checkout_mode != "direct"
-        or adapter.payment_form_strategy != "browserbase_ai"
-        or adapter.order_reference_selector is None
-    ):
+    direct_ai_method = (
+        adapter.checkout_mode == "direct"
+        and adapter.payment_form_strategy == "browserbase_ai"
+        and adapter.order_reference_selector is not None
+    )
+    if direct_card_method and not (direct_ai_method or hosted_direct_method):
         raise CheckoutQueueError(
             "checkout_adapter_invalid",
-            "Stored direct cards require an AI-mapped direct adapter with an order reference",
+            "Stored direct cards require a compatible managed-checkout adapter",
         )
     if direct_card_method:
         stored_credential = await db.scalar(

@@ -510,6 +510,38 @@ async def test_hosted_checkout_queues_one_pinned_frozen_adapter_snapshot(
     assert frozen.checkout_url == STRIPE_HOSTED_TEST_CHECKOUT_URL
 
 
+async def test_hosted_checkout_accepts_an_assigned_local_direct_card(
+    client: AsyncClient,
+    settings: Settings,
+) -> None:
+    settings.checkout_enabled = True
+    settings.checkout_demo_enabled = True
+    settings.checkout_hosted_demo_enabled = True
+    settings.checkout_adapters = {STRIPE_HOSTED_TEST_ADAPTER_KEY: stripe_hosted_test_adapter()}
+    cvc_client = FakeDirectCardCvcClient()
+    app.dependency_overrides[get_direct_card_cvc_client] = lambda: cvc_client
+    wallet = await direct_card_wallet(client, "hosted-direct-card")
+    proposed = await propose_managed(
+        client,
+        wallet,
+        suffix="hosted-direct-card",
+        adapter=STRIPE_HOSTED_TEST_ADAPTER_KEY,
+        checkout_url=STRIPE_HOSTED_TEST_CHECKOUT_URL,
+    )
+
+    approval = await client.post(
+        f"{API}/cart-items/{proposed['id']}/approve",
+        headers=bearer(wallet["user_token"]),
+        json={"payment_method_id": wallet["payment_method_id"], "cvc": "731"},
+    )
+
+    assert approval.status_code == 200, approval.text
+    assert approval.json()["execution"]["status"] == "queued"
+    assert len(cvc_client.puts) == 1
+    assert cvc_client.puts[0][2] == UUID(wallet["payment_method_id"])
+    assert cvc_client.puts[0][3] == "731"
+
+
 async def test_owner_reconciles_unknown_hosted_payment_once_and_releases_card(
     client: AsyncClient,
     settings: Settings,

@@ -8,7 +8,10 @@ from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
-from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
+from ag_platform_api.core.config import (
+    LOCAL_DIRECT_CARD_PROVIDER,
+    STRIPE_HOSTED_TEST_ADAPTER_KEY,
+)
 from ag_platform_api.models import CheckoutExecutionStatus
 from ag_platform_api.services.checkout.browserbase import BrowserbaseCheckout
 from ag_platform_api.services.checkout.cvc_broker import (
@@ -179,11 +182,17 @@ class CheckoutWorker:
         if context.provider == "stripe_link":
             return self._link is not None
         if context.provider == LOCAL_DIRECT_CARD_PROVIDER:
+            compatible_adapter = (
+                context.adapter.checkout_mode == "direct"
+                and context.adapter.payment_form_strategy == "browserbase_ai"
+            ) or (
+                context.adapter_key == STRIPE_HOSTED_TEST_ADAPTER_KEY
+                and context.adapter.checkout_mode == "stripe_hosted_test"
+            )
             return (
                 self._direct_cards is not None
                 and self._direct_card_cvcs is not None
-                and context.adapter.checkout_mode == "direct"
-                and context.adapter.payment_form_strategy == "browserbase_ai"
+                and compatible_adapter
                 and context.provider_card_id.startswith("ldc_")
             )
         return (

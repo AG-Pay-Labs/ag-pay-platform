@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
+from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
 from ag_platform_api.services.checkout.form_mapping import (
     CheckoutFormMapper,
@@ -335,12 +336,15 @@ class BrowserbaseCheckout:
             raise CheckoutError(CheckoutErrorCode.origin_blocked)
         checkout_url = validate_checkout_url(context.checkout_url, merchant_origins)
         observe_test_session = adapter.checkout_mode == "stripe_hosted_test"
+        record_public_test_session = (
+            observe_test_session and context.provider != LOCAL_DIRECT_CARD_PROVIDER
+        )
         if observe_test_session:
             checkout_url = validate_stripe_hosted_test_checkout_url(checkout_url)
         session = await self._gateway.create_session(
             allowed_origins + payment_origins + resource_origins,
-            record_session=observe_test_session,
-            log_session=observe_test_session,
+            record_session=record_public_test_session,
+            log_session=record_public_test_session,
         )
         browser: ConnectedBrowser | None = None
         mapped_form = False

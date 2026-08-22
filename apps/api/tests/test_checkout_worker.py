@@ -693,6 +693,41 @@ async def test_hosted_worker_uses_fixed_url_and_keyless_test_card_fixture() -> N
     assert broker.events[0][0] == "checkout.succeeded"
 
 
+async def test_hosted_worker_consumes_an_assigned_local_direct_card_once() -> None:
+    context = replace(
+        hosted_worker_context("pm_stripe_demo_success"),
+        provider=LOCAL_DIRECT_CARD_PROVIDER,
+        provider_card_id="ldc_card123",
+    )
+    repository = HostedRepository(context)
+    browser = FakeHostedBrowser(repository)
+    direct_cards = FakeDirectCards(context)
+    cvcs = OneShotCvcStore(context)
+    broker = FakeBroker()
+    worker = CheckoutWorker(
+        repository=repository,  # type: ignore[arg-type]
+        browser=browser,  # type: ignore[arg-type]
+        issuing=None,
+        direct_cards=direct_cards,  # type: ignore[arg-type]
+        direct_card_cvcs=cvcs,
+        broker=broker,
+        lease_seconds=120,
+        max_attempts=3,
+        poll_seconds=0.01,
+    )
+
+    assert await worker.process_once()
+
+    assert browser.runs == 1
+    assert direct_cards.calls == 1
+    assert cvcs.calls == 1
+    assert cvcs.consumed
+    assert repository.terminal_status == CheckoutExecutionStatus.succeeded
+    assert repository.merchant_order_reference == "cs_test_hosted123"
+    assert repository.retry_errors == []
+    assert broker.events[0][0] == "checkout.succeeded"
+
+
 async def test_hosted_worker_never_accepts_an_unverified_browser_result() -> None:
     context = hosted_worker_context("pm_stripe_demo_success")
     repository = HostedRepository(context)
