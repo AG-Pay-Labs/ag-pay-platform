@@ -570,11 +570,13 @@ export function AddCardDialog() {
                 placeholder="28001"
               />
               <Field
-                label="Country code"
+                label="ISO country code"
                 name="country"
                 placeholder="ES"
                 minLength={2}
                 maxLength={2}
+                pattern="[A-Za-z]{2}"
+                title="Enter the ISO alpha-2 country code, such as ES, GB, or US"
               />
             </div>
           </section>

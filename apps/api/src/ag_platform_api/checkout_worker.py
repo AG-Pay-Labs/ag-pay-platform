@@ -140,6 +140,7 @@ def build_worker(
             browserbase,
             result_timeout_seconds=settings.checkout_result_timeout_seconds,
             form_mapper=form_mapper,
+            record_local_direct_card_sessions=(settings.local_direct_card_recording_enabled),
         ),
         issuing=issuing,
         link=link,
@@ -168,6 +169,13 @@ async def run() -> None:
     worker_logger.addHandler(worker_handler)
     worker_logger.setLevel(logging.INFO)
     worker_logger.propagate = False
+    browser_logger = logging.getLogger("ag_platform_api.services.checkout.browserbase")
+    browser_logger.handlers.clear()
+    browser_handler = logging.StreamHandler()
+    browser_handler.setFormatter(logging.Formatter(log_format))
+    browser_logger.addHandler(browser_handler)
+    browser_logger.setLevel(logging.WARNING)
+    browser_logger.propagate = False
     settings = get_worker_settings()
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     browserbase: BrowserbaseGateway | None = None

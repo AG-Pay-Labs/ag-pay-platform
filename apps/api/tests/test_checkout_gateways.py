@@ -80,6 +80,14 @@ def test_local_direct_card_configuration_is_secret_and_development_only() -> Non
     assert configured.local_direct_card_enabled
     assert encryption_key not in repr(configured)
 
+    with pytest.raises(ValidationError, match="requires LOCAL_DIRECT_CARD_ENABLED"):
+        CheckoutRuntimeSettings(
+            _env_file=None,
+            environment="test",
+            checkout_enabled=True,
+            local_direct_card_recording_enabled=True,
+        )
+
     with pytest.raises(ValidationError, match="development/test-only"):
         CheckoutRuntimeSettings(
             _env_file=None,

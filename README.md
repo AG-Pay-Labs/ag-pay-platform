@@ -151,6 +151,8 @@ provide distinct locally generated secrets:
 ENVIRONMENT=development
 CHECKOUT_ENABLED=true
 LOCAL_DIRECT_CARD_ENABLED=true
+# Fake cards only: Browserbase video replay can expose the entered PAN and CVC.
+LOCAL_DIRECT_CARD_RECORDING_ENABLED=false
 DIRECT_CARD_ENCRYPTION_KEY=generate-a-dedicated-fernet-key
 LOCAL_DIRECT_CARD_BROKER_TOKEN=generate-a-separate-random-token
 LOCAL_DIRECT_CARD_SOCKET_PATH=/tmp/agpay-direct-card/cvc.sock
@@ -171,6 +173,11 @@ parent directory and `0600` Unix socket, and therefore must be running before a
 direct-card approval can stage CVC. Add the
 card from **Cards**, assign it to an agent, and approve only a
 new managed proposal carrying the exact configured adapter and checkout URL.
+`LOCAL_DIRECT_CARD_RECORDING_ENABLED` is an explicit development-only debugging
+switch. Leave it `false` unless every stored card is synthetic: enabling it sends
+the rendered checkout, including the entered PAN and CVC, to Browserbase video
+replay. Direct-card CDP/session logging remains disabled even when video replay
+is enabled.
 The approval dialog asks for CVC for that execution only. A missing/expired CVC
 fails safely and requires a new proposal/approval; it is never recovered from
 PostgreSQL, Redis, logs, or a file.

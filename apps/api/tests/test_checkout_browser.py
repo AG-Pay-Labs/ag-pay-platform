@@ -10,6 +10,7 @@ from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
 from ag_platform_api.services.checkout.browserbase import (
     CARD_FIELD_PREFLIGHT_CLEANUP_SCRIPT,
     CARD_FIELD_PREFLIGHT_SCRIPT,
+    DETERMINISTIC_INPUT_SCRIPT,
     BrowserbaseCheckout,
     _PlaywrightBrowser,
 )
@@ -105,6 +106,22 @@ class FakeElement:
         return self
 
 
+class StaleableElement(FakeElement):
+    def __init__(self, name: str, events: list[str], **kwargs: Any) -> None:
+        super().__init__(name, events, **kwargs)
+        self.stale = False
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        if self.stale:
+            raise RuntimeError("detached element")
+        return await super().evaluate(expression, arg)
+
+    async def click(self) -> None:
+        if self.stale:
+            raise RuntimeError("detached element")
+        await super().click()
+
+
 class FakeCollection:
     def __init__(self, elements: list[FakeElement]) -> None:
         self.elements = elements
@@ -125,6 +142,23 @@ class CapturingSelectElement(FakeElement):
         self.selected_values.append(value)
         self.events.append(f"select:{self.name}")
         return None
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        if expression == DETERMINISTIC_INPUT_SCRIPT:
+            assert isinstance(arg, str)
+            self.selected_values.append(arg)
+            self.events.append(f"inject:{self.name}")
+            return None
+        return await super().evaluate(expression, arg)
+
+
+class RejectingChoiceElement(FakeElement):
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        if expression == DETERMINISTIC_INPUT_SCRIPT:
+            assert isinstance(arg, str)
+            self.events.append(f"inject:{self.name}")
+            raise RuntimeError("choice option is unavailable")
+        return await super().evaluate(expression, arg)
 
 
 class ChangingTextElement(FakeElement):
@@ -160,6 +194,7 @@ class FakePage(FakeFrame):
         super().__init__(url, elements)
         self.frames = frames
         self.route_handler: Callable[..., Any] | None = None
+        self.waits: list[float] = []
 
     async def goto(self, _: str, **__: Any) -> None:
         return None
@@ -167,8 +202,8 @@ class FakePage(FakeFrame):
     async def route(self, _: str, handler: Callable[..., Any]) -> None:
         self.route_handler = handler
 
-    async def wait_for_timeout(self, _: float) -> None:
-        return None
+    async def wait_for_timeout(self, milliseconds: float) -> None:
+        self.waits.append(milliseconds)
 
 
 class FakeBrowser:
@@ -279,6 +314,58 @@ class FakeGateway:
     async def release_session(self, session_id: str) -> bool:
         self.released_session_id = session_id
         return True
+
+
+class TimeoutCapturingCheckout(BrowserbaseCheckout):
+    def __init__(
+        self,
+        gateway: FakeGateway,
+        *,
+        result_timeout_seconds: float,
+        record_local_direct_card_sessions: bool = False,
+    ) -> None:
+        super().__init__(  # type: ignore[arg-type]
+            gateway,
+            result_timeout_seconds=result_timeout_seconds,
+            record_local_direct_card_sessions=record_local_direct_card_sessions,
+        )
+        self.submit_timeouts: list[int] = []
+        self.card_timeout: int | None = None
+
+    async def _unique_visible(
+        self,
+        page: FakePage,
+        selector: str,
+        allowed_origins: tuple[str, ...],
+        missing_code: CheckoutErrorCode,
+        *,
+        timeout_ms: int = 0,
+    ):
+        if selector == "#submit":
+            self.submit_timeouts.append(timeout_ms)
+        return await super()._unique_visible(
+            page,
+            selector,
+            allowed_origins,
+            missing_code,
+            timeout_ms=timeout_ms,
+        )
+
+    async def _resolve_card_fields(
+        self,
+        page: FakePage,
+        checkout_adapter: CheckoutAdapter,
+        payment_origins: tuple[str, ...],
+        *,
+        timeout_ms: int = 10_000,
+    ):
+        self.card_timeout = timeout_ms
+        return await super()._resolve_card_fields(
+            page,
+            checkout_adapter,
+            payment_origins,
+            timeout_ms=timeout_ms,
+        )
 
 
 def context(adapter: CheckoutAdapter) -> CheckoutContext:
@@ -440,13 +527,82 @@ async def test_browser_checkout_supports_split_expiry_fields() -> None:
     assert "fill:year" in events
 
 
+async def test_browser_checkout_refreshes_stripe_controls_after_card_load() -> None:
+    events: list[str] = []
+    success = FakeElement("success", events, visible=False)
+    old_submit = StaleableElement("old-submit", events)
+    old_fields = {
+        "#number": StaleableElement("old-number", events),
+        "#expiry": StaleableElement("old-expiry", events),
+        "#cvc": StaleableElement("old-cvc", events),
+    }
+    main = FakeFrame(
+        "https://merchant.example.test/checkout/one",
+        {
+            "#product-title": [FakeElement("product-title", events, text="Managed checkout")],
+            "#quantity": [FakeElement("quantity", events, value="2")],
+            "#total": [FakeElement("total", events, text="EUR 25.00")],
+            "#submit": [old_submit],
+            "#success": [success],
+        },
+    )
+    payment = FakeFrame(
+        "https://payments.example.test/card",
+        {selector: [element] for selector, element in old_fields.items()},
+    )
+    page = FakePage(main.url, [main, payment], {})
+    checkout = BrowserbaseCheckout(FakeGateway(FakeBrowser(page)), result_timeout_seconds=1)  # type: ignore[arg-type]
+
+    async def load_card() -> IssuingCardSecret:
+        old_submit.stale = True
+        for element in old_fields.values():
+            element.stale = True
+        main.elements["#submit"] = [
+            FakeElement("fresh-submit", events, clicked=lambda: setattr(success, "visible", True))
+        ]
+        payment.elements = {
+            "#number": [FakeElement("fresh-number", events)],
+            "#expiry": [FakeElement("fresh-expiry", events)],
+            "#cvc": [FakeElement("fresh-cvc", events)],
+        }
+        return IssuingCardSecret("4242424242424242", "123", 12, 2030)
+
+    async def nothing(_: str = "") -> None:
+        return None
+
+    await checkout.run(
+        context(
+            adapter(
+                name_selector=None,
+                billing_email_selector=None,
+                order_reference_selector=None,
+                receipt_url_selector=None,
+            )
+        ),
+        load_card=load_card,
+        on_session_started=nothing,
+        prepare_submission=nothing,
+        mark_submitted=nothing,
+    )
+
+    assert "fill:fresh-number" in events
+    assert "fill:old-number" not in events
+    assert "click:fresh-submit" in events
+
+
 @pytest.mark.parametrize(
-    ("provider", "expected_recording"),
-    [("stripe_issuing", True), (LOCAL_DIRECT_CARD_PROVIDER, False)],
+    ("provider", "record_local_direct_card_sessions", "expected_recording", "expected_logging"),
+    [
+        ("stripe_issuing", False, True, True),
+        (LOCAL_DIRECT_CARD_PROVIDER, False, False, False),
+        (LOCAL_DIRECT_CARD_PROVIDER, True, True, False),
+    ],
 )
 async def test_hosted_checkout_parses_localized_facts_selects_country_and_observes_provider(
     provider: str,
+    record_local_direct_card_sessions: bool,
     expected_recording: bool,
+    expected_logging: bool,
 ) -> None:
     events: list[str] = []
     country = CapturingSelectElement("country", events)
@@ -466,7 +622,11 @@ async def test_hosted_checkout_parses_localized_facts_selects_country_and_observ
     main = FakeFrame(checkout_url, main_elements)
     browser = FakeBrowser(FakePage(main.url, [main], {}))
     gateway = FakeGateway(browser)
-    checkout = BrowserbaseCheckout(gateway, result_timeout_seconds=1)  # type: ignore[arg-type]
+    checkout = TimeoutCapturingCheckout(
+        gateway,
+        result_timeout_seconds=1,
+        record_local_direct_card_sessions=record_local_direct_card_sessions,
+    )
     hosted_adapter = adapter(
         allowed_origins=("https://checkout.stripe.com", "https://example.com"),
         payment_origins=("https://checkout.stripe.com",),
@@ -516,7 +676,8 @@ async def test_hosted_checkout_parses_localized_facts_selects_country_and_observ
 
     assert result.outcome == AuthorizationOutcome.declined
     assert country.selected_values == ["ES"]
-    assert "select:country" in events
+    assert "inject:country" in events
+    assert "select:country" not in events
     assert events.index("submitted") < events.index("fill:number")
     assert events.index("fill:number") < events.index("click:submit")
     assert events.index("click:submit") < events.index("observe-provider")
@@ -527,8 +688,32 @@ async def test_hosted_checkout_parses_localized_facts_selects_country_and_observ
         "https://checkout.stripe.com",
     )
     assert gateway.record_session is expected_recording
-    assert gateway.log_session is expected_recording
+    assert gateway.log_session is expected_logging
+    assert checkout.submit_timeouts == [30_000, 30_000, 30_000]
+    assert checkout.card_timeout == 30_000
     assert browser.closed
+
+
+async def test_billing_choice_failure_does_not_use_slow_locator_fallbacks() -> None:
+    events: list[str] = []
+    country = RejectingChoiceElement("country", events)
+    main = FakeFrame(
+        "https://merchant.example.test/checkout/one",
+        {"#country": [country]},
+    )
+    page = FakePage(main.url, [main], {})
+    checkout = BrowserbaseCheckout(FakeGateway(FakeBrowser(page)))  # type: ignore[arg-type]
+
+    with pytest.raises(CheckoutError) as caught:
+        await checkout._fill_billing(
+            page,
+            adapter(billing_country_selector="#country"),
+            {"address": {"country": "SP"}},
+            ("https://merchant.example.test",),
+        )
+
+    assert caught.value.code == CheckoutErrorCode.payment_form_not_found
+    assert events == ["inject:country"]
 
 
 async def test_hosted_checkout_accepts_stripes_implicit_single_quantity() -> None:
@@ -553,6 +738,27 @@ async def test_hosted_checkout_accepts_stripes_implicit_single_quantity() -> Non
 
     checkout = BrowserbaseCheckout(FakeGateway(FakeBrowser(page)))  # type: ignore[arg-type]
     await checkout._verify_item(page, checkout_context, ("https://checkout.stripe.com",))
+
+
+async def test_hosted_checkout_skips_missing_optional_billing_field_quickly() -> None:
+    checkout_url = "https://checkout.stripe.com/c/pay/cs_test_session123#fixture"
+    main = FakeFrame(checkout_url, {})
+    page = FakePage(main.url, [main], {})
+    hosted_adapter = adapter(
+        allowed_origins=("https://checkout.stripe.com",),
+        payment_origins=("https://checkout.stripe.com",),
+        checkout_mode="stripe_hosted_test",
+        name_selector=None,
+    )
+
+    await BrowserbaseCheckout(object())._fill_billing(  # type: ignore[arg-type]
+        page,
+        hosted_adapter,
+        {"email": "alex@example.test"},
+        ("https://checkout.stripe.com",),
+    )
+
+    assert page.waits == [100] * 10
 
 
 async def test_hosted_checkout_accepts_product_description_as_implicit_one() -> None:
@@ -1079,7 +1285,7 @@ async def test_browser_checkout_rechecks_quantity_before_submission() -> None:
 
 async def test_browser_request_guard_blocks_unapproved_resource_origins(caplog) -> None:
     page = FakePage("about:blank", [], {})
-    await BrowserbaseCheckout._install_request_guard(
+    blocked_origins = await BrowserbaseCheckout._install_request_guard(
         page,
         (
             "https://merchant.example.test",
@@ -1102,6 +1308,7 @@ async def test_browser_request_guard_blocks_unapproved_resource_origins(caplog) 
 
     assert allowed_route.action == "continue"
     assert blocked_route.action == "abort"
+    assert blocked_origins == {"https://evil.example.test"}
     assert "secret-value" not in caplog.text
     assert "4242424242424242" not in caplog.text
 

@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ag_platform_api.models import PaymentMethod, StoredCardCredential
+from ag_platform_api.schemas import BillingAddress
 from ag_platform_api.services.checkout.direct_card import (
     DirectCardPanCipher,
     LocalDirectCardGateway,
@@ -61,6 +62,44 @@ def test_card_expiry_uses_calendar_month_boundaries() -> None:
     assert is_card_expired(12, 2029, at=boundary)
     assert not is_card_expired(1, 2030, at=boundary)
     assert not is_card_expired(2, 2030, at=boundary)
+
+
+@pytest.mark.parametrize("country", [" es ", "BQ", "CW", "SX"])
+def test_billing_address_accepts_and_normalizes_assigned_iso_country_codes(
+    country: str,
+) -> None:
+    address = BillingAddress(
+        line1="1 Test Street",
+        city="Madrid",
+        postal_code="28001",
+        country=country,
+    )
+
+    assert address.country == country.strip().upper()
+
+
+@pytest.mark.parametrize("country", ["SP", "UK", "ZZ"])
+async def test_payment_method_enrollment_rejects_unassigned_country_codes(
+    client: AsyncClient,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    country: str,
+) -> None:
+    user_token = await register_user(client, f"invalid-country-{country.lower()}")
+    payload = personal_payment_method(f"pm_invalid_country_{country.lower()}")
+    payload["billing_details"]["address"]["country"] = country  # type: ignore[index]
+
+    response = await client.post(
+        f"{API}/payment-methods",
+        headers=bearer(user_token),
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    issue = response.json()["detail"][0]
+    assert issue["loc"][-1] == "country"
+    assert issue["msg"] == "Country code must be an assigned ISO 3166-1 alpha-2 code."
+    async with db_session_factory() as db:
+        assert await db.scalar(select(func.count()).select_from(PaymentMethod)) == 0
 
 
 async def test_direct_card_enrollment_stores_only_encrypted_pan_and_safe_metadata(

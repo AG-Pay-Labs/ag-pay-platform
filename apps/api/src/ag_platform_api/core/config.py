@@ -208,6 +208,7 @@ class CheckoutRuntimeSettings(BaseSettings):
     stripe_link_enabled: bool = False
     stripe_link_test_mode: bool = False
     local_direct_card_enabled: bool = False
+    local_direct_card_recording_enabled: bool = False
     direct_card_encryption_key: SecretStr | None = None
     local_direct_card_socket_path: Path = Path("/tmp/agpay-direct-card/cvc.sock")
     local_direct_card_broker_token: SecretStr | None = None
@@ -268,6 +269,10 @@ class CheckoutRuntimeSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_local_direct_card_mode(self) -> "CheckoutRuntimeSettings":
+        if self.local_direct_card_recording_enabled and not self.local_direct_card_enabled:
+            raise ValueError(
+                "LOCAL_DIRECT_CARD_RECORDING_ENABLED requires LOCAL_DIRECT_CARD_ENABLED"
+            )
         if not self.local_direct_card_enabled:
             return self
         if self.environment.lower() not in {"development", "test"}:

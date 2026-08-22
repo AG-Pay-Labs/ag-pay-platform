@@ -1,3 +1,4 @@
+import logging
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
@@ -64,6 +65,15 @@ DETERMINISTIC_INPUT_SCRIPT = """
   if (!descriptor || !descriptor.set) {
     throw new Error("payment control has no native value setter");
   }
+  const ariaDisabled =
+    (element.getAttribute("aria-disabled") || "").toLocaleLowerCase() === "true";
+  const locked = element.disabled || ariaDisabled ||
+    (element instanceof HTMLInputElement && element.readOnly);
+  if (locked) {
+    if (String(element.value) === nextValue) return;
+    throw new Error("payment control is not editable");
+  }
+  if (String(element.value) === nextValue) return;
   element.focus();
   descriptor.set.call(element, nextValue);
   element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
@@ -112,6 +122,11 @@ CARD_FIELD_PREFLIGHT_CLEANUP_SCRIPT = """
   try { delete element[marker]; } catch (_) {}
 }
 """.strip()
+STRIPE_HOSTED_FORM_TIMEOUT_MS = 30_000
+STRIPE_HOSTED_OPTIONAL_FIELD_TIMEOUT_MS = 1_000
+MAX_RECORDED_BLOCKED_ORIGINS = 20
+
+logger = logging.getLogger(__name__)
 
 
 class LocatorLike(Protocol):
@@ -310,10 +325,12 @@ class BrowserbaseCheckout:
         *,
         result_timeout_seconds: float = 60,
         form_mapper: CheckoutFormMapper | None = None,
+        record_local_direct_card_sessions: bool = False,
     ) -> None:
         self._gateway = gateway
         self._result_timeout_ms = max(1, int(result_timeout_seconds * 1000))
         self._form_mapper = form_mapper
+        self._record_local_direct_card_sessions = record_local_direct_card_sessions
 
     async def run(
         self,
@@ -339,34 +356,46 @@ class BrowserbaseCheckout:
         record_public_test_session = (
             observe_test_session and context.provider != LOCAL_DIRECT_CARD_PROVIDER
         )
+        record_local_direct_card_session = (
+            context.provider == LOCAL_DIRECT_CARD_PROVIDER
+            and self._record_local_direct_card_sessions
+        )
         if observe_test_session:
             checkout_url = validate_stripe_hosted_test_checkout_url(checkout_url)
         session = await self._gateway.create_session(
             allowed_origins + payment_origins + resource_origins,
-            record_session=record_public_test_session,
+            record_session=(record_public_test_session or record_local_direct_card_session),
+            # Direct-card video recording is an explicit fake-card development aid.
+            # Keep CDP/session logging disabled because it captures substantially
+            # more request and DOM detail than the visual replay.
             log_session=record_public_test_session,
         )
         browser: ConnectedBrowser | None = None
         mapped_form = False
         new_form_snapshot: dict[str, str | None] | None = None
+        blocked_origins: set[str] = set()
+        failure_stage = "connect"
         try:
             await on_session_started(session.session_id)
             browser = await self._gateway.connect(session)
             page = await browser.new_page(allowed_origins + payment_origins + resource_origins)
-            await self._install_request_guard(
+            blocked_origins = await self._install_request_guard(
                 page,
                 allowed_origins + payment_origins + resource_origins,
             )
+            failure_stage = "navigation"
             try:
                 await page.goto(checkout_url, wait_until="domcontentloaded", timeout=30_000)
             except Exception:
                 raise CheckoutError(
                     CheckoutErrorCode.browser_navigation_failed, retryable=True
                 ) from None
+            failure_stage = "cart_validation"
             self._validate_page(page, merchant_origins, payment_origins)
             await self._verify_item(page, context, merchant_origins)
             await self._verify_total(page, context, merchant_origins)
             if adapter.payment_form_strategy == "browserbase_ai":
+                failure_stage = "form_mapping"
                 if context.resolved_form_config is not None:
                     mapping = PaymentFormSelectorMap.from_snapshot(
                         dict(context.resolved_form_config)
@@ -391,6 +420,26 @@ class BrowserbaseCheckout:
                 )
             discovered_origins = tuple(dict.fromkeys(merchant_origins + payment_origins))
             form_control_origins = discovered_origins if mapped_form else merchant_origins
+            hosted_form_timeout_ms = (
+                STRIPE_HOSTED_FORM_TIMEOUT_MS
+                if adapter.checkout_mode == "stripe_hosted_test"
+                else 10_000
+            )
+            if adapter.submit_selector is None:
+                raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+            if adapter.checkout_mode == "stripe_hosted_test":
+                # Stripe Checkout mounts its payment controls asynchronously. Wait for the
+                # stable form shell before probing optional billing controls so a slow mount
+                # cannot turn into a misleading missing-field failure.
+                failure_stage = "hosted_form_ready"
+                await self._unique_visible(
+                    page,
+                    adapter.submit_selector,
+                    form_control_origins,
+                    CheckoutErrorCode.payment_form_not_found,
+                    timeout_ms=hosted_form_timeout_ms,
+                )
+            failure_stage = "billing"
             await self._fill_billing(
                 page,
                 adapter,
@@ -398,21 +447,27 @@ class BrowserbaseCheckout:
                 form_control_origins,
                 javascript=mapped_form,
             )
-            if adapter.submit_selector is None:
-                raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+            failure_stage = "submit_control"
             submit = await self._unique_visible(
                 page,
                 adapter.submit_selector,
                 form_control_origins,
                 CheckoutErrorCode.payment_form_not_found,
-                timeout_ms=10_000,
+                timeout_ms=hosted_form_timeout_ms,
             )
             submit_handle = await self._resolve_handle(
                 submit,
                 form_control_origins,
                 CheckoutErrorCode.payment_form_not_found,
             )
-            card_fields = await self._resolve_card_fields(page, adapter, payment_origins)
+            failure_stage = "card_controls"
+            card_fields = await self._resolve_card_fields(
+                page,
+                adapter,
+                payment_origins,
+                timeout_ms=hosted_form_timeout_ms,
+            )
+            failure_stage = "submission_preflight"
             await prepare_submission()
             self._validate_page(page, merchant_origins, payment_origins)
             await self._verify_item(page, context, merchant_origins)
@@ -424,16 +479,41 @@ class BrowserbaseCheckout:
             )
             if new_form_snapshot is not None and on_form_mapped is not None:
                 await on_form_mapped(new_form_snapshot)
+            failure_stage = "card_load"
             card = await load_card()
             try:
                 self._validate_page(page, merchant_origins, payment_origins)
                 await self._verify_item(page, context, merchant_origins)
                 await self._verify_total(page, context, merchant_origins)
+                # Stripe can replace its card controls while the trusted executor
+                # retrieves the approved card. Never reuse element handles across
+                # that boundary: resolve and validate a fresh control set before
+                # marking the execution submitted or injecting any credential.
+                failure_stage = "control_refresh"
+                submit = await self._unique_visible(
+                    page,
+                    adapter.submit_selector,
+                    form_control_origins,
+                    CheckoutErrorCode.payment_form_not_found,
+                    timeout_ms=hosted_form_timeout_ms,
+                )
+                submit_handle = await self._resolve_handle(
+                    submit,
+                    form_control_origins,
+                    CheckoutErrorCode.payment_form_not_found,
+                )
+                card_fields = await self._resolve_card_fields(
+                    page,
+                    adapter,
+                    payment_origins,
+                    timeout_ms=hosted_form_timeout_ms,
+                )
                 await self._preflight_card_fields(
                     card_fields,
                     submit_handle=submit_handle,
                     retryable=adapter.payment_form_strategy == "resolved",
                 )
+                failure_stage = "card_fill"
                 await mark_submitted(session.session_id)
                 await self._fill_resolved_card(card_fields, card, payment_origins)
                 try:
@@ -442,6 +522,7 @@ class BrowserbaseCheckout:
                     raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown) from None
             finally:
                 del card
+            failure_stage = "result"
             if adapter.checkout_mode == "stripe_hosted_test":
                 if observe_outcome is not None:
                     outcome = await observe_outcome()
@@ -459,6 +540,19 @@ class BrowserbaseCheckout:
                 tuple(dict.fromkeys(merchant_origins + result_origins)),
                 payment_origins,
             )
+        except CheckoutError as error:
+            if error.code in {
+                CheckoutErrorCode.browser_navigation_failed,
+                CheckoutErrorCode.origin_blocked,
+                CheckoutErrorCode.payment_form_not_found,
+            }:
+                logger.warning(
+                    "Browser checkout failed at safe stage %s with %s; blocked origins: %s",
+                    failure_stage,
+                    error.code.value,
+                    ", ".join(sorted(blocked_origins)) or "none",
+                )
+            raise
         finally:
             if browser is not None:
                 try:
@@ -474,23 +568,29 @@ class BrowserbaseCheckout:
     async def _install_request_guard(
         page: PageLike,
         permitted_origins: tuple[str, ...],
-    ) -> None:
+    ) -> set[str]:
         permitted = set(permitted_origins)
+        blocked_origins: set[str] = set()
 
         async def guard(route: RouteLike, request: RequestLike) -> None:
             try:
-                permitted_request = normalize_origin(request.url) in permitted
+                request_origin = normalize_origin(request.url)
+                permitted_request = request_origin in permitted
             except CheckoutError:
+                request_origin = "(invalid origin)"
                 permitted_request = False
             if permitted_request:
                 await route.continue_()
             else:
+                if len(blocked_origins) < MAX_RECORDED_BLOCKED_ORIGINS:
+                    blocked_origins.add(request_origin)
                 await route.abort()
 
         try:
             await page.route("**/*", guard)
         except Exception:
             raise CheckoutError(CheckoutErrorCode.browser_session_failed, retryable=True) from None
+        return blocked_origins
 
     @staticmethod
     def _validate_page(
@@ -635,7 +735,11 @@ class BrowserbaseCheckout:
                     selector,
                     allowed_origins,
                     CheckoutErrorCode.payment_form_not_found,
-                    timeout_ms=5_000,
+                    timeout_ms=(
+                        STRIPE_HOSTED_OPTIONAL_FIELD_TIMEOUT_MS
+                        if adapter.checkout_mode == "stripe_hosted_test"
+                        else 5_000
+                    ),
                 )
             except CheckoutError:
                 if adapter.checkout_mode == "stripe_hosted_test":
@@ -643,25 +747,19 @@ class BrowserbaseCheckout:
                 raise
             try:
                 self._validate_located_frame(located, allowed_origins)
-                if javascript:
+                choice_control = selector in {
+                    adapter.billing_country_selector,
+                    adapter.billing_region_selector,
+                }
+                if javascript or choice_control:
                     handle = await self._resolve_handle(
                         located,
                         allowed_origins,
                         CheckoutErrorCode.payment_form_not_found,
                     )
                     await handle.evaluate(DETERMINISTIC_INPUT_SCRIPT, str(value)[:320])
-                elif selector in {
-                    adapter.billing_country_selector,
-                    adapter.billing_region_selector,
-                }:
-                    try:
-                        await located.locator.select_option(str(value)[:320])
-                    except Exception:
-                        try:
-                            await located.locator.select_option(label=str(value)[:320])
-                        except Exception:
-                            await located.locator.fill(str(value)[:320])
-                    await page.wait_for_timeout(100)
+                    if choice_control:
+                        await page.wait_for_timeout(100)
                 else:
                     await located.locator.fill(str(value)[:320])
             except Exception:
@@ -672,6 +770,8 @@ class BrowserbaseCheckout:
         page: PageLike,
         adapter: CheckoutAdapter,
         payment_origins: tuple[str, ...],
+        *,
+        timeout_ms: int = 10_000,
     ) -> tuple[ResolvedCardField, ...]:
         if adapter.card_number_selector is None or adapter.cvc_selector is None:
             raise CheckoutError(CheckoutErrorCode.adapter_invalid)
@@ -697,7 +797,7 @@ class BrowserbaseCheckout:
                 selector,
                 payment_origins,
                 CheckoutErrorCode.payment_form_not_found,
-                timeout_ms=10_000,
+                timeout_ms=timeout_ms,
             )
             handle = await self._resolve_handle(
                 located,
