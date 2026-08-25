@@ -1,4 +1,6 @@
+import logging
 import re
+import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -7,7 +9,12 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
+from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
 from ag_platform_api.services.checkout.errors import CheckoutError, CheckoutErrorCode
+from ag_platform_api.services.checkout.form_mapping import (
+    CheckoutFormMapper,
+    PaymentFormSelectorMap,
+)
 from ag_platform_api.services.checkout.origins import (
     browserbase_allowed_domains,
     normalize_origin,
@@ -34,6 +41,92 @@ STRIPE_HOSTED_QUANTITY_VALUE_PATTERN = re.compile(
     r"(?:^|\b)(?:qty|quantity)\s*[:x×]?\s*(\d+)(?=\b|,)"
 )
 NUMBER_PATTERN = re.compile(r"(?<!\d)(\d{1,3}(?:[., ]\d{3})*[.,]\d{1,3}|\d+[.,]\d{1,3}|\d+)(?!\d)")
+DETERMINISTIC_INPUT_SCRIPT = """
+(element, value) => {
+  let nextValue = String(value);
+  let descriptor;
+  if (element instanceof HTMLInputElement) {
+    descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  } else if (element instanceof HTMLSelectElement) {
+    const wanted = nextValue.trim().toLocaleLowerCase();
+    const option = Array.from(element.options).find((candidate) =>
+      candidate.value === nextValue ||
+      candidate.label.trim().toLocaleLowerCase() === wanted ||
+      candidate.text.trim().toLocaleLowerCase() === wanted
+    );
+    if (!option) {
+      throw new Error("payment select option was not found");
+    }
+    nextValue = option.value;
+    descriptor = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+  } else {
+    throw new Error("unsupported payment control");
+  }
+  if (!descriptor || !descriptor.set) {
+    throw new Error("payment control has no native value setter");
+  }
+  const ariaDisabled =
+    (element.getAttribute("aria-disabled") || "").toLocaleLowerCase() === "true";
+  const locked = element.disabled || ariaDisabled ||
+    (element instanceof HTMLInputElement && element.readOnly);
+  if (locked) {
+    if (String(element.value) === nextValue) return;
+    throw new Error("payment control is not editable");
+  }
+  if (String(element.value) === nextValue) return;
+  element.focus();
+  descriptor.set.call(element, nextValue);
+  element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  element.blur();
+}
+""".strip()
+CARD_FIELD_PREFLIGHT_SCRIPT = """
+(element, options) => {
+  const input = element instanceof HTMLInputElement;
+  const select = element instanceof HTMLSelectElement;
+  const button = element instanceof HTMLButtonElement;
+  const submit = options.kind === "submit";
+  const splitExpiry = options.kind === "expiry_month" || options.kind === "expiry_year";
+  const inputType = input ? element.type.toLocaleLowerCase() : "";
+  const role = (element.getAttribute("role") || "").toLocaleLowerCase();
+  const ariaDisabled = (element.getAttribute("aria-disabled") || "").toLocaleLowerCase() === "true";
+  const style = window.getComputedStyle(element);
+  const bounds = element.getBoundingClientRect();
+  const submitControl = button || (input && ["button", "image", "submit"].includes(inputType));
+  if (
+    !element.isConnected || element.disabled || ariaDisabled || bounds.width <= 0 ||
+    bounds.height <= 0 || style.display === "none" || style.visibility === "hidden" ||
+    (submit && !submitControl && role !== "button")
+  ) {
+    return false;
+  }
+  if (!submit) {
+    const splitSelect = select && splitExpiry;
+    const blocked = new Set([
+      "hidden", "button", "submit", "reset", "file", "checkbox", "radio"
+    ]);
+    if ((!input && !splitSelect) || (input && (element.readOnly || blocked.has(inputType)))) {
+      return false;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(element, options.marker)) {
+    return false;
+  }
+  Object.defineProperty(element, options.marker, { value: true, configurable: true });
+  return true;
+}
+""".strip()
+CARD_FIELD_PREFLIGHT_CLEANUP_SCRIPT = """
+(element, marker) => {
+  try { delete element[marker]; } catch (_) {}
+}
+""".strip()
+STRIPE_HOSTED_FORM_TIMEOUT_MS = 30_000
+STRIPE_HOSTED_OPTIONAL_FIELD_TIMEOUT_MS = 1_000
+MAX_RECORDED_BLOCKED_ORIGINS = 20
+
+logger = logging.getLogger(__name__)
 
 
 class LocatorLike(Protocol):
@@ -67,6 +160,8 @@ class ElementHandleLike(Protocol):
     async def fill(self, value: str) -> None: ...
 
     async def click(self) -> None: ...
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object: ...
 
 
 class RequestLike(Protocol):
@@ -114,6 +209,7 @@ SessionStarted = Callable[[str], Awaitable[None]]
 PrepareSubmission = Callable[[], Awaitable[None]]
 MarkSubmitted = Callable[[str], Awaitable[None]]
 ObserveOutcome = Callable[[], Awaitable[AuthorizationOutcome]]
+FormMapped = Callable[[Mapping[str, object]], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,9 +319,18 @@ class BrowserbaseGateway:
 
 
 class BrowserbaseCheckout:
-    def __init__(self, gateway: BrowserbaseGateway, *, result_timeout_seconds: float = 60) -> None:
+    def __init__(
+        self,
+        gateway: BrowserbaseGateway,
+        *,
+        result_timeout_seconds: float = 60,
+        form_mapper: CheckoutFormMapper | None = None,
+        record_local_direct_card_sessions: bool = False,
+    ) -> None:
         self._gateway = gateway
         self._result_timeout_ms = max(1, int(result_timeout_seconds * 1000))
+        self._form_mapper = form_mapper
+        self._record_local_direct_card_sessions = record_local_direct_card_sessions
 
     async def run(
         self,
@@ -236,6 +341,7 @@ class BrowserbaseCheckout:
         prepare_submission: PrepareSubmission,
         mark_submitted: MarkSubmitted,
         observe_outcome: ObserveOutcome | None = None,
+        on_form_mapped: FormMapped | None = None,
     ) -> BrowserCheckoutResult:
         adapter = context.adapter
         allowed_origins = tuple(normalize_origin(value) for value in adapter.allowed_origins)
@@ -247,54 +353,167 @@ class BrowserbaseCheckout:
             raise CheckoutError(CheckoutErrorCode.origin_blocked)
         checkout_url = validate_checkout_url(context.checkout_url, merchant_origins)
         observe_test_session = adapter.checkout_mode == "stripe_hosted_test"
+        record_public_test_session = (
+            observe_test_session and context.provider != LOCAL_DIRECT_CARD_PROVIDER
+        )
+        record_local_direct_card_session = (
+            context.provider == LOCAL_DIRECT_CARD_PROVIDER
+            and self._record_local_direct_card_sessions
+        )
         if observe_test_session:
             checkout_url = validate_stripe_hosted_test_checkout_url(checkout_url)
         session = await self._gateway.create_session(
             allowed_origins + payment_origins + resource_origins,
-            record_session=observe_test_session,
-            log_session=observe_test_session,
+            record_session=(record_public_test_session or record_local_direct_card_session),
+            # Direct-card video recording is an explicit fake-card development aid.
+            # Keep CDP/session logging disabled because it captures substantially
+            # more request and DOM detail than the visual replay.
+            log_session=record_public_test_session,
         )
         browser: ConnectedBrowser | None = None
+        mapped_form = False
+        new_form_snapshot: dict[str, str | None] | None = None
+        blocked_origins: set[str] = set()
+        failure_stage = "connect"
         try:
             await on_session_started(session.session_id)
             browser = await self._gateway.connect(session)
             page = await browser.new_page(allowed_origins + payment_origins + resource_origins)
-            await self._install_request_guard(
+            blocked_origins = await self._install_request_guard(
                 page,
                 allowed_origins + payment_origins + resource_origins,
             )
+            failure_stage = "navigation"
             try:
                 await page.goto(checkout_url, wait_until="domcontentloaded", timeout=30_000)
             except Exception:
                 raise CheckoutError(
                     CheckoutErrorCode.browser_navigation_failed, retryable=True
                 ) from None
+            failure_stage = "cart_validation"
             self._validate_page(page, merchant_origins, payment_origins)
             await self._verify_item(page, context, merchant_origins)
             await self._verify_total(page, context, merchant_origins)
-            await self._fill_billing(page, adapter, context.billing_details, merchant_origins)
+            if adapter.payment_form_strategy == "browserbase_ai":
+                failure_stage = "form_mapping"
+                if context.resolved_form_config is not None:
+                    mapping = PaymentFormSelectorMap.from_snapshot(
+                        dict(context.resolved_form_config)
+                    )
+                else:
+                    if self._form_mapper is None:
+                        raise CheckoutError(CheckoutErrorCode.form_analysis_failed, retryable=True)
+                    mapping = await self._form_mapper.map_payment_form(
+                        browserbase_session_id=session.session_id,
+                        billing_fields=self._billing_fields_to_map(
+                            adapter, context.billing_details
+                        ),
+                    )
+                    new_form_snapshot = mapping.to_snapshot()
+                adapter = mapping.apply(adapter)
+                mapped_form = True
+                await self._validate_discovered_form(
+                    page,
+                    adapter,
+                    merchant_origins=merchant_origins,
+                    payment_origins=payment_origins,
+                )
+            discovered_origins = tuple(dict.fromkeys(merchant_origins + payment_origins))
+            form_control_origins = discovered_origins if mapped_form else merchant_origins
+            hosted_form_timeout_ms = (
+                STRIPE_HOSTED_FORM_TIMEOUT_MS
+                if adapter.checkout_mode == "stripe_hosted_test"
+                else 10_000
+            )
+            if adapter.submit_selector is None:
+                raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+            if adapter.checkout_mode == "stripe_hosted_test":
+                # Stripe Checkout mounts its payment controls asynchronously. Wait for the
+                # stable form shell before probing optional billing controls so a slow mount
+                # cannot turn into a misleading missing-field failure.
+                failure_stage = "hosted_form_ready"
+                await self._unique_visible(
+                    page,
+                    adapter.submit_selector,
+                    form_control_origins,
+                    CheckoutErrorCode.payment_form_not_found,
+                    timeout_ms=hosted_form_timeout_ms,
+                )
+            failure_stage = "billing"
+            await self._fill_billing(
+                page,
+                adapter,
+                context.billing_details,
+                form_control_origins,
+                javascript=mapped_form,
+            )
+            failure_stage = "submit_control"
             submit = await self._unique_visible(
                 page,
                 adapter.submit_selector,
-                merchant_origins,
+                form_control_origins,
                 CheckoutErrorCode.payment_form_not_found,
-                timeout_ms=10_000,
+                timeout_ms=hosted_form_timeout_ms,
             )
             submit_handle = await self._resolve_handle(
                 submit,
-                merchant_origins,
+                form_control_origins,
                 CheckoutErrorCode.payment_form_not_found,
             )
-            card_fields = await self._resolve_card_fields(page, adapter, payment_origins)
+            failure_stage = "card_controls"
+            card_fields = await self._resolve_card_fields(
+                page,
+                adapter,
+                payment_origins,
+                timeout_ms=hosted_form_timeout_ms,
+            )
+            failure_stage = "submission_preflight"
             await prepare_submission()
             self._validate_page(page, merchant_origins, payment_origins)
             await self._verify_item(page, context, merchant_origins)
             await self._verify_total(page, context, merchant_origins)
+            await self._preflight_card_fields(
+                card_fields,
+                submit_handle=submit_handle,
+                retryable=adapter.payment_form_strategy == "resolved",
+            )
+            if new_form_snapshot is not None and on_form_mapped is not None:
+                await on_form_mapped(new_form_snapshot)
+            failure_stage = "card_load"
             card = await load_card()
             try:
                 self._validate_page(page, merchant_origins, payment_origins)
                 await self._verify_item(page, context, merchant_origins)
                 await self._verify_total(page, context, merchant_origins)
+                # Stripe can replace its card controls while the trusted executor
+                # retrieves the approved card. Never reuse element handles across
+                # that boundary: resolve and validate a fresh control set before
+                # marking the execution submitted or injecting any credential.
+                failure_stage = "control_refresh"
+                submit = await self._unique_visible(
+                    page,
+                    adapter.submit_selector,
+                    form_control_origins,
+                    CheckoutErrorCode.payment_form_not_found,
+                    timeout_ms=hosted_form_timeout_ms,
+                )
+                submit_handle = await self._resolve_handle(
+                    submit,
+                    form_control_origins,
+                    CheckoutErrorCode.payment_form_not_found,
+                )
+                card_fields = await self._resolve_card_fields(
+                    page,
+                    adapter,
+                    payment_origins,
+                    timeout_ms=hosted_form_timeout_ms,
+                )
+                await self._preflight_card_fields(
+                    card_fields,
+                    submit_handle=submit_handle,
+                    retryable=adapter.payment_form_strategy == "resolved",
+                )
+                failure_stage = "card_fill"
                 await mark_submitted(session.session_id)
                 await self._fill_resolved_card(card_fields, card, payment_origins)
                 try:
@@ -303,6 +522,7 @@ class BrowserbaseCheckout:
                     raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown) from None
             finally:
                 del card
+            failure_stage = "result"
             if adapter.checkout_mode == "stripe_hosted_test":
                 if observe_outcome is not None:
                     outcome = await observe_outcome()
@@ -320,6 +540,19 @@ class BrowserbaseCheckout:
                 tuple(dict.fromkeys(merchant_origins + result_origins)),
                 payment_origins,
             )
+        except CheckoutError as error:
+            if error.code in {
+                CheckoutErrorCode.browser_navigation_failed,
+                CheckoutErrorCode.origin_blocked,
+                CheckoutErrorCode.payment_form_not_found,
+            }:
+                logger.warning(
+                    "Browser checkout failed at safe stage %s with %s; blocked origins: %s",
+                    failure_stage,
+                    error.code.value,
+                    ", ".join(sorted(blocked_origins)) or "none",
+                )
+            raise
         finally:
             if browser is not None:
                 try:
@@ -335,23 +568,29 @@ class BrowserbaseCheckout:
     async def _install_request_guard(
         page: PageLike,
         permitted_origins: tuple[str, ...],
-    ) -> None:
+    ) -> set[str]:
         permitted = set(permitted_origins)
+        blocked_origins: set[str] = set()
 
         async def guard(route: RouteLike, request: RequestLike) -> None:
             try:
-                permitted_request = normalize_origin(request.url) in permitted
+                request_origin = normalize_origin(request.url)
+                permitted_request = request_origin in permitted
             except CheckoutError:
+                request_origin = "(invalid origin)"
                 permitted_request = False
             if permitted_request:
                 await route.continue_()
             else:
+                if len(blocked_origins) < MAX_RECORDED_BLOCKED_ORIGINS:
+                    blocked_origins.add(request_origin)
                 await route.abort()
 
         try:
             await page.route("**/*", guard)
         except Exception:
             raise CheckoutError(CheckoutErrorCode.browser_session_failed, retryable=True) from None
+        return blocked_origins
 
     @staticmethod
     def _validate_page(
@@ -469,6 +708,8 @@ class BrowserbaseCheckout:
         adapter: CheckoutAdapter,
         billing_details: Mapping[str, Any],
         allowed_origins: tuple[str, ...],
+        *,
+        javascript: bool = False,
     ) -> None:
         address = billing_details.get("address", {})
         if not isinstance(address, Mapping):
@@ -494,7 +735,11 @@ class BrowserbaseCheckout:
                     selector,
                     allowed_origins,
                     CheckoutErrorCode.payment_form_not_found,
-                    timeout_ms=5_000,
+                    timeout_ms=(
+                        STRIPE_HOSTED_OPTIONAL_FIELD_TIMEOUT_MS
+                        if adapter.checkout_mode == "stripe_hosted_test"
+                        else 5_000
+                    ),
                 )
             except CheckoutError:
                 if adapter.checkout_mode == "stripe_hosted_test":
@@ -502,18 +747,19 @@ class BrowserbaseCheckout:
                 raise
             try:
                 self._validate_located_frame(located, allowed_origins)
-                if selector in {
+                choice_control = selector in {
                     adapter.billing_country_selector,
                     adapter.billing_region_selector,
-                }:
-                    try:
-                        await located.locator.select_option(str(value)[:320])
-                    except Exception:
-                        try:
-                            await located.locator.select_option(label=str(value)[:320])
-                        except Exception:
-                            await located.locator.fill(str(value)[:320])
-                    await page.wait_for_timeout(100)
+                }
+                if javascript or choice_control:
+                    handle = await self._resolve_handle(
+                        located,
+                        allowed_origins,
+                        CheckoutErrorCode.payment_form_not_found,
+                    )
+                    await handle.evaluate(DETERMINISTIC_INPUT_SCRIPT, str(value)[:320])
+                    if choice_control:
+                        await page.wait_for_timeout(100)
                 else:
                     await located.locator.fill(str(value)[:320])
             except Exception:
@@ -524,7 +770,11 @@ class BrowserbaseCheckout:
         page: PageLike,
         adapter: CheckoutAdapter,
         payment_origins: tuple[str, ...],
+        *,
+        timeout_ms: int = 10_000,
     ) -> tuple[ResolvedCardField, ...]:
+        if adapter.card_number_selector is None or adapter.cvc_selector is None:
+            raise CheckoutError(CheckoutErrorCode.adapter_invalid)
         fields: list[tuple[str, str]] = [
             (adapter.card_number_selector, "number"),
             (adapter.cvc_selector, "cvc"),
@@ -547,7 +797,7 @@ class BrowserbaseCheckout:
                 selector,
                 payment_origins,
                 CheckoutErrorCode.payment_form_not_found,
-                timeout_ms=10_000,
+                timeout_ms=timeout_ms,
             )
             handle = await self._resolve_handle(
                 located,
@@ -556,6 +806,41 @@ class BrowserbaseCheckout:
             )
             resolved.append(ResolvedCardField(handle=handle, frame=located.frame, kind=kind))
         return tuple(resolved)
+
+    @staticmethod
+    async def _preflight_card_fields(
+        fields: tuple[ResolvedCardField, ...],
+        *,
+        submit_handle: ElementHandleLike | None = None,
+        retryable: bool,
+    ) -> None:
+        marker = f"__agpay_field_probe_{secrets.token_hex(16)}"
+        validated: list[ElementHandleLike] = []
+        controls = [(field.handle, field.kind) for field in fields]
+        if submit_handle is not None:
+            controls.append((submit_handle, "submit"))
+        try:
+            for handle, kind in controls:
+                valid = await handle.evaluate(
+                    CARD_FIELD_PREFLIGHT_SCRIPT,
+                    {"marker": marker, "kind": kind},
+                )
+                if valid is not True:
+                    raise ValueError
+                validated.append(handle)
+        except Exception:
+            code = (
+                CheckoutErrorCode.form_analysis_failed
+                if retryable
+                else CheckoutErrorCode.payment_form_not_found
+            )
+            raise CheckoutError(code, retryable=retryable) from None
+        finally:
+            for handle in validated:
+                try:
+                    await handle.evaluate(CARD_FIELD_PREFLIGHT_CLEANUP_SCRIPT, marker)
+                except Exception:
+                    pass
 
     async def _fill_resolved_card(
         self,
@@ -573,9 +858,137 @@ class BrowserbaseCheckout:
         for field in fields:
             self._validate_frame_origin(field.frame, payment_origins)
             try:
-                await field.handle.fill(values[field.kind])
+                await field.handle.evaluate(DETERMINISTIC_INPUT_SCRIPT, values[field.kind])
             except Exception:
                 raise CheckoutError(CheckoutErrorCode.payment_form_not_found) from None
+
+    @staticmethod
+    def _billing_fields_to_map(
+        adapter: CheckoutAdapter,
+        billing_details: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        address = billing_details.get("address")
+        if not isinstance(address, Mapping):
+            address = {}
+        candidates = (
+            (
+                "name",
+                adapter.name_selector,
+                billing_details.get("full_name") or billing_details.get("contact_name"),
+            ),
+            ("billing_email", adapter.billing_email_selector, billing_details.get("email")),
+            ("billing_phone", adapter.billing_phone_selector, billing_details.get("phone")),
+            ("billing_country", adapter.billing_country_selector, address.get("country")),
+            ("billing_line1", adapter.billing_line1_selector, address.get("line1")),
+            ("billing_line2", adapter.billing_line2_selector, address.get("line2")),
+            ("billing_city", adapter.billing_city_selector, address.get("city")),
+            ("billing_region", adapter.billing_region_selector, address.get("region")),
+            (
+                "billing_postal_code",
+                adapter.billing_postal_code_selector,
+                address.get("postal_code"),
+            ),
+        )
+        return tuple(name for name, selector, value in candidates if selector is None and value)
+
+    async def _validate_discovered_form(
+        self,
+        page: PageLike,
+        adapter: CheckoutAdapter,
+        *,
+        merchant_origins: tuple[str, ...],
+        payment_origins: tuple[str, ...],
+    ) -> None:
+        required = (
+            (adapter.card_number_selector, "card_number"),
+            (adapter.cvc_selector, "cvc"),
+        )
+        if adapter.expiry_selector is not None:
+            required += ((adapter.expiry_selector, "expiry"),)
+        else:
+            required += (
+                (adapter.expiry_month_selector, "expiry_month"),
+                (adapter.expiry_year_selector, "expiry_year"),
+            )
+        for selector, kind in required:
+            if selector is None:
+                raise CheckoutError(CheckoutErrorCode.form_analysis_failed, retryable=True)
+            located = await self._unique_visible(
+                page,
+                selector,
+                payment_origins,
+                CheckoutErrorCode.form_analysis_failed,
+            )
+            await self._validate_payment_field_semantics(located, kind)
+        if adapter.submit_selector is None:
+            raise CheckoutError(CheckoutErrorCode.form_analysis_failed, retryable=True)
+        submit = await self._unique_visible(
+            page,
+            adapter.submit_selector,
+            tuple(dict.fromkeys(merchant_origins + payment_origins)),
+            CheckoutErrorCode.form_analysis_failed,
+        )
+        await self._validate_submit_semantics(submit)
+
+    @staticmethod
+    async def _semantic_attributes(
+        located: LocatedElement,
+    ) -> tuple[str, str, tuple[str, ...]]:
+        attributes: dict[str, str] = {}
+        try:
+            for name in ("autocomplete", "name", "id", "aria-label", "placeholder", "type", "role"):
+                value = await located.locator.get_attribute(name)
+                if value is not None:
+                    attributes[name] = value[:160].casefold()
+        except Exception:
+            raise CheckoutError(CheckoutErrorCode.form_analysis_failed, retryable=True) from None
+        semantic = " ".join(
+            attributes.get(name, "")
+            for name in ("autocomplete", "name", "id", "aria-label", "placeholder")
+        )
+        normalized = re.sub(r"[^a-z0-9]+", "", semantic)
+        normalized_values = tuple(
+            re.sub(r"[^a-z0-9]+", "", attributes.get(name, ""))
+            for name in ("autocomplete", "name", "id", "aria-label", "placeholder")
+        )
+        return (
+            normalized,
+            attributes.get("type", "") + " " + attributes.get("role", ""),
+            normalized_values,
+        )
+
+    async def _validate_payment_field_semantics(
+        self,
+        located: LocatedElement,
+        kind: str,
+    ) -> None:
+        normalized, control_type, normalized_values = await self._semantic_attributes(located)
+        expected = {
+            "card_number": ("ccnumber", "cardnumber", "creditcardnumber"),
+            "cvc": ("cccsc", "cvc", "cvv", "securitycode", "cardcode"),
+            "expiry": ("ccexp", "expiry", "expiration", "cardexp"),
+            "expiry_month": ("ccexpmonth", "expirymonth", "expmonth"),
+            "expiry_year": ("ccexpyear", "expiryyear", "expyear"),
+        }[kind]
+        matched = any(token in normalized for token in expected)
+        if kind == "card_number" and "pan" in normalized_values:
+            matched = True
+        if not matched:
+            raise CheckoutError(CheckoutErrorCode.form_analysis_failed, retryable=True)
+        if any(blocked in control_type.split() for blocked in ("hidden", "button", "submit")):
+            raise CheckoutError(CheckoutErrorCode.form_analysis_failed, retryable=True)
+
+    async def _validate_submit_semantics(self, located: LocatedElement) -> None:
+        normalized, control_type, _ = await self._semantic_attributes(located)
+        if not (
+            "submit" in control_type.split()
+            or "button" in control_type.split()
+            or any(
+                token in normalized
+                for token in ("pay", "submit", "placeorder", "completepurchase", "checkout")
+            )
+        ):
+            raise CheckoutError(CheckoutErrorCode.form_analysis_failed, retryable=True)
 
     async def _wait_for_result(
         self,

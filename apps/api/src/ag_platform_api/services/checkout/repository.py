@@ -15,6 +15,10 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from ag_platform_api.core.config import (
+    LOCAL_DIRECT_CARD_PROVIDER,
+    STRIPE_HOSTED_TEST_ADAPTER_KEY,
+)
 from ag_platform_api.models import (
     Agent,
     AgentPaymentMethod,
@@ -29,6 +33,7 @@ from ag_platform_api.models import (
     PaymentMethodStatus,
     Purchase,
     PurchaseStatus,
+    StoredCardCredential,
 )
 from ag_platform_api.services.checkout.errors import (
     SAFE_ERROR_MESSAGES,
@@ -46,6 +51,7 @@ from ag_platform_api.services.checkout.types import (
     CheckoutContext,
     ExpectedCardMetadata,
     decimal_to_minor,
+    is_card_expired,
     normalize_item_text,
 )
 
@@ -57,7 +63,6 @@ TERMINAL_STATUSES = frozenset(
         CheckoutExecutionStatus.outcome_unknown,
     }
 )
-STRIPE_HOSTED_ADAPTER_KEY = "stripe-hosted"
 STRIPE_CHECKOUT_ORIGIN = "https://checkout.stripe.com"
 TRUSTED_RESULT_ORIGIN = "https://letyouragentspay.com"
 TRUSTED_RECEIPT_PATH = "/playground/success"
@@ -249,6 +254,11 @@ class SqlAlchemyCheckoutRepository:
                     expiry_year=payment_method.expiry_year,
                 ),
                 billing_details=deepcopy(payment_method.billing_details),
+                resolved_form_config=(
+                    deepcopy(execution.resolved_form_config)
+                    if isinstance(execution.resolved_form_config, Mapping)
+                    else None
+                ),
             )
 
     async def renew_lease(self, execution_id: UUID, *, lease_seconds: int) -> bool:
@@ -268,6 +278,22 @@ class SqlAlchemyCheckoutRepository:
         async with self._session_factory() as session, session.begin():
             execution = await self._running_execution_locked(session, execution_id)
             execution.browserbase_session_id = session_id
+
+    async def record_resolved_form_config(
+        self,
+        execution_id: UUID,
+        config: Mapping[str, object],
+    ) -> None:
+        snapshot = deepcopy(dict(config))
+        async with self._session_factory() as session, session.begin():
+            execution = await self._running_execution_locked(session, execution_id)
+            if execution.submitted_at is not None:
+                raise CheckoutError(CheckoutErrorCode.payment_outcome_unknown)
+            if execution.resolved_form_config is not None:
+                if execution.resolved_form_config != snapshot:
+                    raise CheckoutError(CheckoutErrorCode.form_analysis_failed)
+                return
+            execution.resolved_form_config = snapshot
 
     async def record_provider_request(self, execution_id: UUID, request_id: str) -> str:
         """Persist the external request before any payment credential is retrieved."""
@@ -572,8 +598,8 @@ class SqlAlchemyCheckoutRepository:
         if (
             cart.agent_id != execution.agent_id
             or cart.selected_payment_method_id != execution.payment_method_id
-            or execution.adapter_key != STRIPE_HOSTED_ADAPTER_KEY
-            or cart.checkout_adapter != STRIPE_HOSTED_ADAPTER_KEY
+            or execution.adapter_key != STRIPE_HOSTED_TEST_ADAPTER_KEY
+            or cart.checkout_adapter != STRIPE_HOSTED_TEST_ADAPTER_KEY
             or cart.checkout_url is None
             or cart.billing_period is not None
             or execution.submitted_at is None
@@ -754,6 +780,8 @@ class SqlAlchemyCheckoutRepository:
             or cart.selected_payment_method_id != payment_method.id
         ):
             raise CheckoutError(CheckoutErrorCode.payment_method_unavailable)
+        if is_card_expired(payment_method.expiry_month, payment_method.expiry_year):
+            raise CheckoutError(CheckoutErrorCode.payment_method_expired)
         unresolved_sibling = await session.scalar(
             select(CheckoutExecution.id)
             .where(
@@ -795,6 +823,28 @@ class SqlAlchemyCheckoutRepository:
         validate_checkout_url(cart.checkout_url, adapter.allowed_origins)
         if normalize_origin(cart.checkout_url) != normalize_origin(execution.checkout_origin):
             raise CheckoutError(CheckoutErrorCode.origin_blocked)
+        if payment_method.provider == LOCAL_DIRECT_CARD_PROVIDER:
+            direct_ai_adapter = (
+                adapter.checkout_mode == "direct"
+                and adapter.payment_form_strategy == "browserbase_ai"
+                and adapter.order_reference_selector is not None
+            )
+            hosted_test_adapter = (
+                execution.adapter_key == STRIPE_HOSTED_TEST_ADAPTER_KEY
+                and adapter.checkout_mode == "stripe_hosted_test"
+            )
+            if not (direct_ai_adapter or hosted_test_adapter):
+                raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+            credential = await session.scalar(
+                select(StoredCardCredential.payment_method_id)
+                .where(
+                    StoredCardCredential.payment_method_id == payment_method.id,
+                    StoredCardCredential.owner_id == execution.owner_id,
+                )
+                .with_for_update()
+            )
+            if credential is None:
+                raise CheckoutError(CheckoutErrorCode.card_unavailable)
         return execution, cart, agent, payment_method
 
     @staticmethod

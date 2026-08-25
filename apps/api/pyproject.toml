@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "ag-platform-api"
 version = "0.1.0"
 description = "Backend API for the AG Pay agent-wallet platform"
+license = "Apache-2.0"
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "alembic>=1.16,<2",
@@ -21,6 +22,7 @@ dependencies = [
   "python-multipart>=0.0.20,<1",
   "redis>=6,<7",
   "sqlalchemy[asyncio]>=2.0.41,<3",
+  "stagehand>=3.20,<4",
   "uvicorn[standard]>=0.35,<1",
 ]
 

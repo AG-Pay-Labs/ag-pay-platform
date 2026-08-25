@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import (
+    AfterValidator,
     AnyHttpUrl,
     BaseModel,
     BeforeValidator,
@@ -14,6 +15,7 @@ from pydantic import (
     Field,
     SecretStr,
     StringConstraints,
+    field_validator,
     model_validator,
 )
 
@@ -48,6 +50,32 @@ def _uppercase(value: str) -> str:
     return value.strip().upper()
 
 
+# ISO 3166-1 alpha-2 assigned country codes. Keep this explicit so request
+# validation does not depend on network access or optional locale packages.
+ISO_3166_ALPHA_2_CODES = frozenset(
+    """
+    AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ
+    BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ
+    CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ
+    DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR
+    GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY
+    HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP
+    KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY
+    MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ
+    NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY
+    QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ
+    TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ
+    VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW
+    """.split()
+)
+
+
+def _assigned_country_code(value: str) -> str:
+    if value not in ISO_3166_ALPHA_2_CODES:
+        raise ValueError("Country code must be an assigned ISO 3166-1 alpha-2 code.")
+    return value
+
+
 def _luhn_valid(value: str) -> bool:
     checksum = 0
     parity = len(value) % 2
@@ -59,6 +87,16 @@ def _luhn_valid(value: str) -> bool:
                 digit -= 9
         checksum += digit
     return checksum % 10 == 0
+
+
+def normalize_card_number(value: SecretStr | str) -> str:
+    raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+    normalized = raw.replace(" ", "").replace("-", "")
+    if not normalized.isdigit() or not 12 <= len(normalized) <= 19:
+        raise ValueError("Card number must contain 12 to 19 digits")
+    if not _luhn_valid(normalized):
+        raise ValueError("Card number checksum is invalid")
+    return normalized
 
 
 def _contains_pan_or_cvc_like_digits(value: str) -> bool:
@@ -77,6 +115,7 @@ CountryCode = Annotated[
     str,
     BeforeValidator(_uppercase),
     StringConstraints(pattern=r"^[A-Z]{2}$"),
+    AfterValidator(_assigned_country_code),
 ]
 
 
@@ -280,6 +319,24 @@ class PaymentMethodCreate(APIModel):
         return self
 
 
+class DirectCardPaymentMethodCreate(APIModel):
+    display_name: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
+    ]
+    card_number: SecretStr = Field(min_length=12, max_length=32)
+    expiry_month: int = Field(ge=1, le=12)
+    expiry_year: int = Field(ge=2020, le=2200)
+    billing_details: BillingDetails
+
+    @model_validator(mode="after")
+    def validate_card(self) -> "DirectCardPaymentMethodCreate":
+        normalize_card_number(self.card_number)
+        now = datetime.now(UTC)
+        if (self.expiry_year, self.expiry_month) < (now.year, now.month):
+            raise ValueError("Card expiry must not be in the past")
+        return self
+
+
 class PaymentMethodRead(APIModel):
     id: UUID
     display_name: str
@@ -423,6 +480,14 @@ class HumanCartItemRead(CartItemRead):
 class CartApproval(APIModel):
     payment_method_id: UUID
     note: Annotated[str | None, StringConstraints(max_length=2000)] = None
+    cvc: SecretStr | None = Field(default=None, min_length=3, max_length=4)
+
+    @field_validator("cvc")
+    @classmethod
+    def validate_cvc(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().isdigit():
+            raise ValueError("CVC must contain three or four digits")
+        return value
 
 
 class CartCancellation(APIModel):

@@ -1,6 +1,7 @@
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
@@ -67,6 +68,17 @@ class ExpectedCardMetadata:
     expiry_year: int
 
 
+def is_card_expired(
+    expiry_month: int,
+    expiry_year: int,
+    *,
+    at: datetime | None = None,
+) -> bool:
+    """Return whether a card expired before the month containing ``at``."""
+    current = at or datetime.now(UTC)
+    return (expiry_year, expiry_month) < (current.year, current.month)
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class BrowserbaseSession:
     session_id: str
@@ -96,10 +108,11 @@ class CheckoutAdapter:
     product_title_selector: str
     quantity_selector: str
     total_selector: str
-    card_number_selector: str
-    cvc_selector: str
-    submit_selector: str
     success_selector: str
+    payment_form_strategy: str = "configured"
+    card_number_selector: str | None = None
+    cvc_selector: str | None = None
+    submit_selector: str | None = None
     decline_selector: str | None = None
     resource_origins: tuple[str, ...] = ()
     result_origins: tuple[str, ...] = ()
@@ -147,18 +160,39 @@ class CheckoutAdapter:
             self.product_title_selector,
             self.quantity_selector,
             self.total_selector,
-            self.card_number_selector,
-            self.cvc_selector,
-            self.submit_selector,
             self.success_selector,
         )
         if not all(required):
             raise CheckoutError(CheckoutErrorCode.adapter_invalid)
-        combined = self.expiry_selector is not None
-        split = self.expiry_month_selector is not None and self.expiry_year_selector is not None
-        partial_split = (self.expiry_month_selector is None) != (self.expiry_year_selector is None)
-        if combined == split or partial_split:
+        if self.payment_form_strategy not in {"configured", "browserbase_ai", "resolved"}:
             raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+        if self.payment_form_strategy == "browserbase_ai":
+            if self.checkout_mode != "direct" or any(
+                value is not None
+                for value in (
+                    self.card_number_selector,
+                    self.cvc_selector,
+                    self.submit_selector,
+                    self.expiry_selector,
+                    self.expiry_month_selector,
+                    self.expiry_year_selector,
+                )
+            ):
+                raise CheckoutError(CheckoutErrorCode.adapter_invalid)
+        else:
+            combined = self.expiry_selector is not None
+            split = self.expiry_month_selector is not None and self.expiry_year_selector is not None
+            partial_split = (self.expiry_month_selector is None) != (
+                self.expiry_year_selector is None
+            )
+            if (
+                combined == split
+                or partial_split
+                or self.card_number_selector is None
+                or self.cvc_selector is None
+                or self.submit_selector is None
+            ):
+                raise CheckoutError(CheckoutErrorCode.adapter_invalid)
         if self.checkout_mode not in {"direct", "stripe_hosted_test"}:
             raise CheckoutError(CheckoutErrorCode.adapter_invalid)
         if not set(self.result_origins).issubset(self.allowed_origins):
@@ -202,6 +236,7 @@ class CheckoutContext:
     card_metadata: ExpectedCardMetadata
     billing_details: Mapping[str, Any]
     provider_request_id: str | None = None
+    resolved_form_config: Mapping[str, Any] | None = None
 
     @property
     def amount_minor(self) -> int:

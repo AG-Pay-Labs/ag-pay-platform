@@ -25,6 +25,7 @@ SAFE_VALIDATION_MESSAGES = frozenset(
         "Managed checkout requires an absolute HTTPS URL without embedded credentials",
         "The managed checkout currency is not supported.",
         "The managed checkout amount is invalid for its currency.",
+        "Country code must be an assigned ISO 3166-1 alpha-2 code.",
     }
 )
 SAFE_LOCATION_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
@@ -43,7 +44,7 @@ app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
     description=(
-        "Backend for connecting autonomous agents, assigning tokenized payment methods, "
+        "Backend for connecting autonomous agents, assigning payment methods, "
         "approving purchase proposals, and tracking purchases and subscriptions."
     ),
     lifespan=lifespan,

@@ -12,8 +12,10 @@ from ag_platform_api.api.dependencies import (
     CurrentUser,
     DatabaseSession,
     DatabaseSessionFactory,
+    DirectCardCvcClient,
     PaymentVerifier,
 )
+from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
 from ag_platform_api.core.security import decrypt_secret, verify_password
 from ag_platform_api.models import (
     AgentPaymentMethod,
@@ -30,6 +32,7 @@ from ag_platform_api.schemas import (
     CredentialRevealRequest,
     HumanCartItemRead,
 )
+from ag_platform_api.services.checkout.cvc_broker import CvcBrokerError
 from ag_platform_api.services.checkout.reconciliation import (
     CheckoutReconciliationService,
     ReconciliationError,
@@ -162,6 +165,7 @@ async def approve_cart_item(
     db: DatabaseSession,
     settings: AppSettings,
     broker: Broker,
+    cvc_client: DirectCardCvcClient,
 ) -> HumanCartItemRead:
     item = await owned_cart_item(db, user.id, cart_item_id, for_update=True)
     if item.status is not CartItemStatus.proposed:
@@ -184,12 +188,35 @@ async def approve_cart_item(
     if assignment is None:
         raise HTTPException(status_code=409, detail="Payment method is not assigned to this agent")
 
+    direct_card = payment_method.provider == LOCAL_DIRECT_CARD_PROVIDER
+    if direct_card:
+        if item.checkout_adapter is None or item.checkout_url is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Stored direct cards can only be used for managed checkout",
+            )
+        if payload.cvc is None:
+            raise HTTPException(
+                status_code=422,
+                detail="CVC is required for this managed checkout",
+            )
+        if cvc_client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="The local card security-code relay is unavailable",
+            )
+    elif payload.cvc is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="CVC is accepted only for a stored direct-card checkout",
+        )
+
     item.status = CartItemStatus.approved
     item.selected_payment_method_id = payment_method.id
     item.decision_note = payload.note
     item.approved_at = datetime.now(UTC)
     try:
-        await queue_checkout_execution(
+        execution = await queue_checkout_execution(
             db,
             item=item,
             payment_method=payment_method,
@@ -198,7 +225,31 @@ async def approve_cart_item(
     except CheckoutQueueError as exc:
         await db.rollback()
         raise HTTPException(status_code=409, detail=exc.message) from exc
-    await db.commit()
+    cvc_receipt: str | None = None
+    if direct_card:
+        if execution is None or payload.cvc is None or cvc_client is None:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="Managed checkout execution is required")
+        try:
+            cvc_receipt = await cvc_client.put(
+                execution_id=execution.id,
+                owner_id=user.id,
+                payment_method_id=payment_method.id,
+                cvc=payload.cvc.get_secret_value(),
+            )
+        except CvcBrokerError as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail="The local card security-code relay is unavailable",
+            ) from exc
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        if cvc_receipt is not None and execution is not None and cvc_client is not None:
+            await cvc_client.discard(execution_id=execution.id, receipt=cvc_receipt)
+        raise
     item = await load_cart_item(db, item.id)
     await broker.publish(
         "cart_item.approved",

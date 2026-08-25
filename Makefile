@@ -5,7 +5,7 @@ PNPM ?= pnpm
 SEED_USERNAME ?= vitalybulyzhin@gmail.com
 VENV := $(API_DIR)/.venv
 
-.PHONY: help api-install api-migrate api-run checkout-worker demo-merchant-run api-lint seed-demo seed-checkout-demo web-install web-run web-lint web-typecheck web-build lint test
+.PHONY: help api-install api-migrate api-run checkout-worker demo-merchant-run direct-card-fixture-run api-lint seed-demo seed-checkout-demo web-install web-run web-lint web-typecheck web-build lint test
 
 help: ## Show available commands.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "%-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -25,6 +25,9 @@ checkout-worker: ## Run the trusted managed-checkout worker.
 
 demo-merchant-run: ## Run the Stripe test merchant on port 8100 (development only).
 	@cd $(API_DIR) && .venv/bin/python -m uvicorn ag_platform_api.demo_merchant:app --port 8100 --reload
+
+direct-card-fixture-run: ## Run the no-charge direct-card browser fixture on port 8101.
+	@cd $(API_DIR) && .venv/bin/python -m uvicorn ag_platform_api.direct_card_fixture:app --host 127.0.0.1 --port 8101
 
 api-lint: ## Run backend static checks.
 	@cd $(API_DIR) && .venv/bin/python -m ruff check .
