@@ -6,7 +6,7 @@ import { apiRequest } from "@/lib/api-client";
 import type {
   AgentRead,
   CartItemRead,
-  PaymentPolicyRead,
+  PaymentRuleSetRead,
   PaymentMethodRead,
   PurchaseRead,
   SubscriptionRead,
@@ -14,12 +14,13 @@ import type {
 
 export const queryKeys = {
   agents: ["agents"] as const,
-  agentCards: (agentId: string) => ["agents", agentId, "payment-methods"] as const,
+  agentCards: (agentId: string) =>
+    ["agents", agentId, "payment-methods"] as const,
   cards: ["payment-methods"] as const,
   cart: ["cart-items"] as const,
   purchases: ["purchases"] as const,
   subscriptions: ["subscriptions"] as const,
-  paymentPolicies: ["payment-policies"] as const,
+  paymentRuleSets: ["payment-rule-sets"] as const,
 };
 
 export function useAgents() {
@@ -52,7 +53,9 @@ export function useCartItems() {
     queryFn: () => apiRequest<CartItemRead[]>("/cart-items"),
     refetchInterval: (query) =>
       query.state.data?.some(
-        (item) => item.execution?.status === "queued" || item.execution?.status === "running",
+        (item) =>
+          item.execution?.status === "queued" ||
+          item.execution?.status === "running"
       )
         ? 2_000
         : 20_000,
@@ -75,9 +78,9 @@ export function useSubscriptions() {
   });
 }
 
-export function usePaymentPolicies() {
+export function usePaymentRuleSets() {
   return useQuery({
-    queryKey: queryKeys.paymentPolicies,
-    queryFn: () => apiRequest<PaymentPolicyRead[]>("/payment-policies"),
+    queryKey: queryKeys.paymentRuleSets,
+    queryFn: () => apiRequest<PaymentRuleSetRead[]>("/payment-rule-sets"),
   });
 }

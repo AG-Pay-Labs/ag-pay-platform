@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from ag_platform_api.api.dependencies import AppSettings, Broker, CurrentUser, DatabaseSession
 from ag_platform_api.core.security import hash_opaque_token, new_opaque_token
-from ag_platform_api.models import Agent, AgentPaymentPolicy, AgentStatus
+from ag_platform_api.models import Agent, AgentStatus
 from ag_platform_api.schemas import (
     AgentCreate,
     AgentCreated,
@@ -44,8 +44,6 @@ async def create_agent(
         pairing_expires_at=expires_at,
     )
     db.add(agent)
-    await db.flush()
-    db.add(AgentPaymentPolicy(owner_id=user.id, agent_id=agent.id))
     await db.commit()
     await db.refresh(agent)
     await broker.publish("agent.created", {"agent_id": agent.id, "owner_id": user.id})

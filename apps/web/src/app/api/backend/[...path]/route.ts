@@ -26,8 +26,9 @@ const ALLOWED_ROUTES: ReadonlyArray<readonly [string, RegExp]> = [
   ["POST", /^\/payment-methods$/],
   ["POST", /^\/payment-methods\/direct-card$/],
   ["DELETE", new RegExp(`^/payment-methods/${UUID}$`)],
-  ["GET", /^\/payment-policies$/],
-  ["PATCH", new RegExp(`^/agents/${UUID}/payment-policy$`)],
+  ["GET", /^\/payment-rule-sets$/],
+  ["POST", /^\/payment-rule-sets$/],
+  ["PATCH", new RegExp(`^/payment-rule-sets/${UUID}$`)],
   ["GET", /^\/cart-items$/],
   ["GET", new RegExp(`^/cart-items/${UUID}$`)],
   ["POST", new RegExp(`^/cart-items/${UUID}/approve$`)],
@@ -58,7 +59,7 @@ function hasAllowedQuery(path: string, searchParams: URLSearchParams): boolean {
 function jsonError(detail: string, status: number): NextResponse {
   return NextResponse.json(
     { detail },
-    { status, headers: { "Cache-Control": "no-store" } },
+    { status, headers: { "Cache-Control": "no-store" } }
   );
 }
 
@@ -68,7 +69,10 @@ function unauthenticatedResponse(): NextResponse {
   return response;
 }
 
-async function proxy(request: NextRequest, context: RouteContext): Promise<NextResponse> {
+async function proxy(
+  request: NextRequest,
+  context: RouteContext
+): Promise<NextResponse> {
   const { path: segments } = await context.params;
   const path = `/${segments.join("/")}`;
 
@@ -94,7 +98,10 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<NextR
     if (requestBody) {
       const contentType = request.headers.get("content-type") ?? "";
       if (!contentType.toLowerCase().includes("application/json")) {
-        return jsonError("Only application/json request bodies are accepted.", 415);
+        return jsonError(
+          "Only application/json request bodies are accepted.",
+          415
+        );
       }
       body = requestBody;
       headers.set("Content-Type", "application/json");
@@ -113,9 +120,11 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<NextR
     });
     const responseHeaders = new Headers({ "Cache-Control": "no-store" });
     const responseContentType = upstream.headers.get("content-type");
-    if (responseContentType) responseHeaders.set("Content-Type", responseContentType);
+    if (responseContentType)
+      responseHeaders.set("Content-Type", responseContentType);
 
-    const responseBody = upstream.status === 204 ? null : await upstream.arrayBuffer();
+    const responseBody =
+      upstream.status === 204 ? null : await upstream.arrayBuffer();
     const response = new NextResponse(responseBody, {
       status: upstream.status,
       headers: responseHeaders,

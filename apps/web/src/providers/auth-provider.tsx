@@ -28,8 +28,8 @@ export interface AuthContextValue {
   loading: boolean;
   isAuthenticated: boolean;
   error: Error | null;
-  login(username: string, password: string): Promise<AuthSession>;
-  register(username: string, password: string): Promise<AuthSession>;
+  login(email: string, password: string): Promise<AuthSession>;
+  register(email: string, password: string): Promise<AuthSession>;
   logout(): Promise<void>;
   refreshSession(): Promise<void>;
 }
@@ -65,7 +65,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     window.addEventListener(API_UNAUTHORIZED_EVENT, markUnauthenticated);
-    return () => window.removeEventListener(API_UNAUTHORIZED_EVENT, markUnauthenticated);
+    return () =>
+      window.removeEventListener(API_UNAUTHORIZED_EVENT, markUnauthenticated);
   }, [markUnauthenticated]);
 
   useEffect(() => {
@@ -80,33 +81,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const timeout = window.setTimeout(
       markUnauthenticated,
-      Math.min(remaining, 2_147_483_647),
+      Math.min(remaining, 2_147_483_647)
     );
     return () => window.clearTimeout(timeout);
   }, [markUnauthenticated, sessionQuery.data?.expires_at]);
 
   const establishSession = useCallback(
-    async (route: "/login" | "/register", username: string, password: string) => {
+    async (route: "/login" | "/register", email: string, password: string) => {
       const session = await authRequest<AuthSession>(route, {
         method: "POST",
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ email, password }),
       });
       clearProtectedData();
       queryClient.setQueryData(AUTH_SESSION_QUERY_KEY, session);
       return session;
     },
-    [clearProtectedData, queryClient],
+    [clearProtectedData, queryClient]
   );
 
   const login = useCallback(
-    (username: string, password: string) => establishSession("/login", username, password),
-    [establishSession],
+    (email: string, password: string) =>
+      establishSession("/login", email, password),
+    [establishSession]
   );
 
   const register = useCallback(
-    (username: string, password: string) =>
-      establishSession("/register", username, password),
-    [establishSession],
+    (email: string, password: string) =>
+      establishSession("/register", email, password),
+    [establishSession]
   );
 
   const logout = useCallback(async () => {
@@ -127,8 +129,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const status: AuthStatus = loading
     ? "loading"
     : session
-      ? "authenticated"
-      : "unauthenticated";
+    ? "authenticated"
+    : "unauthenticated";
 
   const value = useMemo<AuthContextValue>(
     () => ({
@@ -152,7 +154,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       session,
       sessionQuery.error,
       status,
-    ],
+    ]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

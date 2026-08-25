@@ -53,7 +53,11 @@ async def seed_execution(
     recurring: bool = False,
 ) -> UUID:
     async with session_factory() as session, session.begin():
-        user = User(username=f"owner-{id(session)}", password_hash="unused", is_active=True)
+        user = User(
+            email=f"owner-{id(session)}@example.com",
+            password_hash="unused",
+            is_active=True,
+        )
         session.add(user)
         await session.flush()
         agent = Agent(

@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from email_validator import EmailNotValidError, validate_email
 from pydantic import (
     AfterValidator,
     AnyHttpUrl,
@@ -33,10 +34,6 @@ from ag_platform_api.models import (
 from ag_platform_api.services.checkout.errors import CheckoutError
 from ag_platform_api.services.checkout.types import decimal_to_minor
 
-Username = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, to_lower=True, min_length=3, max_length=64),
-]
 Password = Annotated[SecretStr, Field(min_length=10, max_length=256)]
 OPAQUE_PROVIDER_REFERENCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{2,254}$")
 PROVIDER_REFERENCE_PATTERNS = {
@@ -48,6 +45,17 @@ PROVIDER_REFERENCE_PATTERNS = {
 
 def _uppercase(value: str) -> str:
     return value.strip().upper()
+
+
+def _account_email(value: str) -> str:
+    try:
+        result = validate_email(value.strip(), check_deliverability=False)
+    except (AttributeError, EmailNotValidError):
+        raise ValueError("Enter a valid email address, for example name@example.com.") from None
+    return result.normalized.lower()
+
+
+AccountEmail = Annotated[str, BeforeValidator(_account_email)]
 
 
 # ISO 3166-1 alpha-2 assigned country codes. Keep this explicit so request
@@ -128,13 +136,13 @@ class Message(APIModel):
 
 
 class UserRegister(APIModel):
-    username: Username
+    email: AccountEmail
     password: Password
 
 
 class UserRead(APIModel):
     id: UUID
-    username: str
+    email: str
     is_active: bool
     created_at: datetime
 
@@ -146,7 +154,7 @@ class TokenResponse(APIModel):
 
 
 class LoginRequest(APIModel):
-    username: Username
+    email: AccountEmail
     password: SecretStr
 
 
@@ -179,17 +187,19 @@ class PairingTokenResponse(APIModel):
     pairing_expires_at: datetime
 
 
-class AgentPaymentPolicyRead(APIModel):
+class PaymentRuleSetRead(APIModel):
     id: UUID
-    agent_id: UUID
+    name: str
     mode: PaymentApprovalMode
     threshold_amount: Decimal | None
     threshold_currency: str | None
+    assigned_agent_ids: list[UUID]
     created_at: datetime
     updated_at: datetime
 
 
-class AgentPaymentPolicyUpdate(APIModel):
+class PaymentRuleSetWrite(APIModel):
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
     mode: PaymentApprovalMode
     threshold_amount: Decimal | None = Field(
         default=None,
@@ -198,9 +208,10 @@ class AgentPaymentPolicyUpdate(APIModel):
         decimal_places=2,
     )
     threshold_currency: Currency | None = None
+    agent_ids: list[UUID] = Field(default_factory=list, max_length=1000)
 
     @model_validator(mode="after")
-    def validate_threshold(self) -> "AgentPaymentPolicyUpdate":
+    def validate_rule_set(self) -> "PaymentRuleSetWrite":
         threshold_mode = self.mode in {
             PaymentApprovalMode.above_amount,
             PaymentApprovalMode.subscriptions_or_above_amount,
@@ -215,6 +226,8 @@ class AgentPaymentPolicyUpdate(APIModel):
             raise ValueError("Threshold amount and currency are required for this mode")
         if not threshold_mode and threshold_supplied:
             raise ValueError("Threshold amount and currency are not allowed for this mode")
+        if len(set(self.agent_ids)) != len(self.agent_ids):
+            raise ValueError("Agent assignments must not contain duplicates")
         return self
 
 

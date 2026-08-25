@@ -18,7 +18,6 @@ from ag_platform_api.db.session import SessionFactory
 from ag_platform_api.models import (
     Agent,
     AgentPaymentMethod,
-    AgentPaymentPolicy,
     AgentStatus,
     BillingPeriod,
     BillingProfileType,
@@ -27,6 +26,7 @@ from ag_platform_api.models import (
     PaymentApprovalMode,
     PaymentMethod,
     PaymentMethodStatus,
+    PaymentRuleSet,
     Purchase,
     PurchaseCredential,
     PurchaseStatus,
@@ -460,7 +460,7 @@ async def _seed_card(db: Any, owner: User, now: datetime) -> PaymentMethod:
         "vat_number": "ESB87942136",
         "registration_number": "B-87942136",
         "contact_name": "Vitaly Bulyzhyn",
-        "email": owner.username,
+        "email": owner.email,
         "phone": None,
         "address": {
             "line1": "Calle de la Innovación 12",
@@ -542,7 +542,7 @@ async def _seed_purchase(
         item.decision_note = "Approved under the configured payment policy."
         item.credential.owner_id = owner.id
         item.credential.agent_id = agent.id
-        item.credential.email = owner.username
+        item.credential.email = owner.email
         item.credential.login_url = seed.login_url
 
         if seed.billing_period is not None:
@@ -574,7 +574,7 @@ async def _seed_purchase(
     credential = PurchaseCredential(
         owner_id=owner.id,
         agent_id=agent.id,
-        email=owner.username,
+        email=owner.email,
         encrypted_password=encrypt_secret(
             f"{SEEDED_MERCHANT_PASSWORD_PREFIX}-{seed.slug}", get_settings()
         ),
@@ -676,7 +676,7 @@ async def _seed_approval(
         if existing.credential is not None:
             existing.credential.owner_id = owner.id
             existing.credential.agent_id = agent.id
-            existing.credential.email = owner.username
+            existing.credential.email = owner.email
             existing.credential.login_url = seed.login_url
         return existing
 
@@ -685,7 +685,7 @@ async def _seed_approval(
     credential = PurchaseCredential(
         owner_id=owner.id,
         agent_id=agent.id,
-        email=owner.username,
+        email=owner.email,
         encrypted_password=encrypt_secret(
             f"{SEEDED_MERCHANT_PASSWORD_PREFIX}-approval-{seed.slug}", get_settings()
         ),
@@ -725,32 +725,35 @@ async def _seed_policy(
     owner: User,
     agents: dict[str, Agent],
     seed: PolicySeed,
-) -> AgentPaymentPolicy:
+) -> PaymentRuleSet:
     agent = agents[seed.agent_slug]
+    rule_set_name = f"{agent.name} rules"
     policy = await db.scalar(
-        select(AgentPaymentPolicy).where(
-            AgentPaymentPolicy.owner_id == owner.id,
-            AgentPaymentPolicy.agent_id == agent.id,
+        select(PaymentRuleSet).where(
+            PaymentRuleSet.owner_id == owner.id,
+            PaymentRuleSet.name == rule_set_name,
         )
     )
     if policy is None:
-        policy = AgentPaymentPolicy(owner_id=owner.id, agent_id=agent.id)
+        policy = PaymentRuleSet(owner_id=owner.id, name=rule_set_name)
         db.add(policy)
+        await db.flush()
 
     policy.mode = seed.mode
     policy.threshold_amount = seed.threshold_amount
     policy.threshold_currency = seed.threshold_currency
+    agent.payment_rule_set_id = policy.id
     return policy
 
 
-async def seed_demo_data(username: str) -> dict[str, int]:
+async def seed_demo_data(email: str) -> dict[str, int]:
     now = datetime.now(UTC).replace(microsecond=0)
-    normalized_username = username.strip().lower()
+    normalized_email = email.strip().lower()
 
     async with SessionFactory() as db:
-        owner = await db.scalar(select(User).where(User.username == normalized_username))
+        owner = await db.scalar(select(User).where(User.email == normalized_email))
         if owner is None:
-            raise LookupError(f"No user exists with username {normalized_username!r}")
+            raise LookupError(f"No user exists with email {normalized_email!r}")
 
         agents: dict[str, Agent] = {}
         for seed in AGENT_SEEDS:
@@ -790,10 +793,10 @@ async def seed_demo_data(username: str) -> dict[str, int]:
                 .select_from(PaymentMethod)
                 .where(PaymentMethod.owner_id == owner.id)
             ),
-            "payment_policies": await db.scalar(
+            "payment_rule_sets": await db.scalar(
                 select(func.count())
-                .select_from(AgentPaymentPolicy)
-                .where(AgentPaymentPolicy.owner_id == owner.id)
+                .select_from(PaymentRuleSet)
+                .where(PaymentRuleSet.owner_id == owner.id)
             ),
             "purchases": await db.scalar(
                 select(func.count()).select_from(Purchase).where(Purchase.owner_id == owner.id)
@@ -818,15 +821,15 @@ async def seed_demo_data(username: str) -> dict[str, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Seed repeatable AG Pay demo data.")
-    parser.add_argument("--username", required=True, help="Existing platform username/email")
+    parser.add_argument("--email", required=True, help="Existing platform account email")
     args = parser.parse_args()
 
     try:
-        summary = asyncio.run(seed_demo_data(args.username))
+        summary = asyncio.run(seed_demo_data(args.email))
     except LookupError as exc:
         raise SystemExit(str(exc)) from exc
 
-    print(f"Seeded demo data for {args.username.strip().lower()}:")
+    print(f"Seeded demo data for {args.email.strip().lower()}:")
     for entity, count in summary.items():
         print(f"  {entity}: {count}")
 

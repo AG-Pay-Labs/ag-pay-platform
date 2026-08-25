@@ -7,7 +7,11 @@ export type AgentConnectionState = "pending" | "online" | "offline" | "revoked";
 export type BillingProfileType = "personal" | "business";
 export type BillingPeriod = "monthly" | "yearly";
 export type PaymentMethodStatus = "active" | "disabled";
-export type CartItemStatus = "proposed" | "approved" | "cancelled" | "purchased";
+export type CartItemStatus =
+  | "proposed"
+  | "approved"
+  | "cancelled"
+  | "purchased";
 export type CheckoutExecutionStatus =
   | "queued"
   | "running"
@@ -29,18 +33,18 @@ export interface Message {
 }
 
 export interface UserRegister {
-  username: string;
+  email: string;
   password: string;
 }
 
 export interface LoginRequest {
-  username: string;
+  email: string;
   password: string;
 }
 
 export interface UserRead {
   id: UUID;
-  username: string;
+  email: string;
   is_active: boolean;
   created_at: ISODateTime;
 }
@@ -313,20 +317,23 @@ export interface SubscriptionUpdate {
   next_billing_at?: ISODateTime | null;
 }
 
-export interface PaymentPolicyRead {
+export interface PaymentRuleSetRead {
   id: UUID;
-  agent_id: UUID;
+  name: string;
   mode: PaymentApprovalMode;
   threshold_amount: DecimalString | null;
   threshold_currency: string | null;
+  assigned_agent_ids: UUID[];
   created_at: ISODateTime;
   updated_at: ISODateTime;
 }
 
-export interface PaymentPolicyUpdate {
+export interface PaymentRuleSetWrite {
+  name: string;
   mode: PaymentApprovalMode;
   threshold_amount: DecimalString | null;
   threshold_currency: string | null;
+  agent_ids: UUID[];
 }
 
 export interface ValidationIssue {

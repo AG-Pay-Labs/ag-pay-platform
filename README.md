@@ -109,7 +109,7 @@ Run migrations, the API, web app, and `make checkout-worker` in separate
 terminals. Create the human account and agent, then seed the safe methods:
 
 ```bash
-make seed-checkout-demo SEED_USERNAME=your-login-email@example.com
+make seed-checkout-demo SEED_EMAIL=your-login-email@example.com
 ```
 
 The built-in adapter key is `stripe-hosted`; do not add or override it in
@@ -239,7 +239,7 @@ locally tracked subscriptions.
 To populate an existing account with repeatable local demo data:
 
 ```bash
-make seed-demo SEED_USERNAME=your-existing-username
+make seed-demo SEED_EMAIL=you@example.com
 ```
 
 The seeder creates seven named OpenClaw/Hermes agents, assigns each one the same
@@ -309,10 +309,11 @@ landing-server proof. Issuing, Stripe Link, and other unresolved executions must
 still be reconciled through their provider-specific operator process; do not
 reuse those cards while the outcome remains unknown.
 
-The `never` review mode means eligible legacy/external-completion proposals do
-not wait for a person when an active assigned method exists. It never
-auto-approves executable managed checkout and is not an unlimited spending
-permission.
+The `never` review mode means eligible proposals do not wait for a person when
+an active assigned method exists. Managed checkout is approved and queued
+automatically only when its adapter and assigned payment method pass the same
+execution safety checks used during human approval. It is not an unlimited
+spending permission.
 
 ## Checks
 

@@ -22,12 +22,12 @@ async def update_policy(
     agent_id: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    response = await client.patch(
-        f"{API}/agents/{agent_id}/payment-policy",
+    response = await client.post(
+        f"{API}/payment-rule-sets",
         headers=bearer(user_token),
-        json=payload,
+        json={"name": f"Rules {agent_id}", "agent_ids": [agent_id], **payload},
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 201, response.text
     return response.json()
 
 
@@ -61,35 +61,51 @@ async def policy_wallet(
     return result
 
 
-async def test_payment_policy_list_includes_every_agent_with_persisted_defaults(
+async def test_multiple_rule_sets_can_exist_and_agents_can_be_reassigned(
     client: AsyncClient,
 ) -> None:
     user_token = await register_user(client, "policy-list-owner")
     first_agent = await create_agent(client, user_token, name="First policy agent")
     second_agent = await create_agent(client, user_token, name="Second policy agent")
 
-    first_response = await client.get(
-        f"{API}/payment-policies",
+    empty = await client.get(
+        f"{API}/payment-rule-sets",
         headers=bearer(user_token),
     )
-    assert first_response.status_code == 200
-    first_policies = first_response.json()
-    assert {policy["agent_id"] for policy in first_policies} == {
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+    cautious = await client.post(
+        f"{API}/payment-rule-sets",
+        headers=bearer(user_token),
+        json={
+            "name": "Cautious",
+            "mode": "always",
+            "agent_ids": [first_agent["id"], second_agent["id"]],
+        },
+    )
+    assert cautious.status_code == 201, cautious.text
+    assert set(cautious.json()["assigned_agent_ids"]) == {
         first_agent["id"],
         second_agent["id"],
     }
-    assert {policy["mode"] for policy in first_policies} == {"always"}
-    assert all(policy["threshold_amount"] is None for policy in first_policies)
-    assert all(policy["threshold_currency"] is None for policy in first_policies)
 
-    second_response = await client.get(
-        f"{API}/payment-policies",
+    autonomous = await client.post(
+        f"{API}/payment-rule-sets",
         headers=bearer(user_token),
+        json={
+            "name": "Autonomous",
+            "mode": "never",
+            "agent_ids": [second_agent["id"]],
+        },
     )
-    assert second_response.status_code == 200
-    assert {policy["agent_id"]: policy["id"] for policy in second_response.json()} == {
-        policy["agent_id"]: policy["id"] for policy in first_policies
-    }
+    assert autonomous.status_code == 201, autonomous.text
+
+    listed = await client.get(f"{API}/payment-rule-sets", headers=bearer(user_token))
+    assert listed.status_code == 200
+    by_name = {rule_set["name"]: rule_set for rule_set in listed.json()}
+    assert by_name["Cautious"]["assigned_agent_ids"] == [first_agent["id"]]
+    assert by_name["Autonomous"]["assigned_agent_ids"] == [second_agent["id"]]
 
 
 @pytest.mark.parametrize(
@@ -263,10 +279,10 @@ async def test_payment_policy_threshold_validation(
     user_token = await register_user(client, f"policy-validation-{abs(hash(str(payload)))}")
     agent = await create_agent(client, user_token)
 
-    response = await client.patch(
-        f"{API}/agents/{agent['id']}/payment-policy",
+    response = await client.post(
+        f"{API}/payment-rule-sets",
         headers=bearer(user_token),
-        json=payload,
+        json={"name": "Invalid rules", "agent_ids": [agent["id"]], **payload},
     )
 
     assert response.status_code == 422
@@ -278,17 +294,23 @@ async def test_payment_policy_routes_are_tenant_scoped(client: AsyncClient) -> N
     owner_b = await register_user(client, "policy-tenant-b")
     agent_b = await create_agent(client, owner_b)
 
+    created = await client.post(
+        f"{API}/payment-rule-sets",
+        headers=bearer(owner_a),
+        json={"name": "Owner A rules", "mode": "never", "agent_ids": [agent_a["id"]]},
+    )
+    assert created.status_code == 201
+
     cross_tenant_update = await client.patch(
-        f"{API}/agents/{agent_a['id']}/payment-policy",
+        f"{API}/payment-rule-sets/{created.json()['id']}",
         headers=bearer(owner_b),
-        json={"mode": "never"},
+        json={"name": "Stolen", "mode": "never", "agent_ids": [agent_b["id"]]},
     )
     assert cross_tenant_update.status_code == 404
 
     policies_b = await client.get(
-        f"{API}/payment-policies",
+        f"{API}/payment-rule-sets",
         headers=bearer(owner_b),
     )
     assert policies_b.status_code == 200
-    assert [policy["agent_id"] for policy in policies_b.json()] == [agent_b["id"]]
-    assert all(policy["agent_id"] != agent_a["id"] for policy in policies_b.json())
+    assert policies_b.json() == []

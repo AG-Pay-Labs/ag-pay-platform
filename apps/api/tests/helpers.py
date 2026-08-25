@@ -12,12 +12,13 @@ def bearer(token: str) -> dict[str, str]:
 
 async def register_user(
     client: AsyncClient,
-    username: str,
+    email: str,
     password: str = PASSWORD,
 ) -> str:
+    normalized_email = email if "@" in email else f"{email}@example.com"
     response = await client.post(
         f"{API}/auth/register",
-        json={"username": username, "password": password},
+        json={"email": normalized_email, "password": password},
     )
     assert response.status_code == 201, response.text
     return response.json()["access_token"]

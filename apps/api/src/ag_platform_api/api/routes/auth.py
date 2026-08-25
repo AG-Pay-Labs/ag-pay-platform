@@ -17,7 +17,7 @@ async def register(
     settings: AppSettings,
 ) -> TokenResponse:
     user = User(
-        username=payload.username,
+        email=payload.email,
         password_hash=hash_password(payload.password.get_secret_value()),
     )
     db.add(user)
@@ -25,7 +25,10 @@ async def register(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="Username is already registered") from exc
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email address already exists.",
+        ) from exc
     await db.refresh(user)
     token, expires_at = create_access_token(str(user.id), settings)
     return TokenResponse(access_token=token, expires_at=expires_at)
@@ -37,11 +40,11 @@ async def login(
     db: DatabaseSession,
     settings: AppSettings,
 ) -> TokenResponse:
-    user = await db.scalar(select(User).where(User.username == payload.username))
+    user = await db.scalar(select(User).where(User.email == payload.email))
     if user is None or not verify_password(payload.password.get_secret_value(), user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
+            detail="The email address or password is incorrect.",
         )
     if not user.is_active:
         raise HTTPException(status_code=403, detail="User account is disabled")

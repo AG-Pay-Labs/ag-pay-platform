@@ -10,7 +10,7 @@ async def test_validation_error_does_not_echo_rejected_password_or_extra_body_va
     response = await client.post(
         f"{API}/auth/register",
         json={
-            "username": "ab",
+            "email": "not-an-email",
             "password": "pwSENT!",
             "https://secret.example.test/4242424242424242": "cvc-sentinel-987",
         },
@@ -24,28 +24,30 @@ async def test_validation_error_does_not_echo_rejected_password_or_extra_body_va
 
 
 async def test_registration_login_and_current_user(client: AsyncClient) -> None:
-    token = await register_user(client, "  OWNER  ")
+    token = await register_user(client, "  OWNER@EXAMPLE.COM  ")
 
     me = await client.get(f"{API}/auth/me", headers=bearer(token))
     assert me.status_code == 200
-    assert me.json()["username"] == "owner"
+    assert me.json()["email"] == "owner@example.com"
     assert me.json()["is_active"] is True
 
     duplicate = await client.post(
         f"{API}/auth/register",
-        json={"username": "owner", "password": PASSWORD},
+        json={"email": "owner@example.com", "password": PASSWORD},
     )
     assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "An account with this email address already exists."
 
     wrong_password = await client.post(
         f"{API}/auth/login",
-        json={"username": "owner", "password": "definitely-not-the-password"},
+        json={"email": "owner@example.com", "password": "definitely-not-the-password"},
     )
     assert wrong_password.status_code == 401
+    assert wrong_password.json()["detail"] == "The email address or password is incorrect."
 
     login = await client.post(
         f"{API}/auth/login",
-        json={"username": "OWNER", "password": PASSWORD},
+        json={"email": "OWNER@EXAMPLE.COM", "password": PASSWORD},
     )
     assert login.status_code == 200
     assert login.json()["token_type"] == "bearer"
@@ -55,6 +57,19 @@ async def test_registration_login_and_current_user(client: AsyncClient) -> None:
 
     unauthenticated = await client.get(f"{API}/auth/me")
     assert unauthenticated.status_code == 401
+
+
+async def test_auth_rejects_invalid_email_with_a_clear_message(client: AsyncClient) -> None:
+    for route in ("register", "login"):
+        response = await client.post(
+            f"{API}/auth/{route}",
+            json={"email": "missing-at-sign", "password": PASSWORD},
+        )
+
+        assert response.status_code == 422
+        issue = response.json()["detail"][0]
+        assert issue["loc"] == ["body", "email"]
+        assert "Enter a valid email address" in issue["msg"]
 
 
 async def test_agent_handshake_is_one_time_and_tokens_are_role_scoped(

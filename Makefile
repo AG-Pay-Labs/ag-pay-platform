@@ -2,7 +2,7 @@ API_DIR := apps/api
 WEB_DIR := apps/web
 PYTHON ?= python3.12
 PNPM ?= pnpm
-SEED_USERNAME ?= vitalybulyzhin@gmail.com
+SEED_EMAIL ?= vitalybulyzhin@gmail.com
 VENV := $(API_DIR)/.venv
 
 .PHONY: help api-install api-migrate api-run checkout-worker demo-merchant-run direct-card-fixture-run api-lint seed-demo seed-checkout-demo web-install web-run web-lint web-typecheck web-build lint test
@@ -33,11 +33,11 @@ api-lint: ## Run backend static checks.
 	@cd $(API_DIR) && .venv/bin/python -m ruff check .
 	@cd $(API_DIR) && .venv/bin/python -m ruff format --check .
 
-seed-demo: ## Seed repeatable demo data for SEED_USERNAME.
-	@cd $(API_DIR) && .venv/bin/python scripts/seed_demo_data.py --username "$(SEED_USERNAME)"
+seed-demo: ## Seed repeatable demo data for SEED_EMAIL.
+	@cd $(API_DIR) && .venv/bin/python scripts/seed_demo_data.py --email "$(SEED_EMAIL)"
 
 seed-checkout-demo: ## Add Stripe test success/decline/3DS methods to an existing user and agents.
-	@cd $(API_DIR) && .venv/bin/python scripts/seed_checkout_demo.py --username "$(SEED_USERNAME)"
+	@cd $(API_DIR) && .venv/bin/python scripts/seed_checkout_demo.py --email "$(SEED_EMAIL)"
 
 web-install: ## Install the web application dependencies.
 	@cd $(WEB_DIR) && $(PNPM) install

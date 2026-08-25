@@ -252,12 +252,16 @@ async def approve_managed(
 
 
 async def set_auto_approval(client: AsyncClient, wallet: dict[str, str]) -> None:
-    response = await client.patch(
-        f"{API}/agents/{wallet['agent_id']}/payment-policy",
+    response = await client.post(
+        f"{API}/payment-rule-sets",
         headers=bearer(wallet["user_token"]),
-        json={"mode": "never"},
+        json={
+            "name": f"Auto {wallet['agent_id']}",
+            "mode": "never",
+            "agent_ids": [wallet["agent_id"]],
+        },
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 201, response.text
 
 
 async def test_direct_card_approval_requires_and_stages_one_checkout_cvc(
@@ -1010,7 +1014,7 @@ async def test_checkout_status_history_cascades_when_tenant_is_deleted(
         assert remaining == 0
 
 
-async def test_managed_checkout_always_waits_for_human_even_with_never_policy(
+async def test_managed_checkout_is_autoapproved_and_queued_by_never_policy(
     client: AsyncClient,
     settings: Settings,
 ) -> None:
@@ -1020,17 +1024,10 @@ async def test_managed_checkout_always_waits_for_human_even_with_never_policy(
 
     item = await propose_managed(client, wallet, suffix="policy")
 
-    assert item["status"] == "proposed"
-    assert item["selected_payment_method_id"] is None
-    assert item["execution"] is None
-    assert item["decision_note"] is None
-
-    approved = await approve_managed(client, wallet, item["id"])
-
-    assert approved.status_code == 200
-    assert approved.json()["status"] == "approved"
-    assert approved.json()["selected_payment_method_id"] == wallet["payment_method_id"]
-    assert approved.json()["execution"]["status"] == "queued"
+    assert item["status"] == "approved"
+    assert item["selected_payment_method_id"] == wallet["payment_method_id"]
+    assert item["execution"]["status"] == "queued"
+    assert item["decision_note"] == "Automatically approved by the agent payment rule."
 
 
 async def test_policy_does_not_autoapprove_managed_checkout_with_only_sandbox_method(

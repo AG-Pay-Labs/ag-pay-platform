@@ -19,13 +19,13 @@ from ag_platform_api.core.security import encrypt_secret, hash_opaque_token, new
 from ag_platform_api.models import (
     Agent,
     AgentPaymentMethod,
-    AgentPaymentPolicy,
     AgentStatus,
     CartItem,
     CartItemStatus,
     CheckoutEvent,
     PaymentMethod,
     PaymentMethodStatus,
+    PaymentRuleSet,
     Purchase,
     PurchaseCredential,
     PurchaseStatus,
@@ -118,21 +118,21 @@ async def propose_cart_item(
     broker: Broker,
 ) -> CartItemRead:
     policy = await db.scalar(
-        select(AgentPaymentPolicy)
+        select(PaymentRuleSet)
         .where(
-            AgentPaymentPolicy.agent_id == agent.id,
-            AgentPaymentPolicy.owner_id == agent.owner_id,
+            PaymentRuleSet.id == agent.payment_rule_set_id,
+            PaymentRuleSet.owner_id == agent.owner_id,
         )
         .with_for_update()
     )
     total_amount = payload.unit_price * payload.quantity
-    approval_required = payload.checkout is not None or requires_human_approval(
+    approval_required = requires_human_approval(
         policy,
         amount=total_amount,
         currency=payload.currency,
         recurring=payload.billing_period is not None,
     )
-    selected_payment_method: PaymentMethod | None = None
+    candidate_payment_methods: list[PaymentMethod] = []
     if not approval_required:
         payment_method_query = (
             select(PaymentMethod)
@@ -144,10 +144,9 @@ async def propose_cart_item(
                 PaymentMethod.provider != LOCAL_DIRECT_CARD_PROVIDER,
             )
             .order_by(AgentPaymentMethod.payment_method_id)
-            .limit(1)
             .with_for_update()
         )
-        selected_payment_method = await db.scalar(payment_method_query)
+        candidate_payment_methods = list((await db.scalars(payment_method_query)).all())
 
     credential = PurchaseCredential(
         owner_id=agent.owner_id,
@@ -173,34 +172,35 @@ async def propose_cart_item(
         unit_price=payload.unit_price,
         currency=payload.currency,
         billing_period=payload.billing_period,
-        status=(
-            CartItemStatus.approved
-            if selected_payment_method is not None
-            else CartItemStatus.proposed
-        ),
-        selected_payment_method_id=(
-            selected_payment_method.id if selected_payment_method is not None else None
-        ),
-        decision_note=(
-            "Automatically approved by the agent payment rule."
-            if selected_payment_method is not None
-            else None
-        ),
-        approved_at=datetime.now(UTC) if selected_payment_method is not None else None,
+        status=CartItemStatus.proposed,
+        selected_payment_method_id=None,
+        decision_note=None,
+        approved_at=None,
     )
     db.add(item)
     await db.flush()
-    if selected_payment_method is not None:
+
+    selected_payment_method: PaymentMethod | None = None
+    for candidate in candidate_payment_methods:
+        item.status = CartItemStatus.approved
+        item.selected_payment_method_id = candidate.id
+        item.decision_note = "Automatically approved by the agent payment rule."
+        item.approved_at = datetime.now(UTC)
         try:
             await queue_checkout_execution(
                 db,
                 item=item,
-                payment_method=selected_payment_method,
+                payment_method=candidate,
                 settings=settings,
             )
-        except CheckoutQueueError as exc:
-            await db.rollback()
-            raise HTTPException(status_code=409, detail=exc.message) from exc
+        except CheckoutQueueError:
+            item.status = CartItemStatus.proposed
+            item.selected_payment_method_id = None
+            item.decision_note = None
+            item.approved_at = None
+            continue
+        selected_payment_method = candidate
+        break
     await db.commit()
     item = await load_cart_item(db, item.id)
     if selected_payment_method is not None:
