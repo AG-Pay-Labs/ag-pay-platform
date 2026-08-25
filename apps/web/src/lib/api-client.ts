@@ -9,7 +9,11 @@ function isValidationIssue(value: unknown): value is ValidationIssue {
 }
 
 function readDetail(payload: unknown): string | ValidationIssue[] | null {
-  if (typeof payload !== "object" || payload === null || !("detail" in payload)) {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("detail" in payload)
+  ) {
     return null;
   }
 
@@ -26,7 +30,9 @@ function validationMessage(issues: ValidationIssue[]): string {
   const field = issue.loc
     .filter((part) => part !== "body" && part !== "query" && part !== "path")
     .join(".");
-  return field ? `${field}: ${issue.msg}` : issue.msg;
+  const label = field === "email" ? "Email" : field;
+  const message = issue.msg.replace(/^Value error,\s*/i, "");
+  return label ? `${label}: ${message}` : message;
 }
 
 export class ApiError extends Error {
@@ -40,8 +46,8 @@ export class ApiError extends Error {
       typeof detail === "string"
         ? detail
         : Array.isArray(detail)
-          ? validationMessage(detail)
-          : statusText || `Request failed with status ${status}`;
+        ? validationMessage(detail)
+        : statusText || `Request failed with status ${status}`;
 
     super(message);
     this.name = "ApiError";
@@ -51,7 +57,10 @@ export class ApiError extends Error {
   }
 }
 
-export function getErrorMessage(error: unknown, fallback = "Something went wrong."): string {
+export function getErrorMessage(
+  error: unknown,
+  fallback = "Something went wrong."
+): string {
   if (error instanceof ApiError || error instanceof Error) return error.message;
   if (typeof error === "string" && error.trim()) return error;
   return fallback;
@@ -100,7 +109,7 @@ function requestHeaders(init?: RequestInit): Headers {
 async function requestJson<T>(
   url: string,
   init?: RequestInit,
-  notifyOnUnauthorized = true,
+  notifyOnUnauthorized = true
 ): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -124,7 +133,9 @@ async function requestJson<T>(
  */
 export function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   if (!path.startsWith("/") || path.startsWith("//")) {
-    throw new TypeError("API paths must be same-origin absolute paths beginning with '/'.");
+    throw new TypeError(
+      "API paths must be same-origin absolute paths beginning with '/'."
+    );
   }
 
   return requestJson<T>(`/api/backend${path}`, init);
@@ -133,6 +144,9 @@ export function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
 export type AuthRoute = "/login" | "/register" | "/logout" | "/session";
 
 /** Internal auth-BFF client used by AuthProvider. */
-export function authRequest<T>(path: AuthRoute, init?: RequestInit): Promise<T> {
+export function authRequest<T>(
+  path: AuthRoute,
+  init?: RequestInit
+): Promise<T> {
   return requestJson<T>(`/api/auth${path}`, init, false);
 }

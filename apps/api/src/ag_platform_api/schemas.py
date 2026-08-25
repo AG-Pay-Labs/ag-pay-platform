@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from email_validator import EmailNotValidError, validate_email
 from pydantic import (
     AfterValidator,
     AnyHttpUrl,
@@ -33,10 +34,6 @@ from ag_platform_api.models import (
 from ag_platform_api.services.checkout.errors import CheckoutError
 from ag_platform_api.services.checkout.types import decimal_to_minor
 
-Username = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, to_lower=True, min_length=3, max_length=64),
-]
 Password = Annotated[SecretStr, Field(min_length=10, max_length=256)]
 OPAQUE_PROVIDER_REFERENCE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{2,254}$")
 PROVIDER_REFERENCE_PATTERNS = {
@@ -48,6 +45,17 @@ PROVIDER_REFERENCE_PATTERNS = {
 
 def _uppercase(value: str) -> str:
     return value.strip().upper()
+
+
+def _account_email(value: str) -> str:
+    try:
+        result = validate_email(value.strip(), check_deliverability=False)
+    except (AttributeError, EmailNotValidError):
+        raise ValueError("Enter a valid email address, for example name@example.com.") from None
+    return result.normalized.lower()
+
+
+AccountEmail = Annotated[str, BeforeValidator(_account_email)]
 
 
 # ISO 3166-1 alpha-2 assigned country codes. Keep this explicit so request
@@ -128,13 +136,13 @@ class Message(APIModel):
 
 
 class UserRegister(APIModel):
-    username: Username
+    email: AccountEmail
     password: Password
 
 
 class UserRead(APIModel):
     id: UUID
-    username: str
+    email: str
     is_active: bool
     created_at: datetime
 
@@ -146,7 +154,7 @@ class TokenResponse(APIModel):
 
 
 class LoginRequest(APIModel):
-    username: Username
+    email: AccountEmail
     password: SecretStr
 
 

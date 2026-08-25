@@ -26,6 +26,7 @@ SAFE_VALIDATION_MESSAGES = frozenset(
         "The managed checkout currency is not supported.",
         "The managed checkout amount is invalid for its currency.",
         "Country code must be an assigned ISO 3166-1 alpha-2 code.",
+        "Enter a valid email address, for example name@example.com.",
     }
 )
 SAFE_LOCATION_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")

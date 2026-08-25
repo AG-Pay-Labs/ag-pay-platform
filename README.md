@@ -109,7 +109,7 @@ Run migrations, the API, web app, and `make checkout-worker` in separate
 terminals. Create the human account and agent, then seed the safe methods:
 
 ```bash
-make seed-checkout-demo SEED_USERNAME=your-login-email@example.com
+make seed-checkout-demo SEED_EMAIL=your-login-email@example.com
 ```
 
 The built-in adapter key is `stripe-hosted`; do not add or override it in
@@ -239,7 +239,7 @@ locally tracked subscriptions.
 To populate an existing account with repeatable local demo data:
 
 ```bash
-make seed-demo SEED_USERNAME=your-existing-username
+make seed-demo SEED_EMAIL=you@example.com
 ```
 
 The seeder creates seven named OpenClaw/Hermes agents, assigns each one the same

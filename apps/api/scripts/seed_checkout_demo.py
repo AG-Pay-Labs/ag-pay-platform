@@ -35,9 +35,9 @@ DEMO_BILLING_DETAILS = {
 }
 
 
-async def seed(username: str) -> tuple[int, int, int]:
+async def seed(email: str) -> tuple[int, int, int]:
     async with SessionFactory() as db, db.begin():
-        owner = await db.scalar(select(User).where(User.username == username.strip().lower()))
+        owner = await db.scalar(select(User).where(User.email == email.strip().lower()))
         if owner is None:
             raise LookupError("Create the AG Pay user before seeding checkout demo methods")
         agents = list(await db.scalars(select(Agent).where(Agent.owner_id == owner.id)))
@@ -91,10 +91,10 @@ async def seed(username: str) -> tuple[int, int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--username", required=True)
+    parser.add_argument("--email", required=True)
     args = parser.parse_args()
     try:
-        created, assignments, profiles_updated = asyncio.run(seed(args.username))
+        created, assignments, profiles_updated = asyncio.run(seed(args.email))
     except LookupError as error:
         raise SystemExit(str(error)) from None
     print(
