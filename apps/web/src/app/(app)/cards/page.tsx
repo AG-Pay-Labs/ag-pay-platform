@@ -56,18 +56,6 @@ export default function CardsPage() {
         actions={<AddCardDialog />}
       />
 
-      <div className="mb-6 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
-        <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-        <p>
-          Direct-card storage is a local research feature. The full card number
-          is submitted once and stored encrypted; it is never returned to this
-          browser or sent to an agent. CVC is entered only when approving a
-          managed checkout and is held briefly for that checkout. Stripe Link
-          still requires its separate approval before releasing a one-time
-          payment credential.
-        </p>
-      </div>
-
       {cards.isLoading ? <LoadingState variant="cards" rows={4} /> : null}
       {cards.error ? (
         <ErrorState
@@ -85,7 +73,7 @@ export default function CardsPage() {
       ) : null}
 
       {cards.data?.length ? (
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,20rem),24rem))] gap-6">
+        <div className="mx-auto grid w-full max-w-[76rem] gap-y-4 md:grid-cols-[repeat(2,minmax(0,22rem))] md:justify-between xl:grid-cols-[repeat(3,minmax(0,22rem))]">
           {cards.data.map((card) => (
             <PaymentMethodCard key={card.id} card={card} />
           ))}
@@ -99,19 +87,19 @@ function PaymentMethodCard({ card }: { card: PaymentMethodRead }) {
   return (
     <article
       className={cn(
-        "w-full min-w-0 max-w-96 rounded-2xl border bg-card p-3 shadow-sm transition-shadow hover:shadow-md",
+        "flex h-full min-w-0 flex-col rounded-2xl border bg-card p-2.5 shadow-sm transition-[box-shadow,transform] duration-200 hover:-translate-y-0.5 hover:shadow-md motion-reduce:transform-none motion-reduce:transition-none",
         card.status === "disabled" && "opacity-70 grayscale-[.22]"
       )}
     >
       <VirtualCard card={card} />
 
-      <div className="px-1 pt-4 pb-1">
-        <div className="flex items-start gap-3">
-          <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-indigo-50 text-indigo-700 ring-1 ring-indigo-100 dark:bg-indigo-950/60 dark:text-indigo-300 dark:ring-indigo-900">
+      <div className="flex flex-1 flex-col px-1.5 pt-3 pb-1">
+        <div className="flex items-start gap-2.5">
+          <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-indigo-50 text-indigo-700 ring-1 ring-indigo-100 dark:bg-indigo-950/60 dark:text-indigo-300 dark:ring-indigo-900">
             {card.billing_profile_type === "business" ? (
-              <Building2 className="size-4" />
+              <Building2 className="size-3.5" />
             ) : (
-              <UserRound className="size-4" />
+              <UserRound className="size-3.5" />
             )}
           </span>
           <div className="min-w-0 flex-1">
@@ -133,7 +121,7 @@ function PaymentMethodCard({ card }: { card: PaymentMethodRead }) {
           </div>
         </div>
 
-        <dl className="mt-4 grid gap-3 border-t pt-4 text-xs sm:grid-cols-2">
+        <dl className="mt-3 mb-3 grid grid-cols-[minmax(0,1fr)_auto] gap-3 border-t pt-3 text-xs">
           <div className="min-w-0">
             <dt className="flex items-center gap-1.5 text-muted-foreground">
               <Mail className="size-3.5" /> Billing email
@@ -142,16 +130,16 @@ function PaymentMethodCard({ card }: { card: PaymentMethodRead }) {
               {card.billing_details.email}
             </dd>
           </div>
-          <div className="min-w-0 sm:text-right">
+          <div className="min-w-0 text-right">
             <dt className="text-muted-foreground">Added</dt>
-            <dd className="mt-1 font-medium">
+            <dd className="mt-1 whitespace-nowrap font-medium">
               {formatDateTime(card.created_at)}
             </dd>
           </div>
         </dl>
 
-        <div className="mt-4 flex items-center justify-between gap-3 border-t pt-3">
-          <p className="text-xs text-muted-foreground">
+        <div className="mt-auto flex items-center justify-between gap-2 border-t pt-2.5">
+          <p className="min-w-0 text-[11px] leading-4 text-muted-foreground">
             Assign this method from an agent’s details.
           </p>
           {card.status === "active" ? <DisableCardDialog card={card} /> : null}
@@ -168,7 +156,7 @@ function VirtualCard({ card }: { card: PaymentMethodRead }) {
   return (
     <div
       className={cn(
-        "relative isolate aspect-[1.586/1] w-full overflow-hidden rounded-[1.35rem] bg-gradient-to-br p-5 text-white shadow-[0_22px_50px_-28px_rgba(30,27,75,0.95)]",
+        "relative isolate aspect-[1.586/1] w-full overflow-hidden rounded-[1.15rem] bg-gradient-to-br p-4 text-white shadow-[0_18px_40px_-26px_rgba(30,27,75,0.95)]",
         palette
       )}
       aria-label={`${card.display_name}, ${card.card_brand}, ending in ${lastFour}`}
@@ -177,57 +165,54 @@ function VirtualCard({ card }: { card: PaymentMethodRead }) {
       <span className="absolute -right-24 -bottom-32 -z-10 size-72 rounded-full border-[36px] border-fuchsia-200/10" />
       <span className="absolute inset-0 -z-10 bg-[linear-gradient(120deg,transparent_20%,rgba(255,255,255,.08)_49%,transparent_72%)]" />
 
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <p className="truncate text-sm font-semibold tracking-wide">
-            {card.display_name}
-          </p>
-          <p className="mt-0.5 truncate text-[10px] font-medium tracking-[0.16em] text-white/65 uppercase">
-            {card.provider === "local_direct_card"
-              ? "Encrypted direct card"
-              : `${card.provider} · provider reference`}
-          </p>
-        </div>
-        <div className="text-right">
-          <p className="text-[11px] font-bold tracking-[0.18em]">AG PAY</p>
-          <p className="mt-0.5 text-[9px] tracking-[0.14em] text-white/60 uppercase">
-            {card.status}
-          </p>
-        </div>
-      </div>
-
-      <div className="mt-[clamp(1.25rem,5vw,2.4rem)] flex items-center gap-3">
-        <CardChip />
-        <ContactlessMark className="size-7 text-white/75" />
-      </div>
-
-      <div className="absolute inset-x-5 bottom-5">
-        <div className="flex items-end justify-between gap-4">
+      <div className="flex h-full flex-col">
+        <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <p className="font-mono text-[clamp(1rem,3.5vw,1.3rem)] leading-none font-medium tracking-[0.12em] text-white drop-shadow-sm">
-              •••• •••• •••• {lastFour}
+            <p className="truncate text-[13px] font-semibold tracking-wide">
+              {card.display_name}
             </p>
-            <div className="mt-4 flex min-w-0 items-end gap-6">
-              <div className="min-w-0">
-                <p className="text-[8px] tracking-[0.16em] text-white/55 uppercase">
-                  Cardholder
-                </p>
-                <p className="mt-0.5 truncate text-[11px] font-semibold tracking-wide uppercase">
-                  {cardholderName(card)}
-                </p>
-              </div>
-              <div className="shrink-0">
-                <p className="text-[8px] tracking-[0.16em] text-white/55 uppercase">
-                  Expires
-                </p>
-                <p className="mt-0.5 text-[11px] font-semibold tabular-nums">
-                  {String(card.expiry_month).padStart(2, "0")}/
-                  {String(card.expiry_year).slice(-2)}
-                </p>
-              </div>
-            </div>
+            <p className="mt-0.5 truncate text-[9px] font-medium tracking-[0.15em] text-white/65 uppercase">
+              {card.provider === "local_direct_card"
+                ? "Encrypted direct card"
+                : `${card.provider} · provider reference`}
+            </p>
           </div>
-          <p className="shrink-0 text-sm font-bold tracking-[0.12em] uppercase italic">
+          <div className="shrink-0 text-right">
+            <p className="text-[10px] font-bold tracking-[0.17em]">AG PAY</p>
+            <p className="mt-0.5 text-[8px] tracking-[0.13em] text-white/60 uppercase">
+              {card.status}
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-[clamp(1rem,3vw,1.6rem)] flex items-center gap-2.5">
+          <CardChip />
+          <ContactlessMark className="size-6 text-white/75" />
+        </div>
+
+        <p className="mt-2.5 truncate font-mono text-[clamp(.9rem,1.6vw,1.05rem)] leading-none font-medium tracking-[0.1em] text-white drop-shadow-sm">
+          •••• •••• •••• {lastFour}
+        </p>
+
+        <div className="mt-auto grid grid-cols-[minmax(0,1fr)_auto_auto] items-end gap-3">
+          <div className="min-w-0">
+            <p className="text-[7px] tracking-[0.15em] text-white/55 uppercase">
+              Cardholder
+            </p>
+            <p className="mt-0.5 truncate text-[10px] font-semibold tracking-wide uppercase">
+              {cardholderName(card)}
+            </p>
+          </div>
+          <div className="shrink-0">
+            <p className="text-[7px] tracking-[0.15em] text-white/55 uppercase">
+              Expires
+            </p>
+            <p className="mt-0.5 text-[10px] font-semibold tabular-nums">
+              {String(card.expiry_month).padStart(2, "0")}/
+              {String(card.expiry_year).slice(-2)}
+            </p>
+          </div>
+          <p className="max-w-16 truncate text-right text-xs font-bold tracking-[0.1em] uppercase italic">
             {card.card_brand}
           </p>
         </div>
@@ -239,7 +224,7 @@ function VirtualCard({ card }: { card: PaymentMethodRead }) {
 function CardChip() {
   return (
     <span
-      className="relative block h-8 w-11 overflow-hidden rounded-md border border-amber-100/70 bg-gradient-to-br from-amber-100 via-yellow-300 to-amber-500 shadow-sm"
+      className="relative block h-7 w-10 overflow-hidden rounded-md border border-amber-100/70 bg-gradient-to-br from-amber-100 via-yellow-300 to-amber-500 shadow-sm"
       aria-hidden="true"
     >
       <span className="absolute inset-y-0 left-1/2 w-px bg-amber-800/30" />

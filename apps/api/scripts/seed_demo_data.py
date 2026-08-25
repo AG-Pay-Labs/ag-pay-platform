@@ -18,7 +18,6 @@ from ag_platform_api.db.session import SessionFactory
 from ag_platform_api.models import (
     Agent,
     AgentPaymentMethod,
-    AgentPaymentPolicy,
     AgentStatus,
     BillingPeriod,
     BillingProfileType,
@@ -27,6 +26,7 @@ from ag_platform_api.models import (
     PaymentApprovalMode,
     PaymentMethod,
     PaymentMethodStatus,
+    PaymentRuleSet,
     Purchase,
     PurchaseCredential,
     PurchaseStatus,
@@ -725,21 +725,24 @@ async def _seed_policy(
     owner: User,
     agents: dict[str, Agent],
     seed: PolicySeed,
-) -> AgentPaymentPolicy:
+) -> PaymentRuleSet:
     agent = agents[seed.agent_slug]
+    rule_set_name = f"{agent.name} rules"
     policy = await db.scalar(
-        select(AgentPaymentPolicy).where(
-            AgentPaymentPolicy.owner_id == owner.id,
-            AgentPaymentPolicy.agent_id == agent.id,
+        select(PaymentRuleSet).where(
+            PaymentRuleSet.owner_id == owner.id,
+            PaymentRuleSet.name == rule_set_name,
         )
     )
     if policy is None:
-        policy = AgentPaymentPolicy(owner_id=owner.id, agent_id=agent.id)
+        policy = PaymentRuleSet(owner_id=owner.id, name=rule_set_name)
         db.add(policy)
+        await db.flush()
 
     policy.mode = seed.mode
     policy.threshold_amount = seed.threshold_amount
     policy.threshold_currency = seed.threshold_currency
+    agent.payment_rule_set_id = policy.id
     return policy
 
 
@@ -790,10 +793,10 @@ async def seed_demo_data(email: str) -> dict[str, int]:
                 .select_from(PaymentMethod)
                 .where(PaymentMethod.owner_id == owner.id)
             ),
-            "payment_policies": await db.scalar(
+            "payment_rule_sets": await db.scalar(
                 select(func.count())
-                .select_from(AgentPaymentPolicy)
-                .where(AgentPaymentPolicy.owner_id == owner.id)
+                .select_from(PaymentRuleSet)
+                .where(PaymentRuleSet.owner_id == owner.id)
             ),
             "purchases": await db.scalar(
                 select(func.count()).select_from(Purchase).where(Purchase.owner_id == owner.id)

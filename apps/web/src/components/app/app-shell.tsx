@@ -35,6 +35,11 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/providers/auth-provider";
 
@@ -45,7 +50,12 @@ export const APP_NAVIGATION = [
   { href: "/rules", label: "Rules", icon: SlidersHorizontalIcon },
   { href: "/cards", label: "Cards", icon: CreditCardIcon },
   { href: "/purchases", label: "Purchases", icon: ReceiptTextIcon },
-  { href: "/subscriptions", label: "Subscriptions", icon: RefreshCwIcon },
+  {
+    href: "/subscriptions",
+    label: "Subscriptions",
+    icon: RefreshCwIcon,
+    disabled: true,
+  },
 ] as const;
 
 type AppShellProps = {
@@ -102,6 +112,30 @@ function Navigation({
       {APP_NAVIGATION.map((item) => {
         const active = isCurrentRoute(pathname, item.href);
         const showCount = item.href === "/approvals" && pendingApprovals > 0;
+        const disabled = "disabled" in item && item.disabled;
+
+        if (disabled) {
+          return (
+            <Tooltip key={item.href}>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  aria-disabled="true"
+                  className="flex min-h-10 w-full cursor-not-allowed items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-medium text-muted-foreground/55 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <item.icon
+                    className="size-[18px] shrink-0"
+                    aria-hidden="true"
+                  />
+                  <span>{item.label}</span>
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="right" sideOffset={8}>
+                Coming soon
+              </TooltipContent>
+            </Tooltip>
+          );
+        }
 
         return (
           <Link

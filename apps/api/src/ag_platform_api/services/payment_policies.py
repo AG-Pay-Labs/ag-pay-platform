@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from ag_platform_api.models import AgentPaymentPolicy, PaymentApprovalMode
+from ag_platform_api.models import PaymentApprovalMode, PaymentRuleSet
 
 THRESHOLD_MODES = {
     PaymentApprovalMode.above_amount,
@@ -9,7 +9,7 @@ THRESHOLD_MODES = {
 
 
 def requires_human_approval(
-    policy: AgentPaymentPolicy | None,
+    policy: PaymentRuleSet | None,
     *,
     amount: Decimal,
     currency: str,

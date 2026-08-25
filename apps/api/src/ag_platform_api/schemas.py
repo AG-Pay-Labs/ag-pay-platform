@@ -187,17 +187,19 @@ class PairingTokenResponse(APIModel):
     pairing_expires_at: datetime
 
 
-class AgentPaymentPolicyRead(APIModel):
+class PaymentRuleSetRead(APIModel):
     id: UUID
-    agent_id: UUID
+    name: str
     mode: PaymentApprovalMode
     threshold_amount: Decimal | None
     threshold_currency: str | None
+    assigned_agent_ids: list[UUID]
     created_at: datetime
     updated_at: datetime
 
 
-class AgentPaymentPolicyUpdate(APIModel):
+class PaymentRuleSetWrite(APIModel):
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
     mode: PaymentApprovalMode
     threshold_amount: Decimal | None = Field(
         default=None,
@@ -206,9 +208,10 @@ class AgentPaymentPolicyUpdate(APIModel):
         decimal_places=2,
     )
     threshold_currency: Currency | None = None
+    agent_ids: list[UUID] = Field(default_factory=list, max_length=1000)
 
     @model_validator(mode="after")
-    def validate_threshold(self) -> "AgentPaymentPolicyUpdate":
+    def validate_rule_set(self) -> "PaymentRuleSetWrite":
         threshold_mode = self.mode in {
             PaymentApprovalMode.above_amount,
             PaymentApprovalMode.subscriptions_or_above_amount,
@@ -223,6 +226,8 @@ class AgentPaymentPolicyUpdate(APIModel):
             raise ValueError("Threshold amount and currency are required for this mode")
         if not threshold_mode and threshold_supplied:
             raise ValueError("Threshold amount and currency are not allowed for this mode")
+        if len(set(self.agent_ids)) != len(self.agent_ids):
+            raise ValueError("Agent assignments must not contain duplicates")
         return self
 
 

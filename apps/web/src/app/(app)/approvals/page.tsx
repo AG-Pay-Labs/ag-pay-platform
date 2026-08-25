@@ -31,7 +31,6 @@ import {
   RevealCredentialDialog,
 } from "@/components/features/approvals/approval-actions";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -43,10 +42,7 @@ import {
 } from "@/components/ui/sheet";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAgents, useCartItems } from "@/hooks/use-api-data";
-import type {
-  CartItemRead,
-  CheckoutExecutionStatus,
-} from "@/lib/api-types";
+import type { CartItemRead, CheckoutExecutionStatus } from "@/lib/api-types";
 import { cn } from "@/lib/utils";
 import { formatDateTime, hostname, relativeTime } from "@/utils/format";
 
@@ -58,6 +54,37 @@ const QUEUE_LABELS: Record<Queue, string> = {
   attention: "Needs attention",
   history: "History",
 };
+
+const QUEUE_OPTIONS: ReadonlyArray<{
+  value: Queue;
+  label: string;
+  countClassName: string;
+}> = [
+  {
+    value: "review",
+    label: "Needs review",
+    countClassName:
+      "bg-amber-100 text-amber-800 dark:bg-amber-950/70 dark:text-amber-200",
+  },
+  {
+    value: "progress",
+    label: "In progress",
+    countClassName:
+      "bg-indigo-100 text-indigo-700 dark:bg-indigo-950/70 dark:text-indigo-200",
+  },
+  {
+    value: "attention",
+    label: "Needs attention",
+    countClassName:
+      "bg-rose-100 text-rose-700 dark:bg-rose-950/70 dark:text-rose-200",
+  },
+  {
+    value: "history",
+    label: "History",
+    countClassName:
+      "bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-200",
+  },
+];
 
 const ATTENTION_STATUSES = new Set<CheckoutExecutionStatus>([
   "failed",
@@ -98,15 +125,26 @@ function ApprovalsContent() {
     return (cart.data ?? []).filter((item) => {
       if (queueFor(item) !== queue) return false;
       if (!normalized) return true;
-      const agent = agents.data?.find((candidate) => candidate.id === item.agent_id);
-      return [item.title, item.merchant, item.description, item.reason, agent?.name]
+      const agent = agents.data?.find(
+        (candidate) => candidate.id === item.agent_id
+      );
+      return [
+        item.title,
+        item.merchant,
+        item.description,
+        item.reason,
+        agent?.name,
+      ]
         .filter(Boolean)
         .some((value) => value?.toLowerCase().includes(normalized));
     });
   }, [agents.data, cart.data, queue, search]);
 
-  const selected = cart.data?.find((item) => item.id === effectiveSelectedId) ?? null;
-  const selectedAgent = agents.data?.find((agent) => agent.id === selected?.agent_id);
+  const selected =
+    cart.data?.find((item) => item.id === effectiveSelectedId) ?? null;
+  const selectedAgent = agents.data?.find(
+    (agent) => agent.id === selected?.agent_id
+  );
   const loading = cart.isLoading || agents.isLoading;
   const error = cart.error ?? agents.error;
 
@@ -122,39 +160,46 @@ function ApprovalsContent() {
         description="Review what agents want to buy. Approval selects an assigned payment method and, for supported adapters, queues a secure AG Pay checkout."
       />
 
-      <Card>
-        <CardContent className="p-4 sm:p-5">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <Tabs value={queue} onValueChange={(value) => setQueue(value as Queue)}>
-              <TabsList className="h-auto w-full justify-start overflow-x-auto sm:w-auto">
-                <TabsTrigger value="review">
-                  Needs review
-                  {counts.review ? (
-                    <span className="ml-1 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-900 dark:bg-amber-950 dark:text-amber-200">
-                      {counts.review}
-                    </span>
-                  ) : null}
+      <div className="rounded-2xl border bg-card p-2.5 shadow-sm">
+        <div className="flex flex-col gap-2.5 lg:flex-row lg:items-center lg:justify-between">
+          <Tabs
+            value={queue}
+            onValueChange={(value) => setQueue(value as Queue)}
+            className="min-w-0"
+          >
+            <TabsList className="h-10 max-w-full justify-start gap-1 overflow-x-auto rounded-xl bg-muted/60 p-1">
+              {QUEUE_OPTIONS.map((option) => (
+                <TabsTrigger
+                  key={option.value}
+                  value={option.value}
+                  className="h-8 flex-none gap-2 rounded-lg px-3 text-xs data-active:bg-card data-active:shadow-sm sm:text-sm"
+                >
+                  {option.label}
+                  <span
+                    className={cn(
+                      "inline-flex min-w-5 items-center justify-center rounded-full px-1.5 py-0.5 text-[10px] leading-none font-bold tabular-nums",
+                      option.countClassName
+                    )}
+                  >
+                    {counts[option.value]}
+                  </span>
                 </TabsTrigger>
-                <TabsTrigger value="progress">In progress · {counts.progress}</TabsTrigger>
-                <TabsTrigger value="attention">
-                  Needs attention · {counts.attention}
-                </TabsTrigger>
-                <TabsTrigger value="history">History · {counts.history}</TabsTrigger>
-              </TabsList>
-            </Tabs>
-            <div className="relative w-full lg:max-w-xs">
-              <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search proposals"
-                className="pl-9"
-                aria-label="Search purchase proposals"
-              />
-            </div>
+              ))}
+            </TabsList>
+          </Tabs>
+
+          <div className="relative w-full shrink-0 lg:w-72">
+            <Search className="pointer-events-none absolute top-1/2 left-3.5 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search proposals"
+              className="h-10 rounded-xl border-transparent bg-muted/45 pr-3 pl-10 shadow-none hover:bg-muted/65 focus-visible:bg-background"
+              aria-label="Search purchase proposals"
+            />
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </div>
 
       <div className="mt-5">
         {loading ? (
@@ -195,7 +240,8 @@ function ApprovalsContent() {
                       {item.title}
                     </button>
                     <p className="mt-1 truncate text-xs text-muted-foreground">
-                      {item.merchant ?? hostname(item.product_url)} · Qty {item.quantity}
+                      {item.merchant ?? hostname(item.product_url)} · Qty{" "}
+                      {item.quantity}
                     </p>
                   </div>
                 ),
@@ -222,7 +268,9 @@ function ApprovalsContent() {
               {
                 id: "status",
                 header: "Status",
-                cell: (item) => <StatusBadge status={item.execution?.status ?? item.status} />,
+                cell: (item) => (
+                  <StatusBadge status={item.execution?.status ?? item.status} />
+                ),
               },
               {
                 id: "amount",
@@ -230,7 +278,10 @@ function ApprovalsContent() {
                 align: "right",
                 cell: (item) => (
                   <div>
-                    <Money amount={item.total_amount} currency={item.currency} />
+                    <Money
+                      amount={item.total_amount}
+                      currency={item.currency}
+                    />
                     <p className="mt-1 text-xs text-muted-foreground">
                       {item.billing_period ?? "one-time"}
                     </p>
@@ -242,7 +293,11 @@ function ApprovalsContent() {
                 header: <span className="sr-only">Actions</span>,
                 align: "right",
                 cell: (item) => (
-                  <Button variant="outline" size="sm" onClick={() => setSelectedId(item.id)}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setSelectedId(item.id)}
+                  >
                     Review
                   </Button>
                 ),
@@ -258,7 +313,8 @@ function ApprovalsContent() {
                   <div className="min-w-0">
                     <p className="truncate font-medium">{item.title}</p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {agentFor(item)?.name ?? "Unknown agent"} · {relativeTime(item.created_at)}
+                      {agentFor(item)?.name ?? "Unknown agent"} ·{" "}
+                      {relativeTime(item.created_at)}
                     </p>
                   </div>
                   <StatusBadge status={item.execution?.status ?? item.status} />
@@ -280,7 +336,8 @@ function ApprovalsContent() {
         onOpenChange={(open) => {
           if (!open) {
             setSelectedId(null);
-            if (searchParams.has("item")) router.replace("/approvals", { scroll: false });
+            if (searchParams.has("item"))
+              router.replace("/approvals", { scroll: false });
           }
         }}
       >
@@ -301,9 +358,12 @@ function ApprovalsContent() {
                     />
                   ) : null}
                 </div>
-                <SheetTitle className="mt-2 pr-8 text-2xl">{selected.title}</SheetTitle>
+                <SheetTitle className="mt-2 pr-8 text-2xl">
+                  {selected.title}
+                </SheetTitle>
                 <SheetDescription>
-                  Proposed by {selectedAgent?.name ?? "an unknown agent"} {relativeTime(selected.created_at)}
+                  Proposed by {selectedAgent?.name ?? "an unknown agent"}{" "}
+                  {relativeTime(selected.created_at)}
                 </SheetDescription>
               </SheetHeader>
 
@@ -314,7 +374,8 @@ function ApprovalsContent() {
                       Proposed total
                     </p>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      {selected.quantity} × {selected.currency.toUpperCase()} {selected.unit_price}
+                      {selected.quantity} × {selected.currency.toUpperCase()}{" "}
+                      {selected.unit_price}
                     </p>
                   </div>
                   <Money
@@ -328,13 +389,22 @@ function ApprovalsContent() {
                   <p className="text-sm leading-6">{selected.description}</p>
                   <div className="flex flex-wrap gap-2">
                     <Button variant="outline" size="sm" asChild>
-                      <Link href={selected.product_url} target="_blank" rel="noreferrer">
+                      <Link
+                        href={selected.product_url}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
                         Open product page <ExternalLink />
                       </Link>
                     </Button>
-                    {selected.checkout_url && selected.checkout_url !== selected.product_url ? (
+                    {selected.checkout_url &&
+                    selected.checkout_url !== selected.product_url ? (
                       <Button variant="outline" size="sm" asChild>
-                        <Link href={selected.checkout_url} target="_blank" rel="noreferrer">
+                        <Link
+                          href={selected.checkout_url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
                           Open checkout page <ExternalLink />
                         </Link>
                       </Button>
@@ -350,9 +420,20 @@ function ApprovalsContent() {
 
                 <DetailSection title="Purchase context">
                   <dl className="grid gap-4 text-sm sm:grid-cols-2">
-                    <Detail label="Merchant" value={selected.merchant ?? hostname(selected.product_url)} />
-                    <Detail label="Agent" value={selectedAgent?.name ?? "Unknown agent"} />
-                    <Detail label="Merchant account" value={selected.account_email} />
+                    <Detail
+                      label="Merchant"
+                      value={
+                        selected.merchant ?? hostname(selected.product_url)
+                      }
+                    />
+                    <Detail
+                      label="Agent"
+                      value={selectedAgent?.name ?? "Unknown agent"}
+                    />
+                    <Detail
+                      label="Merchant account"
+                      value={selected.account_email}
+                    />
                     <Detail
                       label="Checkout mode"
                       value={
@@ -361,14 +442,19 @@ function ApprovalsContent() {
                           : "Approval only — no checkout"
                       }
                     />
-                    <Detail label="Submitted" value={formatDateTime(selected.created_at)} />
+                    <Detail
+                      label="Submitted"
+                      value={formatDateTime(selected.created_at)}
+                    />
                   </dl>
                   <RevealCredentialDialog item={selected} />
                 </DetailSection>
 
                 {selected.decision_note ? (
                   <DetailSection title="Decision note">
-                    <p className="text-sm leading-6">{selected.decision_note}</p>
+                    <p className="text-sm leading-6">
+                      {selected.decision_note}
+                    </p>
                   </DetailSection>
                 ) : null}
 
@@ -382,12 +468,14 @@ function ApprovalsContent() {
                       <ShieldCheck className="mt-0.5 size-4 shrink-0" />
                       {selected.checkout_adapter && selected.checkout_url ? (
                         <p>
-                          Review the product, rationale, total, and recurring terms before you decide.
+                          Review the product, rationale, total, and recurring
+                          terms before you decide.
                         </p>
                       ) : (
                         <p>
-                          This proposal has no managed checkout URL. Approval records your decision,
-                          but it will not make or queue a payment.
+                          This proposal has no managed checkout URL. Approval
+                          records your decision, but it will not make or queue a
+                          payment.
                         </p>
                       )}
                     </div>
@@ -408,7 +496,13 @@ function ApprovalsContent() {
   );
 }
 
-function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
+function DetailSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
   return (
     <section className="space-y-3">
       <h3 className="text-sm font-semibold">{title}</h3>
@@ -427,7 +521,9 @@ function Detail({ label, value }: { label: string; value: string }) {
 }
 
 function ExecutionState({ item }: { item: CartItemRead }) {
-  const approved = item.approved_at ? relativeTime(item.approved_at) : "recently";
+  const approved = item.approved_at
+    ? relativeTime(item.approved_at)
+    : "recently";
   const execution = item.execution;
   if (!execution) return null;
   const copy = executionStatusCopy(execution.status);
@@ -438,7 +534,7 @@ function ExecutionState({ item }: { item: CartItemRead }) {
     <div
       className={cn(
         "flex gap-3 rounded-lg border p-4 text-sm",
-        presentation.className,
+        presentation.className
       )}
     >
       <StateIcon className="mt-0.5 size-5 shrink-0" />
@@ -451,12 +547,21 @@ function ExecutionState({ item }: { item: CartItemRead }) {
           Approved {approved}. {copy.description}
         </p>
         <dl className="mt-3 grid gap-3 sm:grid-cols-2">
-          <Detail label="Attempt count" value={String(execution.attempt_count)} />
+          <Detail
+            label="Attempt count"
+            value={String(execution.attempt_count)}
+          />
           {execution.submitted_at ? (
-            <Detail label="Payment submitted" value={formatDateTime(execution.submitted_at)} />
+            <Detail
+              label="Payment submitted"
+              value={formatDateTime(execution.submitted_at)}
+            />
           ) : null}
           {execution.completed_at ? (
-            <Detail label="Checkout completed" value={formatDateTime(execution.completed_at)} />
+            <Detail
+              label="Checkout completed"
+              value={formatDateTime(execution.completed_at)}
+            />
           ) : null}
         </dl>
         {execution.error_message || execution.error_code ? (
@@ -465,13 +570,17 @@ function ExecutionState({ item }: { item: CartItemRead }) {
               <p className="leading-5">{execution.error_message}</p>
             ) : null}
             {execution.error_code ? (
-              <p className="mt-1 font-mono text-xs">Reason code: {execution.error_code}</p>
+              <p className="mt-1 font-mono text-xs">
+                Reason code: {execution.error_code}
+              </p>
             ) : null}
           </div>
         ) : null}
         {execution.status_history.length ? (
           <div className="mt-4 border-t border-current/20 pt-3">
-            <p className="text-xs font-semibold tracking-wide uppercase">Status history</p>
+            <p className="text-xs font-semibold tracking-wide uppercase">
+              Status history
+            </p>
             <ol className="mt-3 space-y-3">
               {execution.status_history.map((transition, index) => (
                 <li
@@ -481,14 +590,18 @@ function ExecutionState({ item }: { item: CartItemRead }) {
                   <div className="flex flex-wrap items-center gap-2">
                     <StatusBadge status={transition.status} />
                     {transition.attempt_count ? (
-                      <span className="text-xs">Attempt {transition.attempt_count}</span>
+                      <span className="text-xs">
+                        Attempt {transition.attempt_count}
+                      </span>
                     ) : null}
                     <time className="text-xs opacity-75">
                       {formatDateTime(transition.occurred_at)}
                     </time>
                   </div>
                   {transition.error_message ? (
-                    <p className="mt-1 text-xs leading-5">{transition.error_message}</p>
+                    <p className="mt-1 text-xs leading-5">
+                      {transition.error_message}
+                    </p>
                   ) : null}
                 </li>
               ))}
@@ -497,14 +610,19 @@ function ExecutionState({ item }: { item: CartItemRead }) {
         ) : null}
         {execution.merchant_order_reference ? (
           <p className="mt-2 text-xs">
-            Merchant order: <span className="font-mono">{execution.merchant_order_reference}</span>
+            Merchant order:{" "}
+            <span className="font-mono">
+              {execution.merchant_order_reference}
+            </span>
           </p>
         ) : null}
         {execution.browserbase_session_id ? (
           <p className="mt-2 text-xs">
             <a
               className="underline"
-              href={`https://browserbase.com/sessions/${encodeURIComponent(execution.browserbase_session_id)}`}
+              href={`https://browserbase.com/sessions/${encodeURIComponent(
+                execution.browserbase_session_id
+              )}`}
               rel="noreferrer"
               target="_blank"
             >
@@ -556,7 +674,9 @@ function executionPresentation(status: CheckoutExecutionStatus) {
 }
 
 function LegacyApprovedState({ item }: { item: CartItemRead }) {
-  const approved = item.approved_at ? relativeTime(item.approved_at) : "recently";
+  const approved = item.approved_at
+    ? relativeTime(item.approved_at)
+    : "recently";
 
   return (
     <div className="flex gap-3 rounded-lg border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100">
@@ -564,9 +684,10 @@ function LegacyApprovedState({ item }: { item: CartItemRead }) {
       <div>
         <p className="font-medium">Approval recorded — no checkout queued</p>
         <p className="mt-1 leading-6">
-          Approved {approved}. This proposal did not include a managed checkout URL, so AG Pay did
-          not attempt a payment. This item cannot be upgraded; create a new proposal with the exact
-          checkout adapter and URL to use managed checkout.
+          Approved {approved}. This proposal did not include a managed checkout
+          URL, so AG Pay did not attempt a payment. This item cannot be
+          upgraded; create a new proposal with the exact checkout adapter and
+          URL to use managed checkout.
         </p>
       </div>
     </div>
@@ -578,27 +699,32 @@ function executionStatusCopy(status: CheckoutExecutionStatus) {
     case "queued":
       return {
         title: "Checkout queued",
-        description: "The trusted AG Pay worker will start the configured checkout.",
+        description:
+          "The trusted AG Pay worker will start the configured checkout.",
       };
     case "running":
       return {
         title: "Checkout in progress",
-        description: "AG Pay is completing the allowlisted checkout without exposing card data to the agent.",
+        description:
+          "AG Pay is completing the allowlisted checkout without exposing card data to the agent.",
       };
     case "action_required":
       return {
         title: "Human action required",
-        description: "Checkout stopped safely because the merchant requires an interactive step.",
+        description:
+          "Checkout stopped safely because the merchant requires an interactive step.",
       };
     case "failed":
       return {
         title: "Checkout failed safely",
-        description: "No successful purchase was recorded. Review the reason before trying again.",
+        description:
+          "No successful purchase was recorded. Review the reason before trying again.",
       };
     case "outcome_unknown":
       return {
         title: "Outcome needs reconciliation",
-        description: "Submission may have occurred, so AG Pay will not retry automatically or risk a duplicate charge.",
+        description:
+          "Submission may have occurred, so AG Pay will not retry automatically or risk a duplicate charge.",
       };
     case "succeeded":
       return {
@@ -609,9 +735,11 @@ function executionStatusCopy(status: CheckoutExecutionStatus) {
 }
 
 function queueFor(item: CartItemRead): Queue {
-  if (item.execution && ATTENTION_STATUSES.has(item.execution.status)) return "attention";
+  if (item.execution && ATTENTION_STATUSES.has(item.execution.status))
+    return "attention";
   if (item.execution?.status === "succeeded") return "history";
-  if (item.status === "purchased" || item.status === "cancelled") return "history";
+  if (item.status === "purchased" || item.status === "cancelled")
+    return "history";
   if (item.status === "proposed") return "review";
   return "progress";
 }
@@ -624,7 +752,8 @@ function emptyTitle(queue: Queue) {
 }
 
 function emptyDescription(queue: Queue) {
-  if (queue === "review") return "New agent proposals will appear here for human approval.";
+  if (queue === "review")
+    return "New agent proposals will appear here for human approval.";
   if (queue === "progress") {
     return "Queued and running managed checkouts appear here, along with legacy approvals awaiting the agent.";
   }

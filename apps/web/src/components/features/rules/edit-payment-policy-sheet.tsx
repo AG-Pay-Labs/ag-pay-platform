@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { CreditCard, Loader2, Pencil, ShieldCheck, TriangleAlert } from "lucide-react";
+import { Loader2, Plus, ShieldCheck, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -23,8 +24,8 @@ import { apiRequest, getErrorMessage } from "@/lib/api-client";
 import type {
   AgentRead,
   PaymentApprovalMode,
-  PaymentPolicyRead,
-  PaymentPolicyUpdate,
+  PaymentRuleSetRead,
+  PaymentRuleSetWrite,
 } from "@/lib/api-types";
 import { cn } from "@/lib/utils";
 
@@ -36,27 +37,27 @@ const POLICY_OPTIONS: Array<{
   {
     mode: "always",
     label: "Always require approval",
-    description: "Every purchase waits for your review before the agent can continue.",
+    description: "Every purchase waits for your review.",
   },
   {
     mode: "subscriptions_only",
     label: "Subscriptions only",
-    description: "Subscriptions require approval; one-time purchases can be approved automatically.",
+    description: "One-time purchases can be approved automatically.",
   },
   {
     mode: "above_amount",
     label: "Above an amount",
-    description: "For example, purchases over $20 require approval.",
+    description: "Purchases above your threshold require approval.",
   },
   {
     mode: "subscriptions_or_above_amount",
     label: "Subscriptions or above an amount",
-    description: "Subscriptions and purchases over $20 require approval.",
+    description: "Review subscriptions and purchases above your threshold.",
   },
   {
     mode: "never",
     label: "Never require approval",
-    description: "Eligible purchases can be approved automatically without human review.",
+    description: "Eligible purchases are approved automatically.",
   },
 ];
 
@@ -65,48 +66,82 @@ export function isThresholdMode(mode: PaymentApprovalMode): boolean {
 }
 
 export function paymentPolicyLabel(mode: PaymentApprovalMode): string {
-  return POLICY_OPTIONS.find((option) => option.mode === mode)?.label ?? "Approval rule";
+  return (
+    POLICY_OPTIONS.find((option) => option.mode === mode)?.label ??
+    "Approval rule"
+  );
 }
 
-type EditPaymentPolicySheetProps = {
-  agent: AgentRead;
-  policy: PaymentPolicyRead | null;
+type RuleSetSheetProps = {
+  agents: AgentRead[];
+  ruleSet?: PaymentRuleSetRead | null;
+  trigger?: ReactNode;
 };
 
-export function EditPaymentPolicySheet({ agent, policy }: EditPaymentPolicySheetProps) {
+export function RuleSetSheet({
+  agents,
+  ruleSet = null,
+  trigger,
+}: RuleSetSheetProps) {
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState<PaymentApprovalMode>(policy?.mode ?? "always");
-  const [thresholdAmount, setThresholdAmount] = useState(policy?.threshold_amount ?? "20.00");
+  const [name, setName] = useState(ruleSet?.name ?? "");
+  const [mode, setMode] = useState<PaymentApprovalMode>(
+    ruleSet?.mode ?? "always"
+  );
+  const [thresholdAmount, setThresholdAmount] = useState(
+    ruleSet?.threshold_amount ?? "20.00"
+  );
   const [thresholdCurrency, setThresholdCurrency] = useState(
-    policy?.threshold_currency ?? "USD",
+    ruleSet?.threshold_currency ?? "USD"
+  );
+  const [agentIds, setAgentIds] = useState<Set<string>>(
+    new Set(ruleSet?.assigned_agent_ids ?? [])
   );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   function handleOpenChange(next: boolean) {
     if (next) {
-      setMode(policy?.mode ?? "always");
-      setThresholdAmount(policy?.threshold_amount ?? "20.00");
-      setThresholdCurrency(policy?.threshold_currency ?? "USD");
+      setName(ruleSet?.name ?? "");
+      setMode(ruleSet?.mode ?? "always");
+      setThresholdAmount(ruleSet?.threshold_amount ?? "20.00");
+      setThresholdCurrency(ruleSet?.threshold_currency ?? "USD");
+      setAgentIds(new Set(ruleSet?.assigned_agent_ids ?? []));
       setError(null);
     }
     setOpen(next);
   }
 
+  function toggleAgent(agentId: string, checked: boolean) {
+    setAgentIds((current) => {
+      const next = new Set(current);
+      if (checked) next.add(agentId);
+      else next.delete(agentId);
+      return next;
+    });
+  }
+
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
-
+    const normalizedName = name.trim();
     const usesThreshold = isThresholdMode(mode);
     const amount = thresholdAmount.trim();
     const currency = thresholdCurrency.trim().toUpperCase();
 
+    if (!normalizedName) {
+      setError("Enter a name for this rule set.");
+      return;
+    }
     if (
       usesThreshold &&
-      (!/^(?:0|[1-9]\d{0,15})(?:\.\d{1,2})?$/.test(amount) || Number(amount) < 0)
+      (!/^(?:0|[1-9]\d{0,15})(?:\.\d{1,2})?$/.test(amount) ||
+        Number(amount) < 0)
     ) {
-      setError("Enter a non-negative threshold with no more than two decimal places.");
+      setError(
+        "Enter a non-negative threshold with no more than two decimal places."
+      );
       return;
     }
     if (usesThreshold && !/^[A-Z]{3}$/.test(currency)) {
@@ -114,35 +149,30 @@ export function EditPaymentPolicySheet({ agent, policy }: EditPaymentPolicySheet
       return;
     }
 
-    const payload: PaymentPolicyUpdate = {
+    const payload: PaymentRuleSetWrite = {
+      name: normalizedName,
       mode,
       threshold_amount: usesThreshold ? amount : null,
       threshold_currency: usesThreshold ? currency : null,
+      agent_ids: Array.from(agentIds),
     };
+    const path = ruleSet
+      ? `/payment-rule-sets/${ruleSet.id}`
+      : "/payment-rule-sets";
 
     setSubmitting(true);
     try {
-      const updated = await apiRequest<PaymentPolicyRead>(
-        `/agents/${agent.id}/payment-policy`,
-        {
-          method: "PATCH",
-          body: JSON.stringify(payload),
-        },
-      );
-      queryClient.setQueryData<PaymentPolicyRead[]>(queryKeys.paymentPolicies, (current) => {
-        if (!current) return [updated];
-        const exists = current.some((candidate) => candidate.agent_id === updated.agent_id);
-        return exists
-          ? current.map((candidate) =>
-              candidate.agent_id === updated.agent_id ? updated : candidate,
-            )
-          : [updated, ...current];
+      await apiRequest<PaymentRuleSetRead>(path, {
+        method: ruleSet ? "PATCH" : "POST",
+        body: JSON.stringify(payload),
       });
-      await queryClient.invalidateQueries({ queryKey: queryKeys.paymentPolicies });
-      toast.success(`Approval rule updated for ${agent.name}`);
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.paymentRuleSets,
+      });
+      toast.success(ruleSet ? "Rule set updated" : "Rule set created");
       setOpen(false);
     } catch (caught) {
-      setError(getErrorMessage(caught, "Could not update this approval rule."));
+      setError(getErrorMessage(caught, "Could not save this rule set."));
     } finally {
       setSubmitting(false);
     }
@@ -151,41 +181,62 @@ export function EditPaymentPolicySheet({ agent, policy }: EditPaymentPolicySheet
   return (
     <Sheet open={open} onOpenChange={handleOpenChange}>
       <SheetTrigger asChild>
-        <Button variant="outline" size="sm">
-          <Pencil aria-hidden="true" />
-          Edit rule
-        </Button>
+        {trigger ?? (
+          <Button>
+            <Plus aria-hidden="true" />
+            Add rule set
+          </Button>
+        )}
       </SheetTrigger>
-      <SheetContent className="w-full gap-0 sm:max-w-lg">
-        <SheetHeader className="border-b px-5 py-5 pr-14">
-          <SheetTitle>Edit approval rule</SheetTitle>
+      <SheetContent side="right" className="w-full gap-0 p-0 sm:max-w-[30rem]">
+        <SheetHeader className="border-b px-6 py-6 pr-14">
+          <SheetTitle className="text-xl font-semibold tracking-tight">
+            {ruleSet ? "Edit rule set" : "Add rule set"}
+          </SheetTitle>
           <SheetDescription>
-            Decide when legacy external-completion purchases proposed by {agent.name} must wait for
-            you. Managed browser checkout always requires your explicit approval.
+            Configure one approval policy and assign it to any number of agents.
           </SheetDescription>
         </SheetHeader>
 
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={handleSubmit}>
-          <div className="flex-1 space-y-6 overflow-y-auto px-5 py-5">
+          <div className="flex-1 space-y-6 overflow-y-auto px-6 py-6">
+            <div className="space-y-1.5">
+              <Label htmlFor={`rule-set-name-${ruleSet?.id ?? "new"}`}>
+                Name
+              </Label>
+              <Input
+                id={`rule-set-name-${ruleSet?.id ?? "new"}`}
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                maxLength={80}
+                placeholder="Standard purchases"
+                autoFocus
+                required
+              />
+            </div>
+
             <fieldset>
-              <legend className="mb-3 text-sm font-medium">Require approval</legend>
+              <legend className="mb-3 text-sm font-medium">
+                Require approval
+              </legend>
               <RadioGroup
                 value={mode}
                 onValueChange={(value) => setMode(value as PaymentApprovalMode)}
                 aria-label="Payment approval rule"
-                className="gap-2.5"
+                className="gap-2"
               >
                 {POLICY_OPTIONS.map((option) => (
                   <Label
                     key={option.mode}
-                    htmlFor={`policy-${agent.id}-${option.mode}`}
+                    htmlFor={`rule-set-${ruleSet?.id ?? "new"}-${option.mode}`}
                     className={cn(
-                      "flex cursor-pointer items-start gap-3 rounded-xl border bg-card p-3.5 transition-colors hover:bg-muted/40",
-                      mode === option.mode && "border-indigo-500 bg-indigo-50/60 dark:bg-indigo-950/25",
+                      "flex cursor-pointer items-start gap-3 rounded-xl border bg-card p-3 transition-colors hover:bg-muted/40",
+                      mode === option.mode &&
+                        "border-indigo-500 bg-indigo-50/60 dark:bg-indigo-950/25"
                     )}
                   >
                     <RadioGroupItem
-                      id={`policy-${agent.id}-${option.mode}`}
+                      id={`rule-set-${ruleSet?.id ?? "new"}-${option.mode}`}
                       value={option.mode}
                       className="mt-0.5"
                     />
@@ -193,7 +244,7 @@ export function EditPaymentPolicySheet({ agent, policy }: EditPaymentPolicySheet
                       <span className="block text-sm font-medium text-foreground">
                         {option.label}
                       </span>
-                      <span className="mt-1 block text-xs leading-5 font-normal text-muted-foreground">
+                      <span className="mt-0.5 block text-xs leading-5 font-normal text-muted-foreground">
                         {option.description}
                       </span>
                     </span>
@@ -204,68 +255,97 @@ export function EditPaymentPolicySheet({ agent, policy }: EditPaymentPolicySheet
 
             {isThresholdMode(mode) ? (
               <fieldset className="rounded-xl border bg-muted/30 p-4">
-                <legend className="px-1 text-sm font-medium">Approval threshold</legend>
-                <p id={`threshold-help-${agent.id}`} className="mb-4 text-xs leading-5 text-muted-foreground">
-                  Purchases strictly above this amount require approval. A purchase in another
-                  currency is always sent for approval.
-                </p>
-                <div className="grid grid-cols-[minmax(0,1fr)_7rem] gap-3">
+                <legend className="px-1 text-sm font-medium">
+                  Approval threshold
+                </legend>
+                <div className="mt-3 grid grid-cols-[minmax(0,1fr)_7rem] gap-3">
                   <div className="space-y-1.5">
-                    <Label htmlFor={`threshold-amount-${agent.id}`}>Amount</Label>
+                    <Label htmlFor={`threshold-amount-${ruleSet?.id ?? "new"}`}>
+                      Amount
+                    </Label>
                     <Input
-                      id={`threshold-amount-${agent.id}`}
+                      id={`threshold-amount-${ruleSet?.id ?? "new"}`}
                       value={thresholdAmount}
-                      onChange={(event) => setThresholdAmount(event.target.value)}
+                      onChange={(event) =>
+                        setThresholdAmount(event.target.value)
+                      }
                       type="number"
                       inputMode="decimal"
                       min="0"
                       max="9999999999999999.99"
                       step="0.01"
-                      placeholder="20.00"
-                      aria-describedby={`threshold-help-${agent.id}`}
                       required
                     />
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor={`threshold-currency-${agent.id}`}>Currency</Label>
+                    <Label
+                      htmlFor={`threshold-currency-${ruleSet?.id ?? "new"}`}
+                    >
+                      Currency
+                    </Label>
                     <Input
-                      id={`threshold-currency-${agent.id}`}
+                      id={`threshold-currency-${ruleSet?.id ?? "new"}`}
                       value={thresholdCurrency}
-                      onChange={(event) => setThresholdCurrency(event.target.value.toUpperCase())}
-                      inputMode="text"
+                      onChange={(event) =>
+                        setThresholdCurrency(event.target.value.toUpperCase())
+                      }
                       minLength={3}
                       maxLength={3}
                       pattern="[A-Za-z]{3}"
-                      placeholder="USD"
-                      autoCapitalize="characters"
-                      autoComplete="off"
-                      aria-describedby={`threshold-help-${agent.id}`}
                       required
                     />
                   </div>
                 </div>
+                <div className="mt-3 flex gap-2 text-xs leading-5 text-amber-800 dark:text-amber-200">
+                  <TriangleAlert
+                    className="mt-0.5 size-3.5 shrink-0"
+                    aria-hidden="true"
+                  />
+                  Currency mismatches always require review.
+                </div>
               </fieldset>
             ) : null}
 
-            <div className="space-y-3">
-              <div className="flex gap-3 rounded-xl border border-indigo-200 bg-indigo-50 p-3.5 text-sm text-indigo-950 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100">
-                <CreditCard className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-                <p className="leading-5">
-                  These rules can auto-approve only legacy external-completion proposals, using
-                  an active method assigned to the agent. Managed browser checkout always waits
-                  for your explicit approval.
-                </p>
-              </div>
-              {isThresholdMode(mode) ? (
-                <div className="flex gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
-                  <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-                  <p className="leading-5">
-                    Currency mismatches are sent for human approval; AG Pay does not convert
-                    currencies when evaluating a threshold.
+            <fieldset>
+              <legend className="text-sm font-medium">Assigned agents</legend>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                Selecting an agent moves it from its current rule set.
+                Unassigned agents always require approval.
+              </p>
+              <div className="mt-3 divide-y rounded-xl border">
+                {agents.length ? (
+                  agents.map((agent) => (
+                    <Label
+                      key={agent.id}
+                      htmlFor={`rule-set-agent-${ruleSet?.id ?? "new"}-${
+                        agent.id
+                      }`}
+                      className="flex cursor-pointer items-center gap-3 px-3 py-3 hover:bg-muted/40"
+                    >
+                      <Checkbox
+                        id={`rule-set-agent-${ruleSet?.id ?? "new"}-${
+                          agent.id
+                        }`}
+                        checked={agentIds.has(agent.id)}
+                        onCheckedChange={(checked) =>
+                          toggleAgent(agent.id, checked === true)
+                        }
+                      />
+                      <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                        {agent.name}
+                      </span>
+                      <span className="text-xs text-muted-foreground capitalize">
+                        {agent.connection_state}
+                      </span>
+                    </Label>
+                  ))
+                ) : (
+                  <p className="p-4 text-sm text-muted-foreground">
+                    No agents are available yet.
                   </p>
-                </div>
-              ) : null}
-            </div>
+                )}
+              </div>
+            </fieldset>
 
             {error ? (
               <p role="alert" className="text-sm text-destructive">
@@ -274,8 +354,13 @@ export function EditPaymentPolicySheet({ agent, policy }: EditPaymentPolicySheet
             ) : null}
           </div>
 
-          <SheetFooter className="border-t bg-background px-5 py-4 sm:flex-row sm:justify-end">
-            <Button type="button" variant="outline" onClick={() => setOpen(false)} disabled={submitting}>
+          <SheetFooter className="border-t bg-background px-6 py-4 sm:flex-row sm:justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setOpen(false)}
+              disabled={submitting}
+            >
               Cancel
             </Button>
             <Button type="submit" disabled={submitting}>
@@ -284,7 +369,7 @@ export function EditPaymentPolicySheet({ agent, policy }: EditPaymentPolicySheet
               ) : (
                 <ShieldCheck aria-hidden="true" />
               )}
-              {submitting ? "Saving…" : "Save rule"}
+              {ruleSet ? "Save changes" : "Create rule set"}
             </Button>
           </SheetFooter>
         </form>

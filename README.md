@@ -309,10 +309,11 @@ landing-server proof. Issuing, Stripe Link, and other unresolved executions must
 still be reconciled through their provider-specific operator process; do not
 reuse those cards while the outcome remains unknown.
 
-The `never` review mode means eligible legacy/external-completion proposals do
-not wait for a person when an active assigned method exists. It never
-auto-approves executable managed checkout and is not an unlimited spending
-permission.
+The `never` review mode means eligible proposals do not wait for a person when
+an active assigned method exists. Managed checkout is approved and queued
+automatically only when its adapter and assigned payment method pass the same
+execution safety checks used during human approval. It is not an unlimited
+spending permission.
 
 ## Checks
 

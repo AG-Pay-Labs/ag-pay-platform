@@ -98,6 +98,9 @@ class Agent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     owner_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    payment_rule_set_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("payment_rule_sets.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     status: Mapped[AgentStatus] = mapped_column(
@@ -118,20 +121,16 @@ class Agent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     assigned_payment_methods: Mapped[list["AgentPaymentMethod"]] = relationship(
         back_populates="agent", cascade="all, delete-orphan"
     )
-    payment_policy: Mapped["AgentPaymentPolicy | None"] = relationship(
-        back_populates="agent", cascade="all, delete-orphan", uselist=False
-    )
+    payment_rule_set: Mapped["PaymentRuleSet | None"] = relationship(back_populates="agents")
 
 
-class AgentPaymentPolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    __tablename__ = "agent_payment_policies"
+class PaymentRuleSet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "payment_rule_sets"
 
     owner_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    agent_id: Mapped[UUID] = mapped_column(
-        ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, unique=True
-    )
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
     mode: Mapped[PaymentApprovalMode] = mapped_column(
         Enum(PaymentApprovalMode, native_enum=False),
         nullable=False,
@@ -141,7 +140,7 @@ class AgentPaymentPolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     threshold_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     threshold_currency: Mapped[str | None] = mapped_column(String(3))
 
-    agent: Mapped[Agent] = relationship(back_populates="payment_policy")
+    agents: Mapped[list[Agent]] = relationship(back_populates="payment_rule_set")
 
     __table_args__ = (
         CheckConstraint(
@@ -159,6 +158,7 @@ class AgentPaymentPolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "threshold_currency IS NULL OR length(threshold_currency) = 3",
             name="threshold_currency_length",
         ),
+        UniqueConstraint("owner_id", "name", name="uq_payment_rule_sets_owner_name"),
     )
 
 
