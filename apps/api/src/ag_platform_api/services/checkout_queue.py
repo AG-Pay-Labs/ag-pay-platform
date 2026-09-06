@@ -18,6 +18,7 @@ from ag_platform_api.models import (
     CheckoutExecutionStatus,
     CheckoutStatusTransition,
     PaymentMethod,
+    PaymentMethodKind,
     PaymentMethodStatus,
     StoredCardCredential,
 )
@@ -72,10 +73,19 @@ async def queue_checkout_execution(
             "checkout_recurring_unsupported",
             "Managed checkout does not support recurring purchases",
         )
+    if payment_method.kind is not PaymentMethodKind.card:
+        raise CheckoutQueueError(
+            "checkout_provider_unsupported",
+            "Card managed checkout requires an assigned card payment method",
+        )
     try:
         decimal_to_minor(item.unit_price * item.quantity, item.currency)
     except CheckoutError as error:
         raise CheckoutQueueError(f"checkout_{error.code.value}", error.safe_message) from None
+    if payment_method.expiry_month is None or payment_method.expiry_year is None:
+        raise CheckoutQueueError(
+            "payment_method_invalid", "The approved card payment method is incomplete"
+        )
     if is_card_expired(payment_method.expiry_month, payment_method.expiry_year):
         raise CheckoutQueueError(
             "payment_method_expired",

@@ -13,7 +13,7 @@ import {
 
 import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge } from "@/components/app";
 import {
-  AgentCardAssignmentsDialog,
+  AgentPaymentMethodAssignmentsDialog,
   RevokeAgentDialog,
   RotatePairingDialog,
 } from "@/components/features/agents/agent-actions";
@@ -46,7 +46,7 @@ export default function AgentsPage() {
       <PageHeader
         eyebrow="Connected runtimes"
         title="Agents"
-        description="Pair OpenClaw-like agents, monitor heartbeats, and control which cards each one may use."
+        description="Pair OpenClaw-like agents, monitor heartbeats, and control which payment methods each one may use."
         actions={<ConnectAgentDialog />}
       />
 
@@ -214,7 +214,7 @@ function AgentSummary({ agent }: { agent: AgentRead }) {
 
         <SheetFooter className="border-t bg-background px-6 py-4">
           <div className="flex flex-wrap items-center gap-2">
-            <AgentCardAssignmentsDialog agent={agent} />
+            <AgentPaymentMethodAssignmentsDialog agent={agent} />
             <div className="ml-auto flex items-center gap-1">
               <RotatePairingDialog agent={agent} />
               <RevokeAgentDialog agent={agent} />

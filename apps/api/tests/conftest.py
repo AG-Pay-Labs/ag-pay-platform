@@ -51,6 +51,7 @@ def settings(tmp_path: Path) -> Settings:
         agent_token_expire_days=1,
         pairing_token_expire_minutes=5,
         agent_online_window_seconds=60,
+        x402_enabled=True,
     )
 
 

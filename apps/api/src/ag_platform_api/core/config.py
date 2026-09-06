@@ -23,6 +23,57 @@ CheckoutSelector = Annotated[
 CHECKOUT_ADAPTER_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 STRIPE_HOSTED_TEST_ADAPTER_KEY = "stripe-hosted"
 LOCAL_DIRECT_CARD_PROVIDER = "local_direct_card"
+X402_ADAPTER_KEY = "x402"
+BASE_NETWORK = "eip155:8453"
+BASE_SEPOLIA_NETWORK = "eip155:84532"
+
+
+class X402AssetSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    network: Literal["eip155:8453", "eip155:84532"]
+    asset: Annotated[str, StringConstraints(pattern=r"^0x[0-9a-fA-F]{40}$")]
+    symbol: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=16)]
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+    version: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=16)]
+    decimals: int = Field(ge=0, le=18)
+    transfer_method: Literal["eip3009", "permit2"]
+    max_amount_atomic: Annotated[str, StringConstraints(pattern=r"^[1-9][0-9]{0,77}$")]
+
+
+def default_x402_assets() -> list[X402AssetSettings]:
+    return [
+        X402AssetSettings(
+            network=BASE_SEPOLIA_NETWORK,
+            asset="0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+            symbol="USDC",
+            name="USDC",
+            version="2",
+            decimals=6,
+            transfer_method="eip3009",
+            max_amount_atomic="100000000",
+        ),
+        X402AssetSettings(
+            network=BASE_NETWORK,
+            asset="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            symbol="USDC",
+            name="USD Coin",
+            version="2",
+            decimals=6,
+            transfer_method="eip3009",
+            max_amount_atomic="100000000",
+        ),
+        X402AssetSettings(
+            network=BASE_NETWORK,
+            asset="0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",
+            symbol="USDT",
+            name="USDT",
+            version="1",
+            decimals=6,
+            transfer_method="permit2",
+            max_amount_atomic="100000000",
+        ),
+    ]
 
 
 def normalize_checkout_origin(value: str) -> str:
@@ -313,12 +364,27 @@ class Settings(CheckoutRuntimeSettings):
     agent_online_window_seconds: int = 120
     credential_encryption_key: str | None = None
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    wallet_challenge_ttl_seconds: int = Field(default=300, ge=60, le=900)
+    x402_enabled: bool = False
+    x402_mainnet_enabled: bool = False
+    x402_http_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
+    x402_reconciliation_grace_seconds: float = Field(default=5.0, ge=1, le=300)
+    x402_max_response_bytes: int = Field(default=2_000_000, ge=1_024, le=10_000_000)
+    x402_assets: list[X402AssetSettings] = Field(default_factory=default_x402_assets)
 
     @field_validator("jwt_secret")
     @classmethod
     def validate_jwt_secret(cls, value: str) -> str:
         if len(value) < 32:
             raise ValueError("JWT_SECRET must contain at least 32 characters")
+        return value
+
+    @field_validator("x402_assets")
+    @classmethod
+    def validate_x402_assets(cls, value: list[X402AssetSettings]) -> list[X402AssetSettings]:
+        references = [(asset.network, asset.asset.lower()) for asset in value]
+        if len(references) != len(set(references)):
+            raise ValueError("X402_ASSETS cannot contain duplicate network/asset entries")
         return value
 
     @model_validator(mode="after")

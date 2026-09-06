@@ -2,9 +2,10 @@
 
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Check, Copy, CreditCard, KeyRound, Loader2, ShieldOff } from "lucide-react";
+import { Check, Copy, KeyRound, Loader2, ShieldOff, WalletCards } from "lucide-react";
 import { toast } from "sonner";
 
+import { PaymentMethodLabel } from "@/components/features/payment-methods/payment-method-label";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -38,25 +39,29 @@ import {
 } from "@/hooks/use-api-data";
 import { formatDateTime } from "@/utils/format";
 
-export function AgentCardAssignmentsDialog({ agent }: { agent: AgentRead }) {
+export function AgentPaymentMethodAssignmentsDialog({ agent }: { agent: AgentRead }) {
   const [open, setOpen] = useState(false);
   const [savingId, setSavingId] = useState<string | null>(null);
-  const cardsQuery = usePaymentMethods();
+  const methodsQuery = usePaymentMethods();
   const assignedQuery = useAgentPaymentMethods(agent.id, open);
   const queryClient = useQueryClient();
   const assignedIds = useMemo(
-    () => new Set((assignedQuery.data ?? []).map((card) => card.id)),
+    () => new Set((assignedQuery.data ?? []).map((method) => method.id)),
     [assignedQuery.data],
   );
-  const activeCards = (cardsQuery.data ?? []).filter((card) => card.status === "active");
+  const activeMethods = (methodsQuery.data ?? []).filter(
+    (method) => method.status === "active",
+  );
 
-  async function toggle(cardId: string, assign: boolean) {
-    setSavingId(cardId);
+  async function toggle(methodId: string, assign: boolean) {
+    setSavingId(methodId);
     try {
-      await apiRequest<void>(`/agents/${agent.id}/payment-methods/${cardId}`, {
+      await apiRequest<void>(`/agents/${agent.id}/payment-methods/${methodId}`, {
         method: assign ? "PUT" : "DELETE",
       });
-      await queryClient.invalidateQueries({ queryKey: queryKeys.agentCards(agent.id) });
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.agentPaymentMethods(agent.id),
+      });
       toast.success(assign ? "Payment method assigned" : "Payment method unassigned");
     } catch (caught) {
       toast.error(getErrorMessage(caught, "Could not update this assignment."));
@@ -69,58 +74,51 @@ export function AgentCardAssignmentsDialog({ agent }: { agent: AgentRead }) {
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <Button variant="outline" size="sm">
-          <CreditCard />
-          Manage cards
+          <WalletCards />
+          Manage methods
         </Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Cards assigned to {agent.name}</DialogTitle>
+          <DialogTitle>Payment methods assigned to {agent.name}</DialogTitle>
           <DialogDescription>
             An assigned method may be selected when you approve this agent’s proposals.
           </DialogDescription>
         </DialogHeader>
 
-        {cardsQuery.isLoading || assignedQuery.isLoading ? (
+        {methodsQuery.isLoading || assignedQuery.isLoading ? (
           <div className="flex items-center justify-center py-10 text-muted-foreground">
             <Loader2 className="mr-2 size-4 animate-spin" /> Loading payment methods
           </div>
-        ) : activeCards.length === 0 ? (
+        ) : activeMethods.length === 0 ? (
           <div className="rounded-lg border border-dashed p-6 text-center">
-            <CreditCard className="mx-auto mb-3 size-6 text-muted-foreground" />
+            <WalletCards className="mx-auto mb-3 size-6 text-muted-foreground" />
             <p className="font-medium">No active payment methods</p>
             <p className="mt-1 text-sm text-muted-foreground">
-              Add a direct, sandbox, or provider-backed method on the Cards page
-              first.
+              Add a card or connect a wallet on the Payment methods page first.
             </p>
           </div>
         ) : (
           <div className="space-y-2">
-            {activeCards.map((card) => {
-              const checked = assignedIds.has(card.id);
-              const saving = savingId === card.id;
+            {activeMethods.map((method) => {
+              const checked = assignedIds.has(method.id);
+              const saving = savingId === method.id;
               return (
                 <Label
-                  key={card.id}
-                  htmlFor={`assign-${agent.id}-${card.id}`}
+                  key={method.id}
+                  htmlFor={`assign-${agent.id}-${method.id}`}
                   className="flex cursor-pointer items-center gap-3 rounded-lg border bg-card p-3 hover:bg-muted/40"
                 >
                   {saving ? (
                     <Loader2 className="size-4 animate-spin" />
                   ) : (
                     <Checkbox
-                      id={`assign-${agent.id}-${card.id}`}
+                      id={`assign-${agent.id}-${method.id}`}
                       checked={checked}
-                      onCheckedChange={(next) => toggle(card.id, next === true)}
+                      onCheckedChange={(next) => toggle(method.id, next === true)}
                     />
                   )}
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate font-medium">{card.display_name}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {card.card_brand.toUpperCase()} •••• {card.card_last4} · expires{" "}
-                      {String(card.expiry_month).padStart(2, "0")}/{card.expiry_year}
-                    </p>
-                  </div>
+                  <PaymentMethodLabel method={method} compact className="flex-1" />
                   {checked ? <Badge variant="secondary">Assigned</Badge> : null}
                 </Label>
               );

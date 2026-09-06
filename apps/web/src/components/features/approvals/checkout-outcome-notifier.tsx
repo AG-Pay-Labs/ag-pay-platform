@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import type { CartItemRead, CheckoutExecutionStatus } from "@/lib/api-types";
 
 const TERMINAL_EXECUTION_STATUSES = new Set<CheckoutExecutionStatus>([
+  "awaiting_signature",
   "succeeded",
   "failed",
   "action_required",
@@ -106,6 +107,12 @@ function checkoutOutcomeNotice(item: CartItemRead): OutcomeNotice {
           ? detail
           : `${item.title}: the merchant requested an interactive step.`,
       };
+    case "awaiting_signature":
+      return {
+        kind: "warning",
+        title: "Wallet signature required",
+        description: `${item.title}: review and sign the exact x402 authorization.`,
+      };
     case "outcome_unknown":
       return {
         kind: "warning",
@@ -116,6 +123,8 @@ function checkoutOutcomeNotice(item: CartItemRead): OutcomeNotice {
       };
     case "queued":
     case "running":
+    case "authorized":
+    case "submitted":
       return {
         kind: "warning",
         title: "Checkout status changed",

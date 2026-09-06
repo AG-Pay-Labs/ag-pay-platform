@@ -6,8 +6,10 @@ import { useRouter, useSearchParams } from "next/navigation";
 import {
   Bot,
   CalendarClock,
+  Check,
   CheckCircle2,
   CircleX,
+  Copy,
   ExternalLink,
   Search,
   ShieldCheck,
@@ -30,6 +32,7 @@ import {
   ReconcilePaymentDialog,
   RevealCredentialDialog,
 } from "@/components/features/approvals/approval-actions";
+import { X402AuthorizeDialog } from "@/components/features/approvals/x402-authorize-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
@@ -44,6 +47,11 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAgents, useCartItems } from "@/hooks/use-api-data";
 import type { CartItemRead, CheckoutExecutionStatus } from "@/lib/api-types";
 import { cn } from "@/lib/utils";
+import {
+  chainForId,
+  chainIdForNetwork,
+  chainLabel,
+} from "@/lib/wallets/chains";
 import { formatDateTime, hostname, relativeTime } from "@/utils/format";
 
 type Queue = "review" | "progress" | "attention" | "history";
@@ -87,6 +95,7 @@ const QUEUE_OPTIONS: ReadonlyArray<{
 ];
 
 const ATTENTION_STATUSES = new Set<CheckoutExecutionStatus>([
+  "awaiting_signature",
   "failed",
   "action_required",
   "outcome_unknown",
@@ -281,6 +290,9 @@ function ApprovalsContent() {
                     <Money
                       amount={item.total_amount}
                       currency={item.currency}
+                      maximumFractionDigits={
+                        item.checkout_adapter === "x402" ? 18 : undefined
+                      }
                     />
                     <p className="mt-1 text-xs text-muted-foreground">
                       {item.billing_period ?? "one-time"}
@@ -323,7 +335,13 @@ function ApprovalsContent() {
                   <span className="text-xs text-muted-foreground">
                     {item.merchant ?? hostname(item.product_url)}
                   </span>
-                  <Money amount={item.total_amount} currency={item.currency} />
+                  <Money
+                    amount={item.total_amount}
+                    currency={item.currency}
+                    maximumFractionDigits={
+                      item.checkout_adapter === "x402" ? 18 : undefined
+                    }
+                  />
                 </div>
               </button>
             )}
@@ -382,6 +400,9 @@ function ApprovalsContent() {
                     amount={selected.total_amount}
                     currency={selected.currency}
                     className="text-2xl"
+                    maximumFractionDigits={
+                      selected.checkout_adapter === "x402" ? 18 : undefined
+                    }
                   />
                 </div>
 
@@ -432,7 +453,7 @@ function ApprovalsContent() {
                     />
                     <Detail
                       label="Merchant account"
-                      value={selected.account_email}
+                      value={selected.account_email ?? "Not required for x402"}
                     />
                     <Detail
                       label="Checkout mode"
@@ -447,7 +468,9 @@ function ApprovalsContent() {
                       value={formatDateTime(selected.created_at)}
                     />
                   </dl>
-                  <RevealCredentialDialog item={selected} />
+                  {selected.credential_id ? (
+                    <RevealCredentialDialog item={selected} />
+                  ) : null}
                 </DetailSection>
 
                 {selected.decision_note ? (
@@ -576,6 +599,13 @@ function ExecutionState({ item }: { item: CartItemRead }) {
             ) : null}
           </div>
         ) : null}
+        <X402SettlementEvidence item={item} />
+        {execution.status === "awaiting_signature" &&
+        item.checkout_adapter === "x402" ? (
+          <div className="mt-4 border-t border-current/20 pt-4">
+            <X402AuthorizeDialog item={item} />
+          </div>
+        ) : null}
         {execution.status_history.length ? (
           <div className="mt-4 border-t border-current/20 pt-3">
             <p className="text-xs font-semibold tracking-wide uppercase">
@@ -642,6 +672,95 @@ function ExecutionState({ item }: { item: CartItemRead }) {
   );
 }
 
+const X402_EVIDENCE_STATUSES = new Set<CheckoutExecutionStatus>([
+  "succeeded",
+  "failed",
+  "outcome_unknown",
+]);
+const EVM_TRANSACTION_PATTERN = /^0x[0-9a-f]{64}$/;
+
+function X402SettlementEvidence({ item }: { item: CartItemRead }) {
+  const [copied, setCopied] = useState(false);
+  const execution = item.execution;
+  const x402 = item.x402;
+  const transaction = x402?.transaction;
+  if (
+    item.checkout_adapter !== "x402" ||
+    !execution ||
+    !X402_EVIDENCE_STATUSES.has(execution.status) ||
+    !transaction ||
+    !EVM_TRANSACTION_PATTERN.test(transaction)
+  ) {
+    return null;
+  }
+  const verifiedTransaction = transaction;
+
+  const chainId = chainIdForNetwork(x402.network);
+  const chain = chainId === null ? null : chainForId(chainId);
+  const explorer = chain?.blockExplorers?.default;
+  const explorerUrl =
+    explorer && explorer.url.startsWith("https://")
+      ? `${explorer.url.replace(/\/$/, "")}/tx/${verifiedTransaction}`
+      : null;
+  const outcomeNote =
+    execution.status === "succeeded"
+      ? "AG Pay matched this transaction to the frozen wallet and network before confirming the purchase."
+      : execution.status === "failed"
+        ? "AG Pay matched this transaction to the frozen wallet and network; the payment response reported failure."
+        : "AG Pay matched this transaction to the frozen wallet and network, but that evidence does not prove the final outcome.";
+
+  async function copyTransaction() {
+    try {
+      await navigator.clipboard.writeText(verifiedTransaction);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2_000);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <div className="mt-4 rounded-md border border-current/20 bg-background/60 p-3">
+      <p className="font-semibold">Verified settlement evidence</p>
+      <p className="mt-1 text-xs leading-5 opacity-80">{outcomeNote}</p>
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+        <Detail
+          label="Network"
+          value={`${chainId === null ? x402.network : chainLabel(chainId)} · ${x402.network}`}
+        />
+        <div>
+          <dt className="text-xs text-muted-foreground">Transaction hash</dt>
+          <dd
+            className="mt-1 break-all font-mono text-xs font-medium"
+            title={verifiedTransaction}
+          >
+            {verifiedTransaction}
+          </dd>
+        </div>
+      </dl>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => void copyTransaction()}
+          aria-label="Copy verified transaction hash"
+        >
+          {copied ? <Check /> : <Copy />}
+          {copied ? "Copied" : "Copy hash"}
+        </Button>
+        {explorerUrl ? (
+          <Button variant="outline" size="sm" asChild>
+            <a href={explorerUrl} target="_blank" rel="noreferrer">
+              View on {explorer?.name ?? "block explorer"} <ExternalLink />
+            </a>
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function executionPresentation(status: CheckoutExecutionStatus) {
   switch (status) {
     case "succeeded":
@@ -657,6 +776,7 @@ function executionPresentation(status: CheckoutExecutionStatus) {
           "border-rose-200 bg-rose-50 text-rose-950 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-100",
       };
     case "action_required":
+    case "awaiting_signature":
     case "outcome_unknown":
       return {
         icon: TriangleAlert,
@@ -665,6 +785,8 @@ function executionPresentation(status: CheckoutExecutionStatus) {
       };
     case "queued":
     case "running":
+    case "authorized":
+    case "submitted":
       return {
         icon: CalendarClock,
         className:
@@ -707,6 +829,24 @@ function executionStatusCopy(status: CheckoutExecutionStatus) {
         title: "Checkout in progress",
         description:
           "AG Pay is completing the allowlisted checkout without exposing card data to the agent.",
+      };
+    case "awaiting_signature":
+      return {
+        title: "Wallet signature required",
+        description:
+          "Review the exact x402 terms and sign the authorization with the assigned wallet.",
+      };
+    case "authorized":
+      return {
+        title: "x402 payment authorized",
+        description:
+          "The signed authorization was accepted and is waiting to be submitted.",
+      };
+    case "submitted":
+      return {
+        title: "x402 payment submitted",
+        description:
+          "The signed payment has been submitted and is awaiting a verified outcome.",
       };
     case "action_required":
       return {

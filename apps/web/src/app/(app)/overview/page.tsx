@@ -6,11 +6,11 @@ import {
   Bot,
   CheckCircle2,
   Clock3,
-  CreditCard,
   ExternalLink,
   ReceiptText,
   RefreshCw,
   ShoppingBasket,
+  WalletCards,
 } from "lucide-react";
 
 import {
@@ -36,31 +36,33 @@ import { hostname, relativeTime } from "@/utils/format";
 
 export default function OverviewPage() {
   const agents = useAgents();
-  const cards = usePaymentMethods();
+  const paymentMethods = usePaymentMethods();
   const cart = useCartItems();
   const purchases = usePurchases();
   const subscriptions = useSubscriptions();
 
-  const allLoading = [agents, cards, cart, subscriptions].some((query) => query.isLoading);
-  const anyError = [agents, cards, cart, purchases, subscriptions].find((query) => query.error);
+  const allLoading = [agents, paymentMethods, cart, subscriptions].some((query) => query.isLoading);
+  const anyError = [agents, paymentMethods, cart, purchases, subscriptions].find((query) => query.error);
   const pending = (cart.data ?? []).filter((item) => item.status === "proposed");
   const onlineAgents = (agents.data ?? []).filter(
     (agent) => agent.connection_state === "online",
   );
-  const activeCards = (cards.data ?? []).filter((card) => card.status === "active");
+  const activePaymentMethods = (paymentMethods.data ?? []).filter(
+    (method) => method.status === "active",
+  );
   const activeSubscriptions = (subscriptions.data ?? []).filter(
     (subscription) => subscription.status === "active",
   );
   const firstRun =
     !allLoading &&
     (agents.data?.length ?? 0) === 0 &&
-    (cards.data?.length ?? 0) === 0 &&
+    (paymentMethods.data?.length ?? 0) === 0 &&
     (cart.data?.length ?? 0) === 0;
 
   async function retry() {
     await Promise.all([
       agents.refetch(),
-      cards.refetch(),
+      paymentMethods.refetch(),
       cart.refetch(),
       purchases.refetch(),
       subscriptions.refetch(),
@@ -109,10 +111,10 @@ export default function OverviewPage() {
             tone="emerald"
           />
           <StatCard
-            label="Active cards"
-            value={activeCards.length}
-            description="Tokenized references"
-            icon={CreditCard}
+            label="Active payment methods"
+            value={activePaymentMethods.length}
+            description="Cards and verified wallets"
+            icon={WalletCards}
             tone="indigo"
           />
           <StatCard
@@ -267,7 +269,18 @@ export default function OverviewPage() {
                     <StatusBadge status={purchase.status} />
                   </div>
                   <div className="mt-5 flex items-end justify-between gap-3">
-                    <Money amount={purchase.amount} currency={purchase.currency} className="text-lg" />
+                    <Money
+                      amount={purchase.amount}
+                      currency={purchase.currency}
+                      className="text-lg"
+                      maximumFractionDigits={
+                        cart.data?.find(
+                          (item) => item.id === purchase.cart_item_id,
+                        )?.checkout_adapter === "x402"
+                          ? 18
+                          : undefined
+                      }
+                    />
                     <Button variant="ghost" size="icon-sm" asChild>
                       <a href={purchase.product_url} target="_blank" rel="noreferrer" aria-label={`Open ${purchase.title} product page`}>
                         <ExternalLink />
@@ -287,8 +300,8 @@ export default function OverviewPage() {
 function SetupChecklist() {
   const steps = [
     { label: "Connect your first agent", href: "/agents", icon: Bot },
-    { label: "Add a provider reference", href: "/cards", icon: CreditCard },
-    { label: "Assign the card to the agent", href: "/agents", icon: CheckCircle2 },
+    { label: "Add a payment method", href: "/payment-methods", icon: WalletCards },
+    { label: "Assign it to the agent", href: "/agents", icon: CheckCircle2 },
     { label: "Wait for the first proposal", href: "/approvals", icon: Clock3 },
   ];
 

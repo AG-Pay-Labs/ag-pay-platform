@@ -27,14 +27,14 @@ export default function AuthLayout({ children }: { children: React.ReactNode }) 
           <ul className="mt-10 grid gap-4 text-sm text-zinc-300 sm:grid-cols-2">
             <Feature icon={Bot}>Verified agent pairing</Feature>
             <Feature icon={ShieldCheck}>Per-agent approval rules</Feature>
-            <Feature icon={CheckCircle2}>Agent and card attribution</Feature>
-            <Feature icon={WalletCards}>Recurring commitment tracking</Feature>
+            <Feature icon={CheckCircle2}>Agent and payment-method attribution</Feature>
+            <Feature icon={WalletCards}>Card and wallet controls</Feature>
           </ul>
         </div>
 
         <div className="flex items-center gap-2 text-xs text-zinc-500">
           <ShieldCheck className="size-3.5" />
-          Supervised checkout with local research card support
+          Supervised checkout with card and x402 wallet support
         </div>
       </section>
       <section className="flex min-h-svh items-center justify-center px-5 py-10 sm:px-8">

@@ -23,6 +23,7 @@ from ag_platform_api.models import (
     CartItemStatus,
     CheckoutExecution,
     PaymentMethod,
+    PaymentMethodKind,
     PaymentMethodStatus,
 )
 from ag_platform_api.schemas import (
@@ -41,8 +42,61 @@ from ag_platform_api.services.checkout.reconciliation import (
 from ag_platform_api.services.checkout.repository import SqlAlchemyCheckoutRepository
 from ag_platform_api.services.checkout_queue import CheckoutQueueError, queue_checkout_execution
 from ag_platform_api.services.serializers import human_cart_item_read
+from ag_platform_api.services.x402 import (
+    X402ReconciliationNotice,
+    X402ServiceError,
+    ensure_x402_submission_enabled,
+    queue_x402_execution,
+    reconcile_stale_x402_submission,
+    reconcile_stale_x402_submissions,
+)
 
 router = APIRouter(prefix="/cart-items", tags=["cart"])
+
+
+async def _publish_x402_reconciliations(
+    broker: Broker,
+    reconciliations: list[X402ReconciliationNotice],
+) -> None:
+    for reconciliation in reconciliations:
+        await broker.publish(
+            "checkout.outcome_unknown",
+            {
+                "execution_id": reconciliation.execution_id,
+                "cart_item_id": reconciliation.cart_item_id,
+                "agent_id": reconciliation.agent_id,
+                "status": reconciliation.status.value,
+                "payment_protocol": "x402",
+                "reconciliation_reason": "response_deadline_exceeded",
+            },
+        )
+
+
+async def _reconcile_owned_x402_reads(
+    db: DatabaseSession,
+    settings: AppSettings,
+    broker: Broker,
+    *,
+    owner_id: UUID,
+    cart_item_id: UUID | None = None,
+) -> None:
+    if cart_item_id is None:
+        reconciliations = await reconcile_stale_x402_submissions(
+            db,
+            owner_id=owner_id,
+            agent_id=None,
+            settings=settings,
+        )
+    else:
+        reconciliation = await reconcile_stale_x402_submission(
+            db,
+            owner_id=owner_id,
+            agent_id=None,
+            cart_item_id=cart_item_id,
+            settings=settings,
+        )
+        reconciliations = [reconciliation] if reconciliation is not None else []
+    await _publish_x402_reconciliations(broker, reconciliations)
 
 
 async def load_cart_item(db: DatabaseSession, cart_item_id: UUID) -> CartItem:
@@ -50,6 +104,7 @@ async def load_cart_item(db: DatabaseSession, cart_item_id: UUID) -> CartItem:
         select(CartItem)
         .options(
             selectinload(CartItem.credential),
+            selectinload(CartItem.x402_payment),
             selectinload(CartItem.checkout_execution).selectinload(
                 CheckoutExecution.status_transitions
             ),
@@ -72,6 +127,7 @@ async def owned_cart_item(
         select(CartItem)
         .options(
             selectinload(CartItem.credential),
+            selectinload(CartItem.x402_payment),
             selectinload(CartItem.checkout_execution).selectinload(
                 CheckoutExecution.status_transitions
             ),
@@ -90,12 +146,21 @@ async def owned_cart_item(
 async def list_cart_items(
     user: CurrentUser,
     db: DatabaseSession,
+    settings: AppSettings,
+    broker: Broker,
     item_status: Annotated[CartItemStatus | None, Query(alias="status")] = None,
 ) -> list[HumanCartItemRead]:
+    await _reconcile_owned_x402_reads(
+        db,
+        settings,
+        broker,
+        owner_id=user.id,
+    )
     query = (
         select(CartItem)
         .options(
             selectinload(CartItem.credential),
+            selectinload(CartItem.x402_payment),
             selectinload(CartItem.checkout_execution).selectinload(
                 CheckoutExecution.status_transitions
             ),
@@ -114,7 +179,16 @@ async def get_cart_item(
     cart_item_id: UUID,
     user: CurrentUser,
     db: DatabaseSession,
+    settings: AppSettings,
+    broker: Broker,
 ) -> HumanCartItemRead:
+    await _reconcile_owned_x402_reads(
+        db,
+        settings,
+        broker,
+        owner_id=user.id,
+        cart_item_id=cart_item_id,
+    )
     return human_cart_item_read(await owned_cart_item(db, user.id, cart_item_id))
 
 
@@ -210,21 +284,40 @@ async def approve_cart_item(
             status_code=422,
             detail="CVC is accepted only for a stored direct-card checkout",
         )
+    if item.checkout_adapter == "x402" and payment_method.kind is not PaymentMethodKind.wallet:
+        raise HTTPException(status_code=409, detail="x402 payments require a connected wallet")
+    if item.checkout_adapter != "x402" and payment_method.kind is not PaymentMethodKind.card:
+        raise HTTPException(status_code=409, detail="This checkout requires a card")
+    if item.checkout_adapter == "x402":
+        if item.x402_payment is None:
+            raise HTTPException(status_code=409, detail="The x402 payment request is incomplete")
+        try:
+            ensure_x402_submission_enabled(item.x402_payment, settings)
+        except X402ServiceError as exc:
+            raise HTTPException(status_code=409, detail=exc.safe_message) from exc
 
     item.status = CartItemStatus.approved
     item.selected_payment_method_id = payment_method.id
     item.decision_note = payload.note
     item.approved_at = datetime.now(UTC)
     try:
-        execution = await queue_checkout_execution(
-            db,
-            item=item,
-            payment_method=payment_method,
-            settings=settings,
-        )
-    except CheckoutQueueError as exc:
+        if item.checkout_adapter == "x402":
+            execution = await queue_x402_execution(
+                db,
+                item=item,
+                payment_method=payment_method,
+            )
+        else:
+            execution = await queue_checkout_execution(
+                db,
+                item=item,
+                payment_method=payment_method,
+                settings=settings,
+            )
+    except (CheckoutQueueError, X402ServiceError) as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail=exc.message) from exc
+        detail = exc.message if isinstance(exc, CheckoutQueueError) else exc.safe_message
+        raise HTTPException(status_code=409, detail=detail) from exc
     cvc_receipt: str | None = None
     if direct_card:
         if execution is None or payload.cvc is None or cvc_client is None:
@@ -296,6 +389,8 @@ async def reveal_cart_credential(
     if not verify_password(payload.current_password.get_secret_value(), user.password_hash):
         raise HTTPException(status_code=403, detail="Current password is incorrect")
     item = await owned_cart_item(db, user.id, cart_item_id)
+    if item.credential is None:
+        raise HTTPException(status_code=409, detail="This cart item has no merchant credential")
     password = decrypt_secret(item.credential.encrypted_password, settings)
     await broker.publish(
         "purchase_credential.revealed",

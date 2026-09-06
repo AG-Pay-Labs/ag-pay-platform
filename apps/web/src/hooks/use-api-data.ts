@@ -10,13 +10,15 @@ import type {
   PaymentMethodRead,
   PurchaseRead,
   SubscriptionRead,
+  WalletConfigRead,
 } from "@/lib/api-types";
 
 export const queryKeys = {
   agents: ["agents"] as const,
-  agentCards: (agentId: string) =>
+  agentPaymentMethods: (agentId: string) =>
     ["agents", agentId, "payment-methods"] as const,
-  cards: ["payment-methods"] as const,
+  paymentMethods: ["payment-methods"] as const,
+  walletConfig: ["payment-methods", "wallet-config"] as const,
   cart: ["cart-items"] as const,
   purchases: ["purchases"] as const,
   subscriptions: ["subscriptions"] as const,
@@ -33,14 +35,24 @@ export function useAgents() {
 
 export function usePaymentMethods() {
   return useQuery({
-    queryKey: queryKeys.cards,
+    queryKey: queryKeys.paymentMethods,
     queryFn: () => apiRequest<PaymentMethodRead[]>("/payment-methods"),
+  });
+}
+
+export function useWalletConfig(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.walletConfig,
+    queryFn: () =>
+      apiRequest<WalletConfigRead>("/payment-methods/wallet-config"),
+    enabled,
+    staleTime: 5 * 60_000,
   });
 }
 
 export function useAgentPaymentMethods(agentId: string | null, enabled = true) {
   return useQuery({
-    queryKey: queryKeys.agentCards(agentId ?? "none"),
+    queryKey: queryKeys.agentPaymentMethods(agentId ?? "none"),
     queryFn: () =>
       apiRequest<PaymentMethodRead[]>(`/agents/${agentId}/payment-methods`),
     enabled: Boolean(agentId) && enabled,
@@ -55,7 +67,9 @@ export function useCartItems() {
       query.state.data?.some(
         (item) =>
           item.execution?.status === "queued" ||
-          item.execution?.status === "running"
+          item.execution?.status === "running" ||
+          item.execution?.status === "authorized" ||
+          item.execution?.status === "submitted"
       )
         ? 2_000
         : 20_000,
