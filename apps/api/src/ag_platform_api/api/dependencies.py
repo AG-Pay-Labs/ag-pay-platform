@@ -19,6 +19,7 @@ from ag_platform_api.services.checkout.reconciliation import (
     LandingPaymentVerificationClient,
     TrustedPaymentVerifier,
 )
+from ag_platform_api.services.x402 import X402HttpClient, new_http_client
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -129,3 +130,14 @@ def get_direct_card_cvc_client(
 DirectCardCvcClient = Annotated[
     LocalDirectCardCvcClient | None, Depends(get_direct_card_cvc_client)
 ]
+
+
+async def get_x402_http_client(settings: AppSettings) -> AsyncIterator[X402HttpClient]:
+    client = new_http_client(settings)
+    try:
+        yield client
+    finally:
+        await client.close()
+
+
+X402Client = Annotated[X402HttpClient, Depends(get_x402_http_client)]

@@ -141,7 +141,7 @@ export function AddCardDialog() {
           body: JSON.stringify(payload),
         });
       }
-      await queryClient.invalidateQueries({ queryKey: queryKeys.cards });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.paymentMethods });
       toast.success(
         setupMode === "direct"
           ? "Direct card added"

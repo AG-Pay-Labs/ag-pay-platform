@@ -1,5 +1,10 @@
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+from eth_account import Account
+from eth_account.messages import encode_defunct
+from eth_keys.exceptions import BadSignature
+from eth_utils import to_checksum_address
 from fastapi import APIRouter, HTTPException, Response, status
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
@@ -11,18 +16,29 @@ from ag_platform_api.core.security import new_opaque_token
 from ag_platform_api.models import (
     AgentPaymentMethod,
     PaymentMethod,
+    PaymentMethodKind,
     PaymentMethodStatus,
     StoredCardCredential,
+    WalletConnectionChallenge,
 )
 from ag_platform_api.schemas import (
     DirectCardPaymentMethodCreate,
     PaymentMethodCreate,
     PaymentMethodRead,
+    WalletChallengeCreate,
+    WalletChallengeRead,
+    WalletConfigRead,
+    WalletPaymentMethodCreate,
     normalize_card_number,
 )
 from ag_platform_api.services.checkout.direct_card import DirectCardPanCipher, card_brand
 
 router = APIRouter(tags=["payment methods"])
+
+WALLET_NETWORKS = {
+    "eip155:84532": {"chain_id": 84532, "name": "Base Sepolia", "is_testnet": True},
+    "eip155:8453": {"chain_id": 8453, "name": "Base", "is_testnet": False},
+}
 
 
 async def owned_payment_method(
@@ -53,6 +69,7 @@ async def create_payment_method(
     billing_details = payload.billing_details.model_dump(mode="json")
     payment_method = PaymentMethod(
         owner_id=user.id,
+        kind=PaymentMethodKind.card,
         display_name=payload.display_name,
         provider=payload.provider,
         provider_payment_method_id=payload.provider_payment_method_id,
@@ -94,6 +111,7 @@ async def create_direct_card_payment_method(
     cipher = DirectCardPanCipher(settings.direct_card_encryption_key.get_secret_value())
     payment_method = PaymentMethod(
         owner_id=user.id,
+        kind=PaymentMethodKind.card,
         display_name=payload.display_name,
         provider=LOCAL_DIRECT_CARD_PROVIDER,
         provider_payment_method_id=new_opaque_token("ldc"),
@@ -128,6 +146,153 @@ async def create_direct_card_payment_method(
     await db.refresh(payment_method)
     await broker.publish(
         "payment_method.created", {"payment_method_id": payment_method.id, "owner_id": user.id}
+    )
+    return payment_method
+
+
+@router.get("/payment-methods/wallet-config", response_model=WalletConfigRead)
+async def wallet_config(user: CurrentUser, settings: AppSettings) -> WalletConfigRead:
+    del user
+    configured_networks = {asset.network for asset in settings.x402_assets}
+    return WalletConfigRead(
+        providers=[{"id": "metamask", "display_name": "MetaMask"}],
+        networks=[
+            {
+                "network": network,
+                **details,
+                "x402_enabled": settings.x402_enabled
+                and network in configured_networks
+                and (network != "eip155:8453" or settings.x402_mainnet_enabled),
+            }
+            for network, details in WALLET_NETWORKS.items()
+        ],
+    )
+
+
+@router.post(
+    "/payment-methods/wallet/challenge",
+    response_model=WalletChallengeRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_wallet_challenge(
+    payload: WalletChallengeCreate,
+    user: CurrentUser,
+    db: DatabaseSession,
+    settings: AppSettings,
+) -> WalletChallengeRead:
+    network = WALLET_NETWORKS[payload.network]
+    try:
+        address = to_checksum_address(payload.address)
+    except ValueError as exc:  # pragma: no cover - Pydantic rejects malformed lengths/hex first
+        raise HTTPException(status_code=422, detail="Wallet address is invalid") from exc
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(seconds=settings.wallet_challenge_ttl_seconds)
+    nonce = new_opaque_token("wch")
+    message = "\n".join(
+        (
+            "AG Pay wants you to connect your wallet:",
+            address,
+            "",
+            "Signing this message proves wallet ownership. It does not initiate a transaction.",
+            f"Provider: {payload.provider}",
+            f"Network: {payload.network}",
+            f"Chain ID: {network['chain_id']}",
+            f"Account: {user.id}",
+            f"Nonce: {nonce}",
+            f"Issued At: {now.isoformat()}",
+            f"Expiration Time: {expires_at.isoformat()}",
+        )
+    )
+    challenge = WalletConnectionChallenge(
+        owner_id=user.id,
+        provider=payload.provider,
+        address=address,
+        address_normalized=address.lower(),
+        network=payload.network,
+        chain_id=int(network["chain_id"]),
+        message=message,
+        expires_at=expires_at,
+    )
+    db.add(challenge)
+    await db.commit()
+    return WalletChallengeRead(
+        challenge_id=challenge.id,
+        message=challenge.message,
+        expires_at=challenge.expires_at,
+    )
+
+
+@router.post(
+    "/payment-methods/wallet",
+    response_model=PaymentMethodRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_wallet_payment_method(
+    payload: WalletPaymentMethodCreate,
+    user: CurrentUser,
+    db: DatabaseSession,
+    broker: Broker,
+) -> PaymentMethod:
+    challenge = await db.scalar(
+        select(WalletConnectionChallenge)
+        .where(
+            WalletConnectionChallenge.id == payload.challenge_id,
+            WalletConnectionChallenge.owner_id == user.id,
+        )
+        .with_for_update()
+    )
+    now = datetime.now(UTC)
+    if challenge is None:
+        raise HTTPException(status_code=404, detail="Wallet challenge not found")
+    expires_at = (
+        challenge.expires_at
+        if challenge.expires_at.tzinfo
+        else challenge.expires_at.replace(tzinfo=UTC)
+    )
+    if challenge.consumed_at is not None or expires_at <= now:
+        raise HTTPException(status_code=409, detail="Wallet challenge is expired or already used")
+    try:
+        recovered = Account.recover_message(
+            encode_defunct(text=challenge.message), signature=payload.signature
+        )
+    except (BadSignature, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Wallet signature is invalid") from exc
+    if recovered.lower() != challenge.address_normalized:
+        raise HTTPException(status_code=422, detail="Wallet signature does not match the address")
+
+    challenge.consumed_at = now
+    payment_method = PaymentMethod(
+        owner_id=user.id,
+        kind=PaymentMethodKind.wallet,
+        display_name=payload.display_name,
+        provider=challenge.provider,
+        provider_payment_method_id=f"{challenge.network}:{challenge.address_normalized}",
+        card_brand=None,
+        card_last4=None,
+        expiry_month=None,
+        expiry_year=None,
+        billing_profile_type=None,
+        billing_details=None,
+        wallet_address=challenge.address,
+        wallet_address_normalized=challenge.address_normalized,
+        wallet_network=challenge.network,
+        wallet_chain_id=challenge.chain_id,
+        wallet_verified_at=now,
+    )
+    db.add(payment_method)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Wallet is already connected") from exc
+    await db.refresh(payment_method)
+    await broker.publish(
+        "payment_method.created",
+        {
+            "payment_method_id": payment_method.id,
+            "owner_id": user.id,
+            "kind": payment_method.kind.value,
+        },
     )
     return payment_method
 

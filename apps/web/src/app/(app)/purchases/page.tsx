@@ -18,10 +18,10 @@ import {
   Money,
   PageHeader,
   ResponsiveEntityList,
-  SafeCardLabel,
   StatusBadge,
 } from "@/components/app";
 import { RevealCredentialDialog } from "@/components/features/approvals/approval-actions";
+import { PaymentMethodLabel } from "@/components/features/payment-methods/payment-method-label";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -54,7 +54,7 @@ type StatusFilter = "all" | PurchaseStatus;
 export default function PurchasesPage() {
   const purchases = usePurchases();
   const agents = useAgents();
-  const cards = usePaymentMethods();
+  const paymentMethods = usePaymentMethods();
   const cart = useCartItems();
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
@@ -79,13 +79,20 @@ export default function PurchasesPage() {
 
   const selected = purchases.data?.find((purchase) => purchase.id === selectedId) ?? null;
   const selectedAgent = agents.data?.find((agent) => agent.id === selected?.agent_id);
-  const selectedCard = cards.data?.find((card) => card.id === selected?.payment_method_id);
+  const selectedPaymentMethod = paymentMethods.data?.find(
+    (method) => method.id === selected?.payment_method_id,
+  );
   const selectedCartItem = cart.data?.find((item) => item.id === selected?.cart_item_id);
-  const loading = purchases.isLoading || agents.isLoading || cards.isLoading;
-  const error = purchases.error ?? agents.error ?? cards.error;
+  const loading = purchases.isLoading || agents.isLoading || paymentMethods.isLoading;
+  const error = purchases.error ?? agents.error ?? paymentMethods.error;
 
   function agentFor(purchase: PurchaseRead) {
     return agents.data?.find((agent) => agent.id === purchase.agent_id);
+  }
+
+  function isX402Purchase(purchase: PurchaseRead) {
+    return cart.data?.find((item) => item.id === purchase.cart_item_id)
+      ?.checkout_adapter === "x402";
   }
 
   return (
@@ -129,7 +136,7 @@ export default function PurchasesPage() {
           <ErrorState
             title="Could not load purchase history"
             description="Check that the API is running and try again."
-            retry={() => void Promise.all([purchases.refetch(), agents.refetch(), cards.refetch()])}
+            retry={() => void Promise.all([purchases.refetch(), agents.refetch(), paymentMethods.refetch()])}
           />
         ) : (
           <ResponsiveEntityList
@@ -195,7 +202,11 @@ export default function PurchasesPage() {
                 header: "Amount",
                 align: "right",
                 cell: (purchase) => (
-                  <Money amount={purchase.amount} currency={purchase.currency} />
+                  <Money
+                    amount={purchase.amount}
+                    currency={purchase.currency}
+                    maximumFractionDigits={isX402Purchase(purchase) ? 18 : undefined}
+                  />
                 ),
               },
               {
@@ -228,7 +239,11 @@ export default function PurchasesPage() {
                   <span className="text-xs text-muted-foreground">
                     {formatDateTime(purchase.purchased_at)}
                   </span>
-                  <Money amount={purchase.amount} currency={purchase.currency} />
+                  <Money
+                    amount={purchase.amount}
+                    currency={purchase.currency}
+                    maximumFractionDigits={isX402Purchase(purchase) ? 18 : undefined}
+                  />
                 </div>
               </button>
             )}
@@ -258,7 +273,14 @@ export default function PurchasesPage() {
                       Requested by {selectedAgent?.name ?? "unknown agent"}
                     </p>
                   </div>
-                  <Money amount={selected.amount} currency={selected.currency} className="text-2xl" />
+                  <Money
+                    amount={selected.amount}
+                    currency={selected.currency}
+                    className="text-2xl"
+                    maximumFractionDigits={
+                      selectedCartItem?.checkout_adapter === "x402" ? 18 : undefined
+                    }
+                  />
                 </div>
 
                 <section className="space-y-3">
@@ -284,15 +306,8 @@ export default function PurchasesPage() {
 
                 <section className="space-y-3">
                   <h3 className="text-sm font-semibold">Payment method</h3>
-                  {selectedCard ? (
-                    <SafeCardLabel
-                      brand={selectedCard.card_brand}
-                      last4={selectedCard.card_last4}
-                      displayName={selectedCard.display_name}
-                      expiryMonth={selectedCard.expiry_month}
-                      expiryYear={selectedCard.expiry_year}
-                      status={selectedCard.status}
-                    />
+                  {selectedPaymentMethod ? (
+                    <PaymentMethodLabel method={selectedPaymentMethod} />
                   ) : (
                     <p className="text-sm text-muted-foreground">Payment method is no longer available.</p>
                   )}
@@ -302,7 +317,10 @@ export default function PurchasesPage() {
                   <h3 className="text-sm font-semibold">Audit information</h3>
                   <dl className="grid gap-4 text-sm sm:grid-cols-2">
                     <Detail label="Agent" value={selectedAgent?.name ?? "Unknown agent"} />
-                    <Detail label="Merchant account" value={selected.account_email} />
+                    <Detail
+                      label="Merchant account"
+                      value={selected.account_email ?? "Not required for x402"}
+                    />
                     {selected.merchant_order_reference ? (
                       <Detail
                         label="Merchant order"
@@ -313,7 +331,9 @@ export default function PurchasesPage() {
                     <Detail label="Provider reference" value={selected.provider_reference} monospace />
                     <Detail label="Purchase ID" value={selected.id} monospace />
                   </dl>
-                  {selectedCartItem ? <RevealCredentialDialog item={selectedCartItem} /> : null}
+                  {selectedCartItem?.credential_id ? (
+                    <RevealCredentialDialog item={selectedCartItem} />
+                  ) : null}
                 </section>
 
                 {selected.subscription ? (

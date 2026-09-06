@@ -8,10 +8,14 @@ Implemented areas:
 
 - registration, login, sign-out, and guarded application routes;
 - workspace overview and first-run setup guidance;
-- agent pairing, connection health, revocation, and card assignment;
+- agent pairing, connection health, revocation, and payment-method assignment;
 - personal/business billing profiles with direct, sandbox, and provider-backed
-  payment methods;
+  cards;
+- card/wallet payment-method tabs, MetaMask ownership connection on Base
+  Sepolia or Base, and network-aware wallet assignment;
 - purchase approval and cancellation queues;
+- x402 approval, MetaMask EIP-712 authorization, execution status, and safe
+  protected-resource result handling;
 - re-authenticated, ephemeral merchant-credential reveal;
 - purchase audit history and local recurring-subscription tracking.
 
@@ -41,6 +45,16 @@ or query caches. CVC is collected only alongside approval for a compatible
 managed direct checkout and is never part of the stored payment method. Provider
 references and their display metadata remain supported alongside this local
 mode. Never add inputs for PIN or 3-D Secure secrets.
+
+MetaMask connection uses `personal_sign` only to prove ownership of the chosen
+address and network; it does not move funds. For an approved x402 request, the
+browser derives the exact EVM typed data only from the backend-frozen
+`PAYMENT-REQUIRED` object and asks MetaMask to sign it. The signed payload goes
+to FastAPI, which revalidates the wallet, network, amount, recipient, asset, and
+signature before making the one allowed paid resource request. The browser
+never receives or stores a private key. Base Sepolia is the safe default;
+whether each network can currently execute x402 is returned by the backend
+wallet configuration, and Base mainnet is disabled by default.
 
 For managed checkout, approval queues the trusted AG Pay executor only when a
 server-configured merchant adapter and compatible payment method are available.

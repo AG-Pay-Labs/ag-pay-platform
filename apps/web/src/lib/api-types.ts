@@ -1,6 +1,10 @@
+import type { PaymentPayload, PaymentRequired } from "@x402/core/types";
+
 export type UUID = string;
 export type ISODateTime = string;
 export type DecimalString = string;
+export type EvmAddress = `0x${string}`;
+export type EvmNetwork = `eip155:${number}`;
 
 export type AgentStatus = "pending" | "active" | "revoked";
 export type AgentConnectionState = "pending" | "online" | "offline" | "revoked";
@@ -15,6 +19,9 @@ export type CartItemStatus =
 export type CheckoutExecutionStatus =
   | "queued"
   | "running"
+  | "awaiting_signature"
+  | "authorized"
+  | "submitted"
   | "succeeded"
   | "failed"
   | "action_required"
@@ -158,18 +165,81 @@ export interface DirectCardPaymentMethodCreate {
   billing_details: BillingDetails;
 }
 
-export interface PaymentMethodRead {
+interface PaymentMethodBase {
   id: UUID;
+  kind: "card" | "wallet";
   display_name: string;
   status: PaymentMethodStatus;
   provider: string;
+  created_at: ISODateTime;
+}
+
+export interface CardPaymentMethodRead extends PaymentMethodBase {
+  kind: "card";
   card_brand: string;
   card_last4: string;
   expiry_month: number;
   expiry_year: number;
   billing_profile_type: BillingProfileType;
   billing_details: BillingDetails;
-  created_at: ISODateTime;
+}
+
+export interface WalletPaymentMethodRead extends PaymentMethodBase {
+  kind: "wallet";
+  provider: string;
+  address: EvmAddress;
+  network: EvmNetwork;
+  chain_id: number;
+  is_testnet: boolean;
+}
+
+export type PaymentMethodRead =
+  | CardPaymentMethodRead
+  | WalletPaymentMethodRead;
+
+export interface WalletProviderConfig {
+  id: string;
+  display_name: string;
+}
+
+export interface WalletNetworkConfig {
+  network: EvmNetwork;
+  chain_id: number;
+  name: string;
+  is_testnet: boolean;
+  x402_enabled: boolean;
+}
+
+export interface WalletConfigRead {
+  providers: WalletProviderConfig[];
+  networks: WalletNetworkConfig[];
+}
+
+export interface WalletChallengeCreate {
+  provider: "metamask";
+  address: EvmAddress;
+  network: EvmNetwork;
+}
+
+export interface WalletChallengeRead {
+  challenge_id: UUID;
+  message: string;
+  expires_at: ISODateTime;
+}
+
+export interface WalletPaymentMethodCreate {
+  challenge_id: UUID;
+  signature: `0x${string}`;
+  display_name: string;
+}
+
+export interface X402SigningRequestRead {
+  payment_required: PaymentRequired;
+  wallet: WalletPaymentMethodRead;
+}
+
+export interface X402AuthorizeCreate {
+  payment_payload: PaymentPayload;
 }
 
 export interface AccountCredentialInput {
@@ -209,6 +279,19 @@ export interface CheckoutExecutionRead {
   status_history: CheckoutStatusTransitionRead[];
 }
 
+export interface X402PaymentSummaryRead {
+  resource_url: string;
+  network: EvmNetwork;
+  asset: EvmAddress;
+  symbol: string;
+  decimals: number;
+  amount_atomic: string;
+  transfer_method: "eip3009" | "permit2";
+  pay_to: EvmAddress;
+  /** Exact-bound settlement evidence supplied only after backend verification. */
+  transaction: `0x${string}` | null;
+}
+
 export interface CartItemCreate {
   title: string;
   description: string;
@@ -226,7 +309,7 @@ export interface CartItemCreate {
 export interface CartItemRead {
   id: UUID;
   agent_id: UUID;
-  credential_id: UUID;
+  credential_id: UUID | null;
   selected_payment_method_id: UUID | null;
   title: string;
   description: string;
@@ -241,9 +324,10 @@ export interface CartItemRead {
   checkout_adapter: string | null;
   checkout_url: string | null;
   execution: CheckoutExecutionRead | null;
+  x402: X402PaymentSummaryRead | null;
   status: CartItemStatus;
   decision_note: string | null;
-  account_email: string;
+  account_email: string | null;
   login_url: string | null;
   approved_at: ISODateTime | null;
   cancelled_at: ISODateTime | null;
@@ -306,7 +390,7 @@ export interface PurchaseRead {
   provider_reference: string;
   merchant_order_reference: string | null;
   receipt_url: string | null;
-  account_email: string;
+  account_email: string | null;
   purchased_at: ISODateTime;
   subscription: SubscriptionRead | null;
 }

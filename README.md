@@ -81,6 +81,60 @@ make api-run
 The API is available at `http://127.0.0.1:8000`; its interactive OpenAPI UI is
 at `http://127.0.0.1:8000/docs`.
 
+### MetaMask and x402 MVP
+
+Payment methods are discriminated as `card` or `wallet`. The first wallet
+provider is MetaMask, connected by a short-lived, owner/address/network-bound
+message-signing challenge; AG Pay never receives a wallet private key. Wallets
+can currently be registered on Base Sepolia (`eip155:84532`) and Base
+(`eip155:8453`), and the provider/network catalog is exposed by
+`GET /api/v1/payment-methods/wallet-config` so more providers and networks can
+be added without changing the card contract.
+
+The agent x402 flow implements v2 `exact` EVM payments for a public HTTPS GET
+resource:
+
+1. The agent proposes the URL with
+   `POST /api/v1/agent/x402-payment-requests`. The API performs an unpaid GET,
+   validates and freezes one configured payment requirement, enforces its
+   per-asset atomic cap, and creates a nominal-USD cart proposal with safe x402
+   metadata.
+2. Policy may approve a matching assigned wallet, otherwise the owner selects
+   one. Approval creates an `awaiting_signature` execution. The browser reads
+   `/api/v1/cart-items/{id}/x402/signing-request`, asks MetaMask to sign the
+   frozen EIP-712 payload, and submits it to
+   `/api/v1/cart-items/{id}/x402/authorize`.
+3. The backend validates the signer and every frozen field, commits the
+   `submitted` state, and makes exactly one paid GET. A verified receipt records
+   `succeeded`; a definitive matching rejection records `failed`; any transport
+   or receipt ambiguity records `outcome_unknown`. If a process loses the
+   response after durable submission, authenticated cart or checkout-event
+   polling moves the execution one way to `outcome_unknown` after the frozen
+   HTTP timeout plus `X402_RECONCILIATION_GRACE_SECONDS`, emits a terminal
+   event, and never sends another paid request. Submitted or unknown executions
+   are never automatically retried. The owning agent reads status and, only on
+   success, the encrypted-at-rest response as base64 from
+   `/api/v1/agent/cart-items/{id}/x402/result`.
+
+Human and agent cart reads include the frozen x402 network and a nullable
+`transaction`. The transaction is exposed only after the facilitator receipt
+has been bound to the expected network, payer, and (when supplied) amount; it
+is normalized to a lowercase 32-byte `0x` hash. Unverified receipt values and
+deadline-only reconciliation never expose a transaction.
+
+Outbound x402 requests are limited to public HTTPS on port 443, reject
+redirects/private resolution, pin a validated DNS address before sending a
+payment signature, verify the connected peer, and cap response bytes. Base
+Sepolia USDC EIP-3009 is enabled by the example configuration. Base USDC
+EIP-3009 and Base USDT Permit2 support are implemented but mainnet submission
+is disabled until `X402_MAINNET_ENABLED=true`. `X402_ENABLED` is the global
+incident switch and defaults off in application settings; the local example
+explicitly enables it for Base Sepolia. `X402_ASSETS` is the operator-owned
+allowlist with a required `max_amount_atomic` for each asset. The same switches
+are enforced at approval, signing-request, and authorization time. A connected
+wallet must already hold the appropriate token (or test token); this flow does
+not convert a card balance into crypto.
+
 Managed checkout stays off with the example configuration. For a deliberate
 Stripe test-mode run, configure checkout and Browserbase values in the untracked
 `.env`, then start a third terminal:
@@ -170,8 +224,8 @@ reuse the JWT or merchant-credential key. Replace the illustrative public HTTPS
 origin and selectors with a controlled research checkout. Run migrations, the
 API, web app, and `make checkout-worker`; the worker owns a 0700-style private
 parent directory and `0600` Unix socket, and therefore must be running before a
-direct-card approval can stage CVC. Add the
-card from **Cards**, assign it to an agent, and approve only a
+direct-card approval can stage CVC. Add the card from **Payment methods →
+Cards**, assign it to an agent, and approve only a
 new managed proposal carrying the exact configured adapter and checkout URL.
 `LOCAL_DIRECT_CARD_RECORDING_ENABLED` is an explicit development-only debugging
 switch. Leave it `false` unless every stored card is synthetic: enabling it sends
@@ -228,7 +282,8 @@ server and defaults to `http://localhost:8000`. Do not expose it as a
 
 The management UI includes registration/login, an overview, compact
 OpenClaw/Hermes runtime cards with detail sheets, realistic but safely masked
-virtual cards, agent/card assignment, personal/business sandbox/provider entry,
+cards and verified wallets, agent/payment-method assignment,
+personal/business sandbox/provider entry,
 the feature-gated local direct-card enrollment and approval-time CVC flow,
 per-agent approval rules at `/rules`, queues for
 proposed, approved, needs-attention, and historical items, ordered checkout
@@ -274,11 +329,11 @@ transiently in request handling and then worker memory. PIN and 3-D Secure
 secrets are never accepted. Production still requires provider-hosted card
 onboarding rather than this local storage path.
 
-Human approval, or an eligible server-side policy decision for a legacy
-external-completion proposal, records the selected assigned method. A proposal
-carrying an explicit checkout adapter and checkout URL always waits for human
-approval, regardless of the agent's payment rule, and then creates one durable execution:
-the worker validates the frozen merchant
+Human approval, or an eligible server-side policy decision, records the
+selected assigned method. A policy-eligible proposal carrying an explicit
+checkout adapter and checkout URL can create a durable execution automatically
+only when a compatible assigned card and every normal queue safety check are
+available; otherwise it waits for human approval. The worker validates the frozen merchant
 configuration, assignment, and allowed origins; requires the merchant product
 title, quantity, amount, and an explicit standalone ISO currency code to match
 the approval; retrieves a

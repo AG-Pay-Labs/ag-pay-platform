@@ -13,6 +13,7 @@ dependencies = [
   "asyncpg>=0.30,<1",
   "cryptography>=45,<47",
   "email-validator>=2.2,<3",
+  "eth-account>=0.13,<1",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "playwright>=1.54,<2",
@@ -24,6 +25,7 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.41,<3",
   "stagehand>=3.20,<4",
   "uvicorn[standard]>=0.35,<1",
+  "x402>=2.21,<3",
 ]
 
 [project.scripts]

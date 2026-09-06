@@ -5,8 +5,10 @@ import Link from "next/link";
 import { useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, KeyRound, Loader2, RefreshCw, ShieldCheck, X } from "lucide-react";
 import { toast } from "sonner";
+import { formatUnits } from "viem";
 
-import { Money, SafeCardLabel } from "@/components/app";
+import { Money } from "@/components/app";
+import { PaymentMethodLabel } from "@/components/features/payment-methods/payment-method-label";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -39,48 +41,60 @@ import type {
   CartApproval,
   CartItemRead,
   CredentialReveal,
-  PaymentMethodRead,
 } from "@/lib/api-types";
 import { queryKeys, useAgentPaymentMethods } from "@/hooks/use-api-data";
-
-function isPaymentMethodUnexpired(
-  paymentMethod: Pick<PaymentMethodRead, "expiry_month" | "expiry_year">,
-  now = new Date(),
-) {
-  const expiryUtcMonth = paymentMethod.expiry_year * 12 + paymentMethod.expiry_month - 1;
-  const currentUtcMonth = now.getUTCFullYear() * 12 + now.getUTCMonth();
-  return expiryUtcMonth >= currentUtcMonth;
-}
+import {
+  isCardPaymentMethod,
+  isCardUnexpired,
+  isWalletPaymentMethod,
+  shortAddress,
+} from "@/lib/payment-methods";
+import { chainIdForNetwork, chainLabel } from "@/lib/wallets/chains";
 
 export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: AgentRead }) {
   const queryClient = useQueryClient();
   const hasManagedCheckout = Boolean(item.checkout_adapter && item.checkout_url);
+  const isX402 = item.checkout_adapter === "x402";
   const [open, setOpen] = useState(false);
-  const [selectedCard, setSelectedCard] = useState("");
+  const [selectedMethodId, setSelectedMethodId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const assigned = useAgentPaymentMethods(item.agent_id, open);
-  const selectableCards = useMemo(
+  const selectableMethods = useMemo(
     () => {
       const now = new Date();
       return (assigned.data ?? []).filter(
-        (card) =>
-          card.status === "active" &&
-          isPaymentMethodUnexpired(card, now) &&
-          (hasManagedCheckout || card.provider !== "local_direct_card"),
+        (method) => {
+          if (method.status !== "active") return false;
+          if (isX402) {
+            return (
+              isWalletPaymentMethod(method) &&
+              item.x402 !== null &&
+              method.network === item.x402.network
+            );
+          }
+          return (
+            isCardPaymentMethod(method) &&
+            isCardUnexpired(method, now) &&
+            (hasManagedCheckout || method.provider !== "local_direct_card")
+          );
+        },
       );
     },
-    [assigned.data, hasManagedCheckout],
+    [assigned.data, hasManagedCheckout, isX402, item.x402],
   );
-  const selectedPaymentMethod = selectableCards.find(
-    (card) => card.id === selectedCard,
+  const selectedPaymentMethod = selectableMethods.find(
+    (method) => method.id === selectedMethodId,
   );
   const requiresCvc =
-    hasManagedCheckout && selectedPaymentMethod?.provider === "local_direct_card";
+    hasManagedCheckout &&
+    selectedPaymentMethod &&
+    isCardPaymentMethod(selectedPaymentMethod) &&
+    selectedPaymentMethod.provider === "local_direct_card";
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedCard) {
+    if (!selectedMethodId) {
       setError("Select an assigned payment method.");
       return;
     }
@@ -97,7 +111,7 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
 
     try {
       const payload: CartApproval = {
-        payment_method_id: selectedCard,
+        payment_method_id: selectedMethodId,
         note: String(form.get("note") ?? "").trim() || null,
         ...(cvc ? { cvc } : {}),
       };
@@ -113,7 +127,9 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
       const approved = await request;
       await queryClient.invalidateQueries({ queryKey: queryKeys.cart });
       toast.success(
-        approved.execution
+        approved.execution?.status === "awaiting_signature"
+          ? "Purchase approved; wallet signature required"
+          : approved.execution
           ? "Purchase approved; secure checkout queued"
           : "Approval recorded. No payment or checkout was queued.",
       );
@@ -133,7 +149,7 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
         if (submitting) return;
         setOpen(next);
         if (!next) {
-          setSelectedCard("");
+          setSelectedMethodId("");
           setError(null);
         }
       }}
@@ -147,7 +163,13 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
         <DialogHeader>
           <DialogTitle>Approve this purchase?</DialogTitle>
           <DialogDescription>
-            {hasManagedCheckout ? (
+            {isX402 ? (
+              <>
+                This approves the exact x402 request. You will then review and
+                sign its onchain authorization in your assigned wallet; AG Pay
+                never receives the private key.
+              </>
+            ) : hasManagedCheckout ? (
               <>
                 This authorizes AG Pay to run the configured checkout after approval. Payment
                 credentials stay inside the trusted executor and are never sent to the agent.
@@ -155,7 +177,7 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
             ) : (
               <>
                 This proposal has no managed checkout URL. Approving records your decision and
-                selected card, but AG Pay will not make or queue a payment. If you expect AG Pay to
+                selected payment method, but AG Pay will not make or queue a payment. If you expect AG Pay to
                 execute checkout, ask {agent?.name ?? "the agent"} to create a new proposal with
                 the exact checkout adapter and URL.
               </>
@@ -171,59 +193,61 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
               {item.billing_period ? ` · Recurs ${item.billing_period}` : " · One-time"}
             </p>
           </div>
-          <Money amount={item.total_amount} currency={item.currency} className="text-xl" />
+          <Money
+            amount={item.total_amount}
+            currency={item.currency}
+            className="text-xl"
+            maximumFractionDigits={isX402 ? 18 : undefined}
+          />
         </div>
+
+        {item.x402 ? <X402ApprovalTerms item={item} /> : null}
 
         <form id={`approve-${item.id}`} onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-2">
             <Label>Assigned payment method</Label>
             {assigned.isLoading ? (
               <div className="flex items-center gap-2 rounded-lg border p-4 text-sm text-muted-foreground">
-                <Loader2 className="size-4 animate-spin" /> Loading assigned cards
+                <Loader2 className="size-4 animate-spin" /> Loading assigned payment methods
               </div>
-            ) : selectableCards.length === 0 ? (
+            ) : selectableMethods.length === 0 ? (
               <div className="rounded-lg border border-dashed p-4 text-sm">
                 <p className="font-medium">
-                  No compatible active, unexpired card is assigned
+                  No compatible active payment method is assigned
                 </p>
                 <p className="mt-1 text-muted-foreground">
-                  {hasManagedCheckout
+                  {isX402
+                    ? `Assign an active wallet on this x402 network to ${agent?.name ?? "this agent"} before approving.`
+                    : hasManagedCheckout
                     ? `Assign an active, unexpired card to ${agent?.name ?? "this agent"} before approving.`
                     : "Direct cards require managed checkout. Assign an active, unexpired provider-backed card to record this approval."}
                 </p>
                 <Button variant="outline" size="sm" className="mt-3" asChild>
-                  <Link href="/agents">Manage agent cards</Link>
+                  <Link href="/agents">Manage agent payment methods</Link>
                 </Button>
               </div>
             ) : (
-              <RadioGroup value={selectedCard} onValueChange={setSelectedCard} className="space-y-2">
-                {selectableCards.map((card) => (
+              <RadioGroup value={selectedMethodId} onValueChange={setSelectedMethodId} className="space-y-2">
+                {selectableMethods.map((method) => (
                   <Label
-                    key={card.id}
-                    htmlFor={`approval-card-${card.id}`}
-                    onClick={() => setSelectedCard(card.id)}
+                    key={method.id}
+                    htmlFor={`approval-method-${method.id}`}
+                    onClick={() => setSelectedMethodId(method.id)}
                     className={cn(
                       "flex cursor-pointer items-center gap-3 rounded-lg border p-3",
-                      selectedCard === card.id &&
+                      selectedMethodId === method.id &&
                         "border-primary ring-2 ring-primary/15",
                     )}
                   >
-                    <RadioGroupItem id={`approval-card-${card.id}`} value={card.id} />
-                    <SafeCardLabel
-                      compact
-                      displayName={card.display_name}
-                      brand={card.card_brand}
-                      last4={card.card_last4}
-                      expiryMonth={card.expiry_month}
-                      expiryYear={card.expiry_year}
-                    />
+                    <RadioGroupItem id={`approval-method-${method.id}`} value={method.id} />
+                    <PaymentMethodLabel method={method} compact className="flex-1" />
                   </Label>
                 ))}
               </RadioGroup>
             )}
           </div>
           {requiresCvc ? (
-            <div key={selectedCard} className="space-y-1.5">
+            <div key={selectedMethodId} className="space-y-1.5">
               <Label htmlFor={`approval-cvc-${item.id}`}>
                 Card security code (CVC)
               </Label>
@@ -287,10 +311,14 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
           <Button
             type="submit"
             form={`approve-${item.id}`}
-            disabled={submitting || selectableCards.length === 0}
+            disabled={submitting || selectableMethods.length === 0}
           >
             {submitting ? <Loader2 className="animate-spin" /> : <ShieldCheck />}
-            {hasManagedCheckout ? (
+            {isX402 ? (
+              <>
+                Approve &amp; review signature · <Money amount={item.total_amount} currency={item.currency} maximumFractionDigits={18} />
+              </>
+            ) : hasManagedCheckout ? (
               <>
                 Approve &amp; queue · <Money amount={item.total_amount} currency={item.currency} />
               </>
@@ -302,6 +330,80 @@ export function ApproveDialog({ item, agent }: { item: CartItemRead; agent?: Age
       </DialogContent>
     </Dialog>
   );
+}
+
+function X402ApprovalTerms({ item }: { item: CartItemRead }) {
+  const x402 = item.x402;
+  if (!x402) return null;
+  const chainId = chainIdForNetwork(x402.network);
+
+  return (
+    <div className="rounded-xl border border-indigo-200 bg-indigo-50/60 p-4 text-sm dark:border-indigo-900 dark:bg-indigo-950/25">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="font-semibold">Exact x402 authorization</p>
+        <span className="rounded-full bg-background px-2 py-1 text-xs font-medium uppercase">
+          {x402.transfer_method}
+        </span>
+      </div>
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+        <ApprovalTerm
+          label="Token amount"
+          value={formatTokenAmount(x402.amount_atomic, x402.decimals, x402.symbol)}
+        />
+        <ApprovalTerm
+          label="Network"
+          value={`${chainId ? chainLabel(chainId) : x402.network} · ${x402.network}`}
+        />
+        <ApprovalTerm
+          label="Asset"
+          value={shortAddress(x402.asset)}
+          title={x402.asset}
+          monospace
+        />
+        <ApprovalTerm
+          label="Recipient"
+          value={shortAddress(x402.pay_to)}
+          title={x402.pay_to}
+          monospace
+        />
+      </dl>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">
+        Only an assigned wallet connected on this exact network can be selected.
+      </p>
+    </div>
+  );
+}
+
+function ApprovalTerm({
+  label,
+  value,
+  title,
+  monospace = false,
+}: {
+  label: string;
+  value: string;
+  title?: string;
+  monospace?: boolean;
+}) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd
+        className={`mt-1 truncate font-medium ${monospace ? "font-mono text-xs" : ""}`}
+        title={title}
+      >
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+function formatTokenAmount(amount: string, decimals: number, symbol: string) {
+  try {
+    return `${formatUnits(BigInt(amount), decimals)} ${symbol}`;
+  } catch {
+    return `${amount} atomic ${symbol}`;
+  }
 }
 
 export function CancelProposalDialog({ item }: { item: CartItemRead }) {

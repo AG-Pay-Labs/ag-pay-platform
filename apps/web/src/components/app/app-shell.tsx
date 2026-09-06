@@ -5,7 +5,6 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import {
   BotIcon,
-  CreditCardIcon,
   LayoutDashboardIcon,
   LogOutIcon,
   MenuIcon,
@@ -13,6 +12,7 @@ import {
   RefreshCwIcon,
   ShoppingBasketIcon,
   SlidersHorizontalIcon,
+  WalletCardsIcon,
 } from "lucide-react";
 
 import { BrandLockup } from "@/components/app/brand";
@@ -48,7 +48,11 @@ export const APP_NAVIGATION = [
   { href: "/approvals", label: "Approvals", icon: ShoppingBasketIcon },
   { href: "/agents", label: "Agents", icon: BotIcon },
   { href: "/rules", label: "Rules", icon: SlidersHorizontalIcon },
-  { href: "/cards", label: "Cards", icon: CreditCardIcon },
+  {
+    href: "/payment-methods",
+    label: "Payment methods",
+    icon: WalletCardsIcon,
+  },
   { href: "/purchases", label: "Purchases", icon: ReceiptTextIcon },
   {
     href: "/subscriptions",

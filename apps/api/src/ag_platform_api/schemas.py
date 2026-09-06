@@ -1,7 +1,7 @@
 import re
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -27,6 +27,7 @@ from ag_platform_api.models import (
     CartItemStatus,
     CheckoutExecutionStatus,
     PaymentApprovalMode,
+    PaymentMethodKind,
     PaymentMethodStatus,
     PurchaseStatus,
     SubscriptionStatus,
@@ -350,18 +351,75 @@ class DirectCardPaymentMethodCreate(APIModel):
         return self
 
 
-class PaymentMethodRead(APIModel):
+class PaymentMethodReadBase(APIModel):
     id: UUID
+    kind: PaymentMethodKind
     display_name: str
     status: PaymentMethodStatus
     provider: str
+    created_at: datetime
+
+
+class CardPaymentMethodRead(PaymentMethodReadBase):
+    kind: Literal[PaymentMethodKind.card]
     card_brand: str
     card_last4: str
     expiry_month: int
     expiry_year: int
     billing_profile_type: BillingProfileType
     billing_details: dict
-    created_at: datetime
+
+
+class WalletPaymentMethodRead(PaymentMethodReadBase):
+    kind: Literal[PaymentMethodKind.wallet]
+    address: Annotated[str, StringConstraints(pattern=r"^0x[0-9a-fA-F]{40}$")]
+    network: Literal["eip155:8453", "eip155:84532"]
+    chain_id: Literal[8453, 84532]
+    is_testnet: bool
+
+
+PaymentMethodRead = Annotated[
+    CardPaymentMethodRead | WalletPaymentMethodRead,
+    Field(discriminator="kind"),
+]
+
+
+class WalletProviderConfig(APIModel):
+    id: Literal["metamask"]
+    display_name: str
+
+
+class WalletNetworkConfig(APIModel):
+    network: Literal["eip155:8453", "eip155:84532"]
+    chain_id: Literal[8453, 84532]
+    name: str
+    is_testnet: bool
+    x402_enabled: bool
+
+
+class WalletConfigRead(APIModel):
+    providers: list[WalletProviderConfig]
+    networks: list[WalletNetworkConfig]
+
+
+class WalletChallengeCreate(APIModel):
+    provider: Literal["metamask"]
+    address: Annotated[str, StringConstraints(pattern=r"^0x[0-9a-fA-F]{40}$")]
+    network: Literal["eip155:8453", "eip155:84532"]
+
+
+class WalletChallengeRead(APIModel):
+    challenge_id: UUID
+    message: str
+    expires_at: datetime
+
+
+class WalletPaymentMethodCreate(APIModel):
+    challenge_id: UUID
+    signature: Annotated[str, StringConstraints(pattern=r"^0x[0-9a-fA-F]{130}$")]
+    display_name: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
+    ]
 
 
 class AccountCredentialInput(APIModel):
@@ -445,10 +503,22 @@ class CheckoutExecutionSummary(APIModel):
     updated_at: datetime
 
 
+class X402MetadataRead(APIModel):
+    resource_url: str
+    network: Literal["eip155:8453", "eip155:84532"]
+    asset: str
+    symbol: str
+    decimals: int
+    amount_atomic: str
+    transfer_method: Literal["eip3009", "permit2"]
+    pay_to: str
+    transaction: Annotated[str, StringConstraints(pattern=r"^0x[0-9a-f]{64}$")] | None
+
+
 class CartItemRead(APIModel):
     id: UUID
     agent_id: UUID
-    credential_id: UUID
+    credential_id: UUID | None
     selected_payment_method_id: UUID | None
     title: str
     description: str
@@ -464,12 +534,13 @@ class CartItemRead(APIModel):
     billing_period: BillingPeriod | None
     status: CartItemStatus
     decision_note: str | None
-    account_email: EmailStr
+    account_email: EmailStr | None
     login_url: str | None
     approved_at: datetime | None
     cancelled_at: datetime | None
     created_at: datetime
     execution: CheckoutExecutionSummary | None = None
+    x402: X402MetadataRead | None = None
 
 
 class CheckoutStatusTransitionRead(APIModel):
@@ -571,7 +642,7 @@ class PurchaseRead(APIModel):
     provider_reference: str
     merchant_order_reference: str | None
     receipt_url: str | None
-    account_email: EmailStr
+    account_email: EmailStr | None
     purchased_at: datetime
     subscription: SubscriptionRead | None = None
 
@@ -579,3 +650,48 @@ class PurchaseRead(APIModel):
 class SubscriptionUpdate(APIModel):
     status: SubscriptionStatus
     next_billing_at: datetime | None = None
+
+
+class X402PaymentRequestCreate(APIModel):
+    resource_url: AnyHttpUrl
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=10000)]
+    merchant: Annotated[str | None, StringConstraints(strip_whitespace=True, max_length=255)] = None
+
+    @model_validator(mode="after")
+    def validate_resource_url(self) -> "X402PaymentRequestCreate":
+        try:
+            parsed = urlsplit(str(self.resource_url))
+            _ = parsed.port
+        except ValueError:
+            raise ValueError(
+                "x402 resources require an absolute HTTPS GET URL without credentials"
+            ) from None
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ValueError("x402 resources require an absolute HTTPS GET URL without credentials")
+        return self
+
+
+class X402SigningRequestRead(APIModel):
+    payment_required: dict[str, Any]
+    wallet: WalletPaymentMethodRead
+
+
+class X402AuthorizeCreate(APIModel):
+    payment_payload: dict[str, Any]
+
+
+class X402ResultRead(APIModel):
+    cart_item_id: UUID
+    status: CheckoutExecutionStatus
+    mime_type: str | None
+    body: str | None
+    body_encoding: Literal["base64"] | None
+    transaction: str | None
+    network: str
+    asset: str

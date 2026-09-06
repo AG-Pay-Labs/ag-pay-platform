@@ -40,6 +40,11 @@ class PaymentMethodStatus(enum.StrEnum):
     disabled = "disabled"
 
 
+class PaymentMethodKind(enum.StrEnum):
+    card = "card"
+    wallet = "wallet"
+
+
 class PaymentApprovalMode(enum.StrEnum):
     always = "always"
     subscriptions_only = "subscriptions_only"
@@ -58,6 +63,9 @@ class CartItemStatus(enum.StrEnum):
 class CheckoutExecutionStatus(enum.StrEnum):
     queued = "queued"
     running = "running"
+    awaiting_signature = "awaiting_signature"
+    authorized = "authorized"
+    submitted = "submitted"
     succeeded = "succeeded"
     failed = "failed"
     action_required = "action_required"
@@ -169,6 +177,13 @@ class PaymentMethod(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    kind: Mapped[PaymentMethodKind] = mapped_column(
+        Enum(PaymentMethodKind, native_enum=False),
+        nullable=False,
+        default=PaymentMethodKind.card,
+        server_default=PaymentMethodKind.card.value,
+        index=True,
+    )
     status: Mapped[PaymentMethodStatus] = mapped_column(
         Enum(PaymentMethodStatus, native_enum=False),
         nullable=False,
@@ -176,14 +191,19 @@ class PaymentMethod(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     provider_payment_method_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    card_brand: Mapped[str] = mapped_column(String(32), nullable=False)
-    card_last4: Mapped[str] = mapped_column(String(4), nullable=False)
-    expiry_month: Mapped[int] = mapped_column(Integer, nullable=False)
-    expiry_year: Mapped[int] = mapped_column(Integer, nullable=False)
-    billing_profile_type: Mapped[BillingProfileType] = mapped_column(
-        Enum(BillingProfileType, native_enum=False), nullable=False
+    card_brand: Mapped[str | None] = mapped_column(String(32))
+    card_last4: Mapped[str | None] = mapped_column(String(4))
+    expiry_month: Mapped[int | None] = mapped_column(Integer)
+    expiry_year: Mapped[int | None] = mapped_column(Integer)
+    billing_profile_type: Mapped[BillingProfileType | None] = mapped_column(
+        Enum(BillingProfileType, native_enum=False)
     )
-    billing_details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    billing_details: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True))
+    wallet_address: Mapped[str | None] = mapped_column(String(42))
+    wallet_address_normalized: Mapped[str | None] = mapped_column(String(42))
+    wallet_network: Mapped[str | None] = mapped_column(String(64))
+    wallet_chain_id: Mapped[int | None] = mapped_column(Integer)
+    wallet_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     owner: Mapped[User] = relationship(back_populates="payment_methods")
     assigned_agents: Mapped[list["AgentPaymentMethod"]] = relationship(
@@ -193,10 +213,73 @@ class PaymentMethod(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="payment_method", cascade="all, delete-orphan", uselist=False
     )
 
+    @property
+    def address(self) -> str | None:
+        return self.wallet_address
+
+    @property
+    def network(self) -> str | None:
+        return self.wallet_network
+
+    @property
+    def chain_id(self) -> int | None:
+        return self.wallet_chain_id
+
+    @property
+    def is_testnet(self) -> bool | None:
+        if self.wallet_chain_id is None:
+            return None
+        return self.wallet_chain_id == 84532
+
     __table_args__ = (
         UniqueConstraint(
             "owner_id", "provider", "provider_payment_method_id", name="provider_reference"
         ),
+        UniqueConstraint(
+            "owner_id",
+            "provider",
+            "wallet_network",
+            "wallet_address_normalized",
+            name="wallet_reference",
+        ),
+        CheckConstraint(
+            "(kind = 'card' AND card_brand IS NOT NULL AND card_last4 IS NOT NULL "
+            "AND expiry_month IS NOT NULL AND expiry_year IS NOT NULL "
+            "AND billing_profile_type IS NOT NULL AND billing_details IS NOT NULL "
+            "AND wallet_address IS NULL AND wallet_address_normalized IS NULL "
+            "AND wallet_network IS NULL AND wallet_chain_id IS NULL "
+            "AND wallet_verified_at IS NULL) OR "
+            "(kind = 'wallet' AND card_brand IS NULL AND card_last4 IS NULL "
+            "AND expiry_month IS NULL AND expiry_year IS NULL "
+            "AND billing_profile_type IS NULL AND billing_details IS NULL "
+            "AND wallet_address IS NOT NULL AND wallet_address_normalized IS NOT NULL "
+            "AND wallet_network IS NOT NULL AND wallet_chain_id IS NOT NULL "
+            "AND wallet_verified_at IS NOT NULL)",
+            name="kind_fields",
+        ),
+    )
+
+
+class WalletConnectionChallenge(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "wallet_connection_challenges"
+
+    owner_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    address: Mapped[str] = mapped_column(String(42), nullable=False)
+    address_normalized: Mapped[str] = mapped_column(String(42), nullable=False)
+    network: Mapped[str] = mapped_column(String(64), nullable=False)
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("chain_id > 0", name="chain_id_positive"),
+        Index("ix_wallet_challenges_owner_expires", "owner_id", "expires_at"),
     )
 
 
@@ -251,9 +334,9 @@ class CartItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_id: Mapped[UUID] = mapped_column(
         ForeignKey("agents.id", ondelete="RESTRICT"), nullable=False, index=True
     )
-    credential_id: Mapped[UUID] = mapped_column(
+    credential_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("purchase_credentials.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
         unique=True,
     )
     selected_payment_method_id: Mapped[UUID | None] = mapped_column(
@@ -267,7 +350,7 @@ class CartItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     merchant: Mapped[str | None] = mapped_column(String(255))
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    unit_price: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     billing_period: Mapped[BillingPeriod | None] = mapped_column(
         Enum(BillingPeriod, native_enum=False)
@@ -282,10 +365,13 @@ class CartItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    credential: Mapped[PurchaseCredential] = relationship()
+    credential: Mapped[PurchaseCredential | None] = relationship()
     purchase: Mapped["Purchase | None"] = relationship(back_populates="cart_item", uselist=False)
     checkout_execution: Mapped["CheckoutExecution | None"] = relationship(
         back_populates="cart_item", uselist=False
+    )
+    x402_payment: Mapped["X402Payment | None"] = relationship(
+        back_populates="cart_item", cascade="all, delete-orphan", uselist=False
     )
 
     __table_args__ = (
@@ -316,7 +402,7 @@ class CheckoutExecution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     adapter_key: Mapped[str] = mapped_column(String(64), nullable=False)
     adapter_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     resolved_form_config: Mapped[dict[str, Any] | None] = mapped_column(JSON)
-    approved_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    approved_amount: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     checkout_origin: Mapped[str] = mapped_column(String(512), nullable=False)
     status: Mapped[CheckoutExecutionStatus] = mapped_column(
@@ -344,12 +430,53 @@ class CheckoutExecution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         order_by=lambda: CheckoutStatusTransition.sequence,
         viewonly=True,
     )
+    x402_payment: Mapped["X402Payment | None"] = relationship(
+        back_populates="execution", cascade="all, delete-orphan", uselist=False
+    )
 
     __table_args__ = (
         CheckConstraint("approved_amount > 0", name="approved_amount_positive"),
         CheckConstraint("length(currency) = 3", name="currency_length"),
         CheckConstraint("attempt_count >= 0", name="attempt_count_non_negative"),
         Index("ix_checkout_executions_owner_status", "owner_id", "status"),
+    )
+
+
+class X402Payment(TimestampMixin, Base):
+    __tablename__ = "x402_payments"
+
+    cart_item_id: Mapped[UUID] = mapped_column(
+        ForeignKey("cart_items.id", ondelete="CASCADE"), primary_key=True
+    )
+    execution_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("checkout_executions.id", ondelete="CASCADE"), unique=True
+    )
+    resource_url: Mapped[str] = mapped_column(Text, nullable=False)
+    payment_required: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    selected_requirements: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    network: Mapped[str] = mapped_column(String(64), nullable=False)
+    asset: Mapped[str] = mapped_column(String(42), nullable=False)
+    asset_symbol: Mapped[str] = mapped_column(String(16), nullable=False)
+    asset_decimals: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_atomic: Mapped[str] = mapped_column(String(78), nullable=False)
+    pay_to: Mapped[str] = mapped_column(String(42), nullable=False)
+    transfer_method: Mapped[str] = mapped_column(String(32), nullable=False)
+    payment_signature_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    response_status_code: Mapped[int | None] = mapped_column(Integer)
+    response_mime_type: Mapped[str | None] = mapped_column(String(255))
+    encrypted_response_body: Mapped[str | None] = mapped_column(Text)
+    payment_response: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    transaction: Mapped[str | None] = mapped_column(String(255))
+
+    cart_item: Mapped[CartItem] = relationship(back_populates="x402_payment")
+    execution: Mapped[CheckoutExecution | None] = relationship(back_populates="x402_payment")
+
+    __table_args__ = (
+        CheckConstraint("asset_decimals >= 0 AND asset_decimals <= 18", name="asset_decimals"),
+        CheckConstraint("length(amount_atomic) > 0", name="amount_atomic_non_empty"),
+        CheckConstraint(
+            "transfer_method IN ('eip3009', 'permit2')", name="transfer_method_supported"
+        ),
     )
 
 
@@ -401,7 +528,7 @@ class Purchase(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         default=PurchaseStatus.completed,
         index=True,
     )
-    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     provider_reference: Mapped[str] = mapped_column(String(255), nullable=False)
     merchant_order_reference: Mapped[str | None] = mapped_column(String(128))
@@ -444,7 +571,7 @@ class CheckoutEvent(Base):
     status: Mapped[CheckoutExecutionStatus] = mapped_column(
         Enum(CheckoutExecutionStatus, native_enum=False), nullable=False
     )
-    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -12,10 +13,16 @@ from ag_platform_api.api.dependencies import (
     Broker,
     CurrentAgent,
     DatabaseSession,
+    X402Client,
 )
 from ag_platform_api.api.routes.cart import load_cart_item
 from ag_platform_api.core.config import LOCAL_DIRECT_CARD_PROVIDER
-from ag_platform_api.core.security import encrypt_secret, hash_opaque_token, new_opaque_token
+from ag_platform_api.core.security import (
+    decrypt_secret,
+    encrypt_secret,
+    hash_opaque_token,
+    new_opaque_token,
+)
 from ag_platform_api.models import (
     Agent,
     AgentPaymentMethod,
@@ -23,13 +30,16 @@ from ag_platform_api.models import (
     CartItem,
     CartItemStatus,
     CheckoutEvent,
+    CheckoutExecutionStatus,
     PaymentMethod,
+    PaymentMethodKind,
     PaymentMethodStatus,
     PaymentRuleSet,
     Purchase,
     PurchaseCredential,
     PurchaseStatus,
     Subscription,
+    X402Payment,
 )
 from ag_platform_api.schemas import (
     AgentHandshake,
@@ -40,12 +50,73 @@ from ag_platform_api.schemas import (
     CheckoutEventPage,
     PurchaseComplete,
     PurchaseRead,
+    X402PaymentRequestCreate,
+    X402ResultRead,
 )
 from ag_platform_api.services.checkout_queue import CheckoutQueueError, queue_checkout_execution
 from ag_platform_api.services.payment_policies import requires_human_approval
-from ag_platform_api.services.serializers import cart_item_read, checkout_event_read, purchase_read
+from ag_platform_api.services.serializers import (
+    cart_item_read,
+    checkout_event_read,
+    purchase_read,
+    x402_transaction_evidence,
+)
+from ag_platform_api.services.x402 import (
+    X402ReconciliationNotice,
+    X402ServiceError,
+    discover_x402_payment,
+    queue_x402_execution,
+    reconcile_stale_x402_submission,
+    reconcile_stale_x402_submissions,
+)
 
 router = APIRouter(prefix="/agent", tags=["agent API"])
+
+
+async def _publish_x402_reconciliations(
+    broker: Broker,
+    reconciliations: list[X402ReconciliationNotice],
+) -> None:
+    for reconciliation in reconciliations:
+        await broker.publish(
+            "checkout.outcome_unknown",
+            {
+                "execution_id": reconciliation.execution_id,
+                "cart_item_id": reconciliation.cart_item_id,
+                "agent_id": reconciliation.agent_id,
+                "status": reconciliation.status.value,
+                "payment_protocol": "x402",
+                "reconciliation_reason": "response_deadline_exceeded",
+            },
+        )
+
+
+async def _reconcile_agent_x402_reads(
+    db: DatabaseSession,
+    settings: AppSettings,
+    broker: Broker,
+    *,
+    owner_id: UUID,
+    agent_id: UUID,
+    cart_item_id: UUID | None = None,
+) -> None:
+    if cart_item_id is None:
+        reconciliations = await reconcile_stale_x402_submissions(
+            db,
+            owner_id=owner_id,
+            agent_id=agent_id,
+            settings=settings,
+        )
+    else:
+        reconciliation = await reconcile_stale_x402_submission(
+            db,
+            owner_id=owner_id,
+            agent_id=agent_id,
+            cart_item_id=cart_item_id,
+            settings=settings,
+        )
+        reconciliations = [reconciliation] if reconciliation is not None else []
+    await _publish_x402_reconciliations(broker, reconciliations)
 
 
 @router.post("/handshake", response_model=AgentTokenResponse)
@@ -141,6 +212,7 @@ async def propose_cart_item(
                 AgentPaymentMethod.agent_id == agent.id,
                 PaymentMethod.owner_id == agent.owner_id,
                 PaymentMethod.status == PaymentMethodStatus.active,
+                PaymentMethod.kind == PaymentMethodKind.card,
                 PaymentMethod.provider != LOCAL_DIRECT_CARD_PROVIDER,
             )
             .order_by(AgentPaymentMethod.payment_method_id)
@@ -222,16 +294,177 @@ async def propose_cart_item(
     return cart_item_read(item)
 
 
+@router.post(
+    "/x402-payment-requests",
+    response_model=CartItemRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_x402_payment_request(
+    payload: X402PaymentRequestCreate,
+    agent: CurrentAgent,
+    db: DatabaseSession,
+    settings: AppSettings,
+    broker: Broker,
+    x402_client: X402Client,
+) -> CartItemRead:
+    if not settings.x402_enabled:
+        raise HTTPException(status_code=404, detail="x402 payments are not enabled")
+    preferred_networks = set(
+        (
+            await db.scalars(
+                select(PaymentMethod.wallet_network)
+                .join(AgentPaymentMethod)
+                .where(
+                    AgentPaymentMethod.agent_id == agent.id,
+                    PaymentMethod.owner_id == agent.owner_id,
+                    PaymentMethod.status == PaymentMethodStatus.active,
+                    PaymentMethod.kind == PaymentMethodKind.wallet,
+                )
+            )
+        ).all()
+    )
+    # End the authentication/read transaction before calling an untrusted remote resource.
+    await db.commit()
+    enabled_assets = [
+        asset
+        for asset in settings.x402_assets
+        if asset.network != "eip155:8453" or settings.x402_mainnet_enabled
+    ]
+    try:
+        discovered = await discover_x402_payment(
+            x402_client,
+            resource_url=str(payload.resource_url),
+            assets=enabled_assets,
+            preferred_networks={network for network in preferred_networks if network is not None},
+        )
+    except X402ServiceError as exc:
+        detail = exc.safe_message
+        if exc.code == "x402_asset_unsupported" and not settings.x402_mainnet_enabled:
+            detail = (
+                "The resource does not accept an enabled x402 asset; Base mainnet x402 is disabled"
+            )
+        status_code = 502 if exc.code in {"x402_transport_error", "x402_dns_failed"} else 409
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+    policy = await db.scalar(
+        select(PaymentRuleSet)
+        .where(
+            PaymentRuleSet.id == agent.payment_rule_set_id,
+            PaymentRuleSet.owner_id == agent.owner_id,
+        )
+        .with_for_update()
+    )
+    approval_required = requires_human_approval(
+        policy,
+        amount=discovered.nominal_usd,
+        currency="USD",
+        recurring=False,
+    )
+    resource_url = str(payload.resource_url)
+    host = urlsplit(resource_url).hostname or "x402 resource"
+    item = CartItem(
+        owner_id=agent.owner_id,
+        agent_id=agent.id,
+        credential_id=None,
+        title=(discovered.description or f"x402 access at {host}")[:255],
+        description=(discovered.description or "Access to an x402-protected resource.")[:10000],
+        product_url=resource_url,
+        checkout_adapter="x402",
+        checkout_url=resource_url,
+        merchant=payload.merchant or host,
+        reason=payload.reason,
+        quantity=1,
+        unit_price=discovered.nominal_usd,
+        currency="USD",
+        billing_period=None,
+        status=CartItemStatus.proposed,
+        selected_payment_method_id=None,
+        decision_note=None,
+        approved_at=None,
+    )
+    db.add(item)
+    await db.flush()
+    x402_payment = X402Payment(
+        cart_item_id=item.id,
+        resource_url=resource_url,
+        payment_required=discovered.payment_required,
+        selected_requirements=discovered.selected_requirements,
+        network=discovered.asset.network,
+        asset=discovered.asset.asset,
+        asset_symbol=discovered.asset.symbol,
+        asset_decimals=discovered.asset.decimals,
+        amount_atomic=discovered.amount_atomic,
+        pay_to=discovered.pay_to,
+        transfer_method=discovered.asset.transfer_method,
+    )
+    db.add(x402_payment)
+    item.x402_payment = x402_payment
+
+    selected_wallet: PaymentMethod | None = None
+    if not approval_required:
+        selected_wallet = await db.scalar(
+            select(PaymentMethod)
+            .join(AgentPaymentMethod)
+            .where(
+                AgentPaymentMethod.agent_id == agent.id,
+                PaymentMethod.owner_id == agent.owner_id,
+                PaymentMethod.status == PaymentMethodStatus.active,
+                PaymentMethod.kind == PaymentMethodKind.wallet,
+                PaymentMethod.wallet_network == discovered.asset.network,
+            )
+            .order_by(AgentPaymentMethod.payment_method_id)
+            .limit(1)
+            .with_for_update()
+        )
+        if selected_wallet is not None:
+            item.status = CartItemStatus.approved
+            item.selected_payment_method_id = selected_wallet.id
+            item.decision_note = "Automatically approved by the agent payment rule."
+            item.approved_at = datetime.now(UTC)
+            try:
+                await queue_x402_execution(db, item=item, payment_method=selected_wallet)
+            except X402ServiceError:
+                item.status = CartItemStatus.proposed
+                item.selected_payment_method_id = None
+                item.decision_note = None
+                item.approved_at = None
+                selected_wallet = None
+    await db.commit()
+    item = await load_cart_item(db, item.id)
+    event_type = "cart_item.approved" if selected_wallet is not None else "cart_item.proposed"
+    event_payload = {
+        "cart_item_id": item.id,
+        "agent_id": agent.id,
+        "owner_id": agent.owner_id,
+        "payment_protocol": "x402",
+    }
+    if selected_wallet is not None:
+        event_payload["payment_method_id"] = selected_wallet.id
+        event_payload["approval_source"] = "payment_policy"
+    await broker.publish(event_type, event_payload)
+    return cart_item_read(item)
+
+
 @router.get("/cart-items", response_model=list[CartItemRead])
 async def list_agent_cart_items(
     agent: CurrentAgent,
     db: DatabaseSession,
+    settings: AppSettings,
+    broker: Broker,
     item_status: Annotated[CartItemStatus | None, Query(alias="status")] = None,
 ) -> list[CartItemRead]:
+    await _reconcile_agent_x402_reads(
+        db,
+        settings,
+        broker,
+        owner_id=agent.owner_id,
+        agent_id=agent.id,
+    )
     query = (
         select(CartItem)
         .options(
             selectinload(CartItem.credential),
+            selectinload(CartItem.x402_payment),
             selectinload(CartItem.checkout_execution),
         )
         .where(CartItem.agent_id == agent.id, CartItem.owner_id == agent.owner_id)
@@ -248,11 +481,22 @@ async def get_agent_cart_item(
     cart_item_id: UUID,
     agent: CurrentAgent,
     db: DatabaseSession,
+    settings: AppSettings,
+    broker: Broker,
 ) -> CartItemRead:
+    await _reconcile_agent_x402_reads(
+        db,
+        settings,
+        broker,
+        owner_id=agent.owner_id,
+        agent_id=agent.id,
+        cart_item_id=cart_item_id,
+    )
     item = await db.scalar(
         select(CartItem)
         .options(
             selectinload(CartItem.credential),
+            selectinload(CartItem.x402_payment),
             selectinload(CartItem.checkout_execution),
         )
         .where(
@@ -266,13 +510,82 @@ async def get_agent_cart_item(
     return cart_item_read(item)
 
 
+@router.get(
+    "/cart-items/{cart_item_id}/x402/result",
+    response_model=X402ResultRead,
+)
+async def get_x402_result(
+    cart_item_id: UUID,
+    agent: CurrentAgent,
+    db: DatabaseSession,
+    settings: AppSettings,
+    broker: Broker,
+) -> X402ResultRead:
+    await _reconcile_agent_x402_reads(
+        db,
+        settings,
+        broker,
+        owner_id=agent.owner_id,
+        agent_id=agent.id,
+        cart_item_id=cart_item_id,
+    )
+    item = await db.scalar(
+        select(CartItem)
+        .options(
+            selectinload(CartItem.x402_payment).selectinload(X402Payment.execution),
+        )
+        .where(
+            CartItem.id == cart_item_id,
+            CartItem.agent_id == agent.id,
+            CartItem.owner_id == agent.owner_id,
+            CartItem.checkout_adapter == "x402",
+        )
+    )
+    if item is None or item.x402_payment is None:
+        raise HTTPException(status_code=404, detail="x402 payment request not found")
+    payment = item.x402_payment
+    if payment.execution is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The x402 result is unavailable until the request is approved",
+        )
+    execution = payment.execution
+    body: str | None = None
+    body_encoding: str | None = None
+    if (
+        execution.status is CheckoutExecutionStatus.succeeded
+        and payment.encrypted_response_body is not None
+    ):
+        body = decrypt_secret(payment.encrypted_response_body, settings)
+        body_encoding = "base64"
+    return X402ResultRead(
+        cart_item_id=item.id,
+        status=execution.status,
+        mime_type=payment.response_mime_type if body is not None else None,
+        body=body,
+        body_encoding=body_encoding,
+        transaction=x402_transaction_evidence(payment, execution),
+        network=payment.network,
+        asset=payment.asset,
+    )
+
+
 @router.get("/checkout-events", response_model=CheckoutEventPage)
 async def list_checkout_events(
     agent: CurrentAgent,
     db: DatabaseSession,
+    settings: AppSettings,
+    broker: Broker,
     after_cursor: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
 ) -> CheckoutEventPage:
+    await _reconcile_agent_x402_reads(
+        db,
+        settings,
+        broker,
+        owner_id=agent.owner_id,
+        agent_id=agent.id,
+    )
     events = list(
         (
             await db.scalars(
